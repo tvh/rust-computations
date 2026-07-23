@@ -110,12 +110,10 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
-        let sync_file = sync_file.clone();
         move |sync_dir, ctx, rel: PathBuf| {
             let source = source.clone();
             let sink = sink.clone();
             let source_root = source_root.clone();
-            let sync_file = sync_file.clone();
             async move {
                 if !rel.as_os_str().is_empty() {
                     sink.make_dirs(&ctx, rel.clone()).await?;
@@ -169,7 +167,6 @@ async fn dirsync_converges_through_a_sequence_of_edits() {
 
     let handle = {
         let engine = engine.clone();
-        let root = root.clone();
         tokio::spawn(async move { engine.run(&root, PathBuf::new()).await })
     };
 

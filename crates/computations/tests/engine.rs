@@ -44,11 +44,9 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
 
     let sum: Comp<(), usize> = builder.define("sum", {
         let kv = kv.clone();
-        let number_of_lines = number_of_lines.clone();
         let runs = sum_runs.clone();
         move |ctx, _: ()| {
             let kv = kv.clone();
-            let number_of_lines = number_of_lines.clone();
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
@@ -69,11 +67,9 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
 
     let store: Comp<(), ()> = builder.define("store", {
         let sink = sink.clone();
-        let sum = sum.clone();
         let runs = store_runs.clone();
         move |ctx, _: ()| {
             let sink = sink.clone();
-            let sum = sum.clone();
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
@@ -145,33 +141,13 @@ async fn diamond_shared_dependency_runs_once() {
         }
     });
 
-    let b: Comp<i32, i32> = builder.define("diamond_b", {
-        let d = d.clone();
-        move |ctx, n: i32| {
-            let d = d.clone();
-            async move { ctx.eval(&d, n).await }
-        }
-    });
+    let b: Comp<i32, i32> = builder.define("diamond_b", move |ctx, n: i32| async move { ctx.eval(&d, n).await });
 
-    let c: Comp<i32, i32> = builder.define("diamond_c", {
-        let d = d.clone();
-        move |ctx, n: i32| {
-            let d = d.clone();
-            async move { ctx.eval(&d, n).await }
-        }
-    });
+    let c: Comp<i32, i32> = builder.define("diamond_c", move |ctx, n: i32| async move { ctx.eval(&d, n).await });
 
-    let a: Comp<i32, i32> = builder.define("diamond_a", {
-        let b = b.clone();
-        let c = c.clone();
-        move |ctx, n: i32| {
-            let b = b.clone();
-            let c = c.clone();
-            async move {
-                let (bv, cv) = futures::try_join!(ctx.eval(&b, n), ctx.eval(&c, n))?;
-                Ok(bv + cv)
-            }
-        }
+    let a: Comp<i32, i32> = builder.define("diamond_a", move |ctx, n: i32| async move {
+        let (bv, cv) = futures::try_join!(ctx.eval(&b, n), ctx.eval(&c, n))?;
+        Ok(bv + cv)
     });
 
     let engine = builder.build();
@@ -215,20 +191,8 @@ async fn cycle_with_same_param_is_detected_promptly() {
     let b: Comp<i32, i32> = Comp::named("cycle_b");
 
     let mut builder = Engine::builder();
-    builder.define("cycle_a", {
-        let b = b.clone();
-        move |ctx, n: i32| {
-            let b = b.clone();
-            async move { ctx.eval(&b, n).await }
-        }
-    });
-    builder.define("cycle_b", {
-        let a = a.clone();
-        move |ctx, n: i32| {
-            let a = a.clone();
-            async move { ctx.eval(&a, n).await }
-        }
-    });
+    builder.define("cycle_a", move |ctx, n: i32| async move { ctx.eval(&b, n).await });
+    builder.define("cycle_b", move |ctx, n: i32| async move { ctx.eval(&a, n).await });
     let engine = builder.build();
 
     let result = tokio::time::timeout(Duration::from_millis(500), engine.eval_root(&a, 1))
@@ -248,18 +212,12 @@ async fn self_recursion_with_different_params_works() {
     let countdown: Comp<i64, i64> = Comp::named("countdown_sum");
 
     let mut builder = Engine::builder();
-    builder.define("countdown_sum", {
-        let countdown = countdown.clone();
-        move |ctx, n: i64| {
-            let countdown = countdown.clone();
-            async move {
-                if n <= 0 {
-                    Ok(0)
-                } else {
-                    let rest = ctx.eval(&countdown, n - 1).await?;
-                    Ok(n + rest)
-                }
-            }
+    builder.define("countdown_sum", move |ctx, n: i64| async move {
+        if n <= 0 {
+            Ok(0)
+        } else {
+            let rest = ctx.eval(&countdown, n - 1).await?;
+            Ok(n + rest)
         }
     });
     let engine = builder.build();
@@ -281,13 +239,8 @@ async fn eval_all_runs_concurrently() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(n * 2)
     });
-    let root: Comp<(), Vec<i32>> = builder.define("root_eval_all", {
-        let sleepy = sleepy.clone();
-        move |ctx, _: ()| {
-            let sleepy = sleepy.clone();
-            async move { ctx.eval_all(&sleepy, [1, 2, 3]).await }
-        }
-    });
+    let root: Comp<(), Vec<i32>> =
+        builder.define("root_eval_all", move |ctx, _: ()| async move { ctx.eval_all(&sleepy, [1, 2, 3]).await });
     let engine = builder.build();
 
     let start = tokio::time::Instant::now();

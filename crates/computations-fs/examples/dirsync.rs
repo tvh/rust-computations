@@ -134,12 +134,10 @@ async fn main() -> anyhow::Result<()> {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
-        let sync_file = sync_file.clone();
         move |sync_dir, ctx, rel: PathBuf| {
             let source = source.clone();
             let sink = sink.clone();
             let source_root = source_root.clone();
-            let sync_file = sync_file.clone();
             async move {
                 // The target root itself always exists (`FsSink::new`
                 // creates it); `MakeDirs` also rejects an empty relative

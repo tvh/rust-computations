@@ -9,7 +9,6 @@
 //! `CompKey` / `c p`).
 
 use std::fmt;
-use std::sync::Arc;
 
 /// A 256-bit content hash (a blake3 digest of a canonical byte encoding).
 ///
@@ -90,20 +89,24 @@ impl<T: serde::Serialize + ?Sized> StableHash for T {
 ///
 /// A `DefId` names a definition (e.g. `"fibonacci"`), independent of any
 /// particular parameter it might be applied to; see [`CompKey`] for the
-/// identity of a specific application. Cloning a `DefId` is cheap (an `Arc`
-/// bump).
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DefId(Arc<str>);
+/// identity of a specific application. `DefId` is `Copy`: it wraps a
+/// `&'static str` rather than an owned/reference-counted string, since
+/// computation names are startup-time string literals in practice. A caller
+/// that truly needs a runtime-generated name can `Box::leak` it into a
+/// `&'static str` — this keeps identity `Copy` everywhere without needing an
+/// intern table.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DefId(&'static str);
 
 impl DefId {
     /// Creates a `DefId` for the definition named `name`.
-    pub fn new(name: &str) -> Self {
-        DefId(Arc::from(name))
+    pub const fn new(name: &'static str) -> Self {
+        DefId(name)
     }
 
     /// Returns the definition's name.
     pub fn name(&self) -> &str {
-        &self.0
+        self.0
     }
 }
 
@@ -202,9 +205,9 @@ mod tests {
         let square = DefId::new("square");
         let cube = DefId::new("cube");
 
-        let key_a = CompKey::new(square.clone(), &5i32);
-        let key_a_again = CompKey::new(square.clone(), &5i32);
-        let key_diff_param = CompKey::new(square.clone(), &6i32);
+        let key_a = CompKey::new(square, &5i32);
+        let key_a_again = CompKey::new(square, &5i32);
+        let key_diff_param = CompKey::new(square, &6i32);
         let key_diff_name = CompKey::new(cube, &5i32);
 
         assert_eq!(key_a, key_a_again);
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn debug_formatting_smoke_test() {
         let def = DefId::new("square");
-        let key = CompKey::new(def.clone(), &5i32);
+        let key = CompKey::new(def, &5i32);
 
         let key_debug = format!("{key:?}");
         assert!(key_debug.starts_with("square#"));

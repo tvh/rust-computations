@@ -52,7 +52,7 @@ impl Ctx {
     ) -> Result<R, CompError> {
         let (value, callee_key) = self
             .engine
-            .eval::<P, R>(comp.def_id().clone(), param, self.chain.clone())
+            .eval::<P, R>(*comp.def_id(), param, self.chain.clone())
             .await?;
 
         match &self.caller {

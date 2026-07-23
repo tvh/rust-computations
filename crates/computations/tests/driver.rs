@@ -96,24 +96,15 @@ async fn minimal_recomputation_two_independent_chains() {
         }
     });
 
-    let root: Comp<(), ()> = builder.define("two_chains_root", {
-        let chain1 = chain1.clone();
-        let chain2 = chain2.clone();
-        move |ctx, _: ()| {
-            let chain1 = chain1.clone();
-            let chain2 = chain2.clone();
-            async move {
-                ctx.eval(&chain1, ()).await?;
-                ctx.eval(&chain2, ()).await?;
-                Ok(())
-            }
-        }
+    let root: Comp<(), ()> = builder.define("two_chains_root", move |ctx, _: ()| async move {
+        ctx.eval(&chain1, ()).await?;
+        ctx.eval(&chain2, ()).await?;
+        Ok(())
     });
 
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        let root = root.clone();
         tokio::spawn(async move { engine.run(&root, ()).await })
     };
 
@@ -171,11 +162,9 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
 
     let parent: Comp<(), ()> = builder.define("cutoff_parent", {
         let sink = sink.clone();
-        let child = child.clone();
         let runs = parent_runs.clone();
         move |ctx, _: ()| {
             let sink = sink.clone();
-            let child = child.clone();
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
@@ -196,7 +185,6 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        let parent = parent.clone();
         tokio::spawn(async move { engine.run(&parent, ()).await })
     };
 
@@ -256,10 +244,8 @@ async fn deletion_gc_removes_output_for_removed_name() {
 
     let root: Comp<(), ()> = builder.define("file_list_root", {
         let kv = kv.clone();
-        let child = child.clone();
         move |ctx, _: ()| {
             let kv = kv.clone();
-            let child = child.clone();
             async move {
                 let list = ctx
                     .src_req(&kv, GetKey("file_list".to_string()))
@@ -275,7 +261,6 @@ async fn deletion_gc_removes_output_for_removed_name() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        let root = root.clone();
         tokio::spawn(async move { engine.run(&root, ()).await })
     };
 
@@ -331,7 +316,6 @@ async fn startup_gc_removes_stale_pre_existing_output() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        let root = root.clone();
         tokio::spawn(async move { engine.run(&root, ()).await })
     };
 
@@ -383,7 +367,6 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        let root = root.clone();
         tokio::spawn(async move { engine.run(&root, ()).await })
     };
 

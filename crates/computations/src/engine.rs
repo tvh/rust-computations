@@ -160,14 +160,14 @@ impl EngineInner {
         }
 
         let engine_for_rerun = self.clone();
-        let def_id_for_rerun = def_id.clone();
+        let def_id_for_rerun = *def_id;
         let param_for_rerun = param.clone();
         let node = nodes.entry(key.clone()).or_insert_with(|| {
             let rerun: RerunFn = Arc::new(move || {
                 let engine = Engine {
                     inner: engine_for_rerun.clone(),
                 };
-                let comp = Comp::<P, R>::from_def_id(def_id_for_rerun.clone());
+                let comp = Comp::<P, R>::from_def_id(def_id_for_rerun);
                 let param = param_for_rerun.clone();
                 Box::pin(async move { engine.eval_root(&comp, param).await.map(|_| ()) })
             });
@@ -359,7 +359,7 @@ impl EngineInner {
         param: P,
         chain: Arc<Vec<CompKey>>,
     ) -> Result<(R, CompKey), CompError> {
-        let key = CompKey::new(def_id.clone(), &param);
+        let key = CompKey::new(def_id, &param);
         let span = tracing::debug_span!(
             "comp.eval",
             comp = %def_id.name(),
@@ -534,8 +534,8 @@ impl EngineBuilder {
     /// Panics if a computation with the same name is already registered —
     /// this is a startup configuration error, not a runtime condition.
     pub fn register<P: CompParam, R: CompResult>(&mut self, def: CompDef<P, R>) -> Comp<P, R> {
-        let id = def.id.clone();
-        let prev = self.defs.insert(id.clone(), Arc::new(def) as Arc<dyn Any + Send + Sync>);
+        let id = def.id;
+        let prev = self.defs.insert(id, Arc::new(def) as Arc<dyn Any + Send + Sync>);
         assert!(prev.is_none(), "duplicate computation name: {id}");
         Comp::from_def_id(id)
     }
@@ -551,7 +551,7 @@ impl EngineBuilder {
     ///
     /// # Panics
     /// Panics if a computation with the same name is already registered.
-    pub fn define<P, R, F, Fut>(&mut self, name: &str, body: F) -> Comp<P, R>
+    pub fn define<P, R, F, Fut>(&mut self, name: &'static str, body: F) -> Comp<P, R>
     where
         P: CompParam,
         R: CompResult,
@@ -573,7 +573,7 @@ impl EngineBuilder {
     ///
     /// # Panics
     /// Panics if a computation with the same name is already registered.
-    pub fn define_rec<P, R, F, Fut>(&mut self, name: &str, body: F) -> Comp<P, R>
+    pub fn define_rec<P, R, F, Fut>(&mut self, name: &'static str, body: F) -> Comp<P, R>
     where
         P: CompParam,
         R: CompResult,
@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
 
         kv.set("names", "a").await;
-        let key = CompKey::new(comp.def_id().clone(), &());
+        let key = CompKey::new(*comp.def_id(), &());
         engine.mark_dirty_for_test(&key);
 
         engine.eval_root(&comp, ()).await.unwrap();
