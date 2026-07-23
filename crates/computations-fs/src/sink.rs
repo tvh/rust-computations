@@ -174,6 +174,14 @@ impl SinkBase for FsSink {
 
     async fn delete_outputs(&self, outs: HashSet<PathBuf>) -> Result<(), SinkError> {
         tracing::debug!(sink = %self.id, count = outs.len(), "fs sink: deleting outputs");
+        // Process deepest paths first: within one batch this guarantees a
+        // file is removed before any directory that contains it, so a
+        // directory that this very batch empties out is itself removable by
+        // the time we reach it (directories are only ever removed if
+        // empty). Sorting purely by component count is sufficient because a
+        // path nested under another always has strictly more components.
+        let mut outs: Vec<PathBuf> = outs.into_iter().collect();
+        outs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
         for out in outs {
             validate_rel_path(&out)?;
             let full = self.full_path(&out);
@@ -214,25 +222,43 @@ impl SinkBase for FsSink {
     }
 }
 
-/// Recursively collects every regular file under `dir` (which starts at
-/// `root` and descends), reporting each as a path relative to `root`.
+/// Recursively collects every entry under `dir` (which starts at `root` and
+/// descends), reporting each as a path relative to `root`. The root itself
+/// is never reported (callers only ever `read_dir` its contents).
 ///
-/// Directories are not reported as outputs themselves (see module docs):
-/// [`MakeDirs`]-produced directories are still pruned once empty by
-/// [`FsSink::delete_outputs`]'s ancestor-pruning, they are just not listed
-/// here as pre-existing outputs to protect on startup GC.
+/// Every entry is reported, not just regular files:
+///
+/// - Directories are reported too, one output per directory, in the same
+///   rel-path shape [`MakeDirs`] reports for its `rel_path`. A directory
+///   that no longer has a live producer (e.g. its source vanished between
+///   runs) would otherwise be invisible to startup GC's `existing − live`
+///   diff — an already-empty stale directory never triggers the ancestor
+///   pruning in [`FsSink::delete_outputs`], since that only fires when a
+///   file *inside* it is deleted. Listing the directory itself closes that
+///   gap. A directory that is still in active use (an ancestor of live
+///   output, or a live `MakeDirs` output itself) is unaffected: subtracting
+///   the live set removes it from the deletion batch, and even if some
+///   ancestor slips through, `delete_outputs` only removes directories that
+///   are empty, so a directory holding live content is a silent no-op.
+/// - Symlinks and any other non-file, non-dir entries (`file_type()` does
+///   not follow links, so a symlink is neither `is_file()` nor `is_dir()`)
+///   are reported as file-kind outputs: they are simple deletable entries,
+///   and `delete_outputs` removes them with `remove_file`, which unlinks a
+///   symlink without following it.
 fn walk_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
+        let rel = path
+            .strip_prefix(root)
+            .expect("walked path is always under root")
+            .to_path_buf();
         if file_type.is_dir() {
+            out.push(rel);
             walk_files(root, &path, out)?;
-        } else if file_type.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .expect("walked path is always under root")
-                .to_path_buf();
+        } else {
+            // Regular file, symlink, or any other non-dir entry type.
             out.push(rel);
         }
     }
@@ -348,7 +374,11 @@ mod tests {
         let existing = sink.list_existing_outputs().await.unwrap().unwrap();
         assert_eq!(
             existing,
-            HashSet::from([PathBuf::from("sub/x.txt"), PathBuf::from("y.txt")])
+            HashSet::from([
+                PathBuf::from("sub"),
+                PathBuf::from("sub/x.txt"),
+                PathBuf::from("y.txt")
+            ])
         );
     }
 
@@ -365,6 +395,110 @@ mod tests {
         assert!(result.is_ok());
         assert!(outs.is_empty());
         assert!(dir.path().exists(), "root must still exist");
+    }
+
+    #[tokio::test]
+    async fn list_existing_outputs_sees_preexisting_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("stale_empty_dir")).unwrap();
+
+        let sink = FsSink::new("fs", dir.path());
+        let existing = sink.list_existing_outputs().await.unwrap().unwrap();
+        assert_eq!(existing, HashSet::from([PathBuf::from("stale_empty_dir")]));
+    }
+
+    #[tokio::test]
+    async fn startup_gc_removes_a_stale_preexisting_empty_dir() {
+        // Simulates the engine's startup GC: list what exists, subtract the
+        // (here, empty) live set, delete the remainder. A directory that no
+        // live computation produces must not survive this, or it would be
+        // immortal (an already-empty directory never triggers
+        // `delete_outputs`'s ancestor-pruning, which only fires when a file
+        // *inside* it is removed).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("stale_empty_dir")).unwrap();
+
+        let sink = FsSink::new("fs", dir.path());
+        let existing = sink.list_existing_outputs().await.unwrap().unwrap();
+        let live: HashSet<PathBuf> = HashSet::new();
+        let stale: HashSet<PathBuf> = existing.difference(&live).cloned().collect();
+
+        sink.delete_outputs(stale).await.unwrap();
+
+        assert!(!dir.path().join("stale_empty_dir").exists());
+        assert!(dir.path().exists(), "root must survive");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn startup_gc_removes_a_stale_preexisting_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        // A symlink whose target need not even exist: it's just an alien
+        // entry that startup GC should be able to see and remove, the same
+        // as it would an alien regular file.
+        std::os::unix::fs::symlink(dir.path().join("nonexistent-target"), dir.path().join("stale_link")).unwrap();
+
+        let sink = FsSink::new("fs", dir.path());
+        let existing = sink.list_existing_outputs().await.unwrap().unwrap();
+        assert_eq!(existing, HashSet::from([PathBuf::from("stale_link")]));
+
+        let live: HashSet<PathBuf> = HashSet::new();
+        let stale: HashSet<PathBuf> = existing.difference(&live).cloned().collect();
+        sink.delete_outputs(stale).await.unwrap();
+
+        // `symlink_metadata` (not `exists`, which follows links and would
+        // report `false` for a dangling link regardless of whether the link
+        // itself is still there) confirms the link entry itself is gone.
+        assert!(tokio::fs::symlink_metadata(dir.path().join("stale_link")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_outputs_removes_a_dir_and_its_stale_files_in_one_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("stale_dir")).unwrap();
+        std::fs::write(dir.path().join("stale_dir/a.txt"), b"1").unwrap();
+        std::fs::write(dir.path().join("stale_dir/b.txt"), b"2").unwrap();
+
+        let sink = FsSink::new("fs", dir.path());
+        let outs = HashSet::from([
+            PathBuf::from("stale_dir"),
+            PathBuf::from("stale_dir/a.txt"),
+            PathBuf::from("stale_dir/b.txt"),
+        ]);
+        sink.delete_outputs(outs).await.unwrap();
+
+        assert!(!dir.path().join("stale_dir").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_outputs_leaves_a_live_dir_in_place_while_removing_a_stale_file_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("live_dir")).unwrap();
+        std::fs::write(dir.path().join("live_dir/live.txt"), b"keep").unwrap();
+        std::fs::write(dir.path().join("live_dir/stale.txt"), b"drop").unwrap();
+
+        let sink = FsSink::new("fs", dir.path());
+        let existing = sink.list_existing_outputs().await.unwrap().unwrap();
+        assert_eq!(
+            existing,
+            HashSet::from([
+                PathBuf::from("live_dir"),
+                PathBuf::from("live_dir/live.txt"),
+                PathBuf::from("live_dir/stale.txt"),
+            ])
+        );
+
+        // The dir and the live file are both still-live outputs; only the
+        // stale file is in `existing - live`.
+        let live = HashSet::from([PathBuf::from("live_dir"), PathBuf::from("live_dir/live.txt")]);
+        let stale: HashSet<PathBuf> = existing.difference(&live).cloned().collect();
+        assert_eq!(stale, HashSet::from([PathBuf::from("live_dir/stale.txt")]));
+
+        sink.delete_outputs(stale).await.unwrap();
+
+        assert!(!dir.path().join("live_dir/stale.txt").exists());
+        assert!(dir.path().join("live_dir/live.txt").exists());
+        assert!(dir.path().join("live_dir").exists(), "live dir must survive");
     }
 
     #[tokio::test]
