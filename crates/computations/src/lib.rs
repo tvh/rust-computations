@@ -11,6 +11,7 @@ pub mod driver;
 pub mod engine;
 pub mod error;
 pub mod key;
+pub mod registry;
 pub mod sink;
 pub mod source;
 
@@ -18,3 +19,6 @@ pub mod source;
 pub mod testutil;
 
 pub use key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
+pub use registry::Registry;
+pub use sink::{OutBytes, RawOutput, Sink, SinkBase, SinkId};
+pub use source::{Dep, KeyBytes, RawDep, Request, Source, SourceBase, SourceId, VerBytes};
