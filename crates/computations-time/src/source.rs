@@ -27,8 +27,18 @@
 //! from the schedule permanently — a passed deadline costs nothing from
 //! then on. A deadline already in the past when [`IsAfter`] is first
 //! executed never enters the schedule at all.
+//!
+//! Only ever one timer is scheduled at a time (the single raced
+//! `sleep_until` in [`run_timer`]) — everything else lives in queues.
+//! Watched buckets stay in a small `HashMap` (there are only ever as many
+//! distinct buckets as distinct granularities actually requested, and each
+//! recurs forever, so a full scan of it is cheap and unavoidable). Watched
+//! deadlines, which can be numerous and are each one-shot, are kept in a
+//! real priority queue — see [`WatchState`]'s doc comment for the min-heap
+//! and lazy-deletion scheme.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -149,14 +159,94 @@ pub enum TimeVer {
 
 /// Mutable scheduling state, shared between [`TimeSource`] and its
 /// background timer task.
+///
+/// Deadlines are kept in a real priority queue rather than a flat set, so
+/// finding the earliest one is O(1) instead of an O(n) scan:
+///
+/// - `deadline_set` is the source of truth for *membership* — is this
+///   deadline currently pending? — and is what `unregister` and a firing
+///   both mutate directly.
+/// - `deadline_heap` is a min-heap (via `Reverse`, since `BinaryHeap` is a
+///   max-heap by default) ordered by time, so its peek is always the
+///   earliest deadline *that was ever inserted* — but `BinaryHeap` has no
+///   efficient way to remove an arbitrary element, so `unregister` only
+///   ever touches `deadline_set`, leaving a now-stale entry sitting in the
+///   heap. This is lazy deletion: a heap entry is only actually discarded
+///   when it reaches the top (in `peek_earliest_deadline` /
+///   `pop_due_deadlines`) and is found to no longer be in `deadline_set` —
+///   at which point it is popped and skipped rather than treated as live.
+///   The invariant this maintains is that `deadline_set` and the *live*
+///   (non-stale) entries of `deadline_heap` always describe exactly the
+///   same set of pending deadlines.
 #[derive(Default)]
 struct WatchState {
-    /// Watched buckets and the rounded value last reported for each.
+    /// Watched buckets and the rounded value last reported for each. Kept
+    /// as a plain map: there are only ever as many distinct buckets as
+    /// distinct granularities actually requested (typically a handful),
+    /// each recurs forever, and a full scan of it on every wakeup is cheap
+    /// and unavoidable (unlike deadlines, there is no "pop the earliest and
+    /// discard" operation that would make sense for a recurring key).
     buckets: HashMap<Bucket, SystemTime>,
-    /// Deadlines currently pending (not yet fired). A fired deadline is
-    /// removed permanently: it will never change again, so keeping it
-    /// around would cost forever for no further benefit.
-    deadlines: HashSet<SystemTime>,
+    /// Pending (not yet fired) `IsAfter` deadlines, as a min-heap plus a
+    /// membership set. See this struct's doc comment for the lazy-deletion
+    /// invariant between the two fields.
+    deadline_heap: BinaryHeap<Reverse<SystemTime>>,
+    deadline_set: HashSet<SystemTime>,
+}
+
+impl WatchState {
+    /// Registers `t` as a pending deadline if it isn't already. Returns
+    /// whether it was newly inserted (i.e. whether the schedule actually
+    /// changed).
+    fn insert_deadline(&mut self, t: SystemTime) -> bool {
+        if self.deadline_set.insert(t) {
+            self.deadline_heap.push(Reverse(t));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unregisters `t` as a pending deadline (lazy deletion: only removes
+    /// it from `deadline_set` — see this struct's doc comment). Returns
+    /// whether it was actually pending.
+    fn remove_deadline(&mut self, t: &SystemTime) -> bool {
+        self.deadline_set.remove(t)
+    }
+
+    /// The earliest still-pending deadline, if any, discarding any
+    /// lazily-deleted (unregistered) stale entries found at the top of the
+    /// heap along the way.
+    fn peek_earliest_deadline(&mut self) -> Option<SystemTime> {
+        while let Some(&Reverse(t)) = self.deadline_heap.peek() {
+            if self.deadline_set.contains(&t) {
+                return Some(t);
+            }
+            self.deadline_heap.pop();
+        }
+        None
+    }
+
+    /// Pops and returns every deadline at or before `now`, discarding (and
+    /// skipping) any lazily-deleted stale entries encountered along the
+    /// way. Every deadline returned is removed from `deadline_set` too — it
+    /// has fired and, per `IsAfter`'s one-shot semantics, will never be
+    /// scheduled again.
+    fn pop_due_deadlines(&mut self, now: SystemTime) -> Vec<SystemTime> {
+        let mut due = Vec::new();
+        while let Some(&Reverse(t)) = self.deadline_heap.peek() {
+            if t > now {
+                break;
+            }
+            self.deadline_heap.pop();
+            if self.deadline_set.remove(&t) {
+                due.push(t);
+            }
+            // else: a stale (already-unregistered) entry — discard it and
+            // keep going rather than reporting a firing for it.
+        }
+        due
+    }
 }
 
 /// State shared between [`TimeSource`] and its background timer task.
@@ -261,7 +351,7 @@ impl SourceBase for TimeSource {
                         }
                     }
                     TimeKey::Deadline(t) => {
-                        if watched.deadlines.remove(t) {
+                        if watched.remove_deadline(t) {
                             changed = true;
                         }
                     }
@@ -315,7 +405,7 @@ impl Source<IsAfter> for TimeSource {
         if !after {
             let is_new = {
                 let mut watched = self.shared.watched.lock().unwrap();
-                watched.deadlines.insert(deadline)
+                watched.insert_deadline(deadline)
             };
             if is_new {
                 tracing::debug!(?deadline, "time source: deadline registered");
@@ -336,15 +426,23 @@ impl Source<IsAfter> for TimeSource {
 /// deadline (`None` if nothing is watched), recomputed fresh from the wall
 /// clock every call so that drift, suspend, or a jumped clock can never
 /// desync it from reality (see the [module docs](self)).
-fn next_wakeup(watched: &WatchState, now: SystemTime) -> Option<SystemTime> {
-    let bucket_wakeups = watched.buckets.keys().map(|b| b.next_boundary_after(now));
-    let deadline_wakeups = watched.deadlines.iter().copied();
-    bucket_wakeups.chain(deadline_wakeups).min()
+///
+/// Buckets stay a full (but small) scan; the deadline side is a single
+/// heap-peek (after lazily discarding any stale top entries) rather than a
+/// scan of every pending deadline.
+fn next_wakeup(watched: &mut WatchState, now: SystemTime) -> Option<SystemTime> {
+    let earliest_bucket = watched.buckets.keys().map(|b| b.next_boundary_after(now)).min();
+    let earliest_deadline = watched.peek_earliest_deadline();
+    match (earliest_bucket, earliest_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
-/// Recomputes bucket roundings and checks deadlines against the current
-/// wall clock, emitting a change dep for everything that actually changed,
-/// and permanently dropping any deadline that just fired.
+/// Recomputes bucket roundings and pops every deadline at or before now,
+/// emitting a change dep for everything that actually changed, and
+/// permanently dropping any deadline that just fired (per `pop_due_deadlines`,
+/// they're already removed from the schedule).
 fn process_wakeup(shared: &Shared, tx: &mpsc::UnboundedSender<Dep<TimeKey, TimeVer>>) {
     let now = SystemTime::now();
     let mut fired = Vec::new();
@@ -360,9 +458,7 @@ fn process_wakeup(shared: &Shared, tx: &mpsc::UnboundedSender<Dep<TimeKey, TimeV
                 });
             }
         }
-        let due: Vec<SystemTime> = watched.deadlines.iter().copied().filter(|d| now >= *d).collect();
-        for deadline in due {
-            watched.deadlines.remove(&deadline);
+        for deadline in watched.pop_due_deadlines(now) {
             fired.push(Dep {
                 key: TimeKey::Deadline(deadline),
                 ver: TimeVer::After(true),
@@ -385,8 +481,8 @@ async fn run_timer(shared: Arc<Shared>, tx: mpsc::UnboundedSender<Dep<TimeKey, T
     loop {
         let now = SystemTime::now();
         let target = {
-            let watched = shared.watched.lock().unwrap();
-            next_wakeup(&watched, now)
+            let mut watched = shared.watched.lock().unwrap();
+            next_wakeup(&mut watched, now)
         };
 
         match target {
