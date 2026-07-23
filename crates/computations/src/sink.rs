@@ -78,11 +78,7 @@ pub struct RawOutput {
 /// Object-safe, byte-erased view of a [`SinkBase`].
 ///
 /// The engine and driver store sinks heterogeneously behind this trait and
-/// only need untyped operations; step 4/5 are the actual consumers of it
-/// (exercised directly in this crate only by the erasure round-trip tests).
-// Only called through `Arc<dyn ErasedSink>` from the engine/driver (steps
-// 4-5) and from this crate's own tests; not yet called by non-test code.
-#[allow(dead_code)]
+/// only need untyped operations.
 pub(crate) trait ErasedSink: Send + Sync {
     fn instance_id(&self) -> SinkId;
     fn delete_outputs(&self, outs: Vec<OutBytes>) -> BoxFuture<'_, Result<(), SinkError>>;
@@ -91,9 +87,8 @@ pub(crate) trait ErasedSink: Send + Sync {
 
 /// Adapts any concrete `S: SinkBase` to the erased [`ErasedSink`] interface,
 /// postcard-(de)serializing outputs at the boundary.
-// Constructed by `Registry::register_sink`; its `ErasedSink` impl is
-// exercised by step 4/5 and by this crate's own erasure tests.
-#[allow(dead_code)]
+///
+/// Constructed by `Registry::register_sink`.
 pub(crate) struct SinkAdapter<S>(pub Arc<S>);
 
 impl<S: SinkBase> ErasedSink for SinkAdapter<S> {

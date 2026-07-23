@@ -16,8 +16,8 @@
 //!    producing (relative to its previous run) are deleted.
 //!
 //! Change propagation itself (deciding *which* dirty nodes to re-run, and
-//! in what order) is step 5's job; this module only provides the primitive
-//! that step 5 will drive: re-evaluating one node.
+//! in what order) lives in [`crate::driver`]; this module only provides the
+//! primitive it drives: re-evaluating one node.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -40,12 +40,11 @@ type SharedExec = Shared<BoxFuture<'static, ExecResult>>;
 /// A closure that re-executes a node's computation via the normal eval path.
 ///
 /// Captures the node's typed `Comp<P, R>` handle, its param, and the engine.
-/// Not called anywhere in this module; step 5's change propagation calls it
-/// on dirtied nodes.
-type RerunFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), CompError>> + Send + Sync>;
+/// Called by the driver's change propagation on dirtied nodes.
+pub(crate) type RerunFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), CompError>> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeState {
+pub(crate) enum NodeState {
     /// Has a cached value that is up to date with its dependencies.
     Clean,
     /// Needs re-execution before its value can be trusted.
@@ -55,32 +54,31 @@ enum NodeState {
 }
 
 /// One computation application's memoized state.
-struct Node {
-    state: NodeState,
+pub(crate) struct Node {
+    pub(crate) state: NodeState,
     /// The cached result, erased. `Some` even when `state == Dirty` (a
     /// stale-but-not-yet-superseded value), `None` only before the first
     /// successful execution.
     value: Option<Arc<dyn Any + Send + Sync>>,
     result_hash: Option<Hash256>,
     /// Computations this node called during its last execution.
-    comp_deps: HashSet<CompKey>,
+    pub(crate) comp_deps: HashSet<CompKey>,
     /// Source reads this node made during its last execution.
-    source_deps: HashSet<RawDep>,
+    pub(crate) source_deps: HashSet<RawDep>,
     /// Computations that called this node during their last execution.
-    rdeps: HashSet<CompKey>,
+    pub(crate) rdeps: HashSet<CompKey>,
     /// Sink outputs this node produced during its last execution.
-    outputs: HashSet<RawOutput>,
+    pub(crate) outputs: HashSet<RawOutput>,
     /// Whether the last successful execution's result hash differed from
     /// the one before it (early cutoff signal).
-    // Read by step 5 to decide whether a clean recomputation should
-    // propagate further to this node's rdeps, or stop here (early cutoff).
-    #[allow(dead_code)]
-    last_changed: bool,
+    ///
+    /// Read by the driver to decide whether a clean recomputation should
+    /// propagate further to this node's rdeps, or stop here (early cutoff).
+    pub(crate) last_changed: bool,
     inflight: Option<SharedExec>,
-    // Called by step 5 during change propagation to re-execute a dirtied
-    // node through the normal eval path.
-    #[allow(dead_code)]
-    rerun: RerunFn,
+    /// Called by the driver during change propagation to re-execute a
+    /// dirtied node through the normal eval path.
+    pub(crate) rerun: RerunFn,
     def: DefId,
     /// `Debug`-rendered param, for diagnostics (tracing, panic messages)
     /// without needing `Node` itself to be generic over `P`.
@@ -108,18 +106,16 @@ enum Action {
 /// never held locked across an `.await`.
 pub(crate) struct EngineInner {
     defs: Mutex<HashMap<DefId, Arc<dyn Any + Send + Sync>>>,
-    nodes: Mutex<HashMap<CompKey, Node>>,
-    // Maintained on every dependency (re-)collection so that step 5 can map
-    // a changed (source, key) pair back to the computations that read it,
-    // without scanning the whole node table.
-    #[allow(dead_code)]
-    source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<CompKey>>>,
-    // Root applications (evaluated via `Engine::eval_root`), so step 5's
-    // garbage collection knows which nodes are reachable from outside the
-    // graph and must not be collected even with no `rdeps`.
-    #[allow(dead_code)]
-    roots: Mutex<HashSet<CompKey>>,
-    registry: Registry,
+    pub(crate) nodes: Mutex<HashMap<CompKey, Node>>,
+    /// Maintained on every dependency (re-)collection so the driver can map
+    /// a changed (source, key) pair back to the computations that read it,
+    /// without scanning the whole node table.
+    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<CompKey>>>,
+    /// Root applications (evaluated via `Engine::eval_root`), so the
+    /// driver's liveness GC knows which nodes are reachable from outside the
+    /// graph and must not be collected even with no `rdeps`.
+    pub(crate) roots: Mutex<HashSet<CompKey>>,
+    pub(crate) registry: Registry,
 }
 
 impl EngineInner {
@@ -441,7 +437,7 @@ fn render_chain(chain: &[CompKey], repeated: &CompKey) -> String {
 /// A handle to the incremental engine: the def table plus the memoized node
 /// graph. Cheap to clone (an `Arc` bump); every clone shares the same state.
 pub struct Engine {
-    inner: Arc<EngineInner>,
+    pub(crate) inner: Arc<EngineInner>,
 }
 
 impl Clone for Engine {
@@ -462,10 +458,11 @@ impl Engine {
     }
 
     /// Evaluates `comp` applied to `param` as a root application: the
-    /// public entry point used by tests and by the (step 5) driver.
+    /// public entry point used by tests and by [`crate::driver`].
     ///
-    /// The resulting node is marked as a root, so step 5's garbage
-    /// collection will not collect it even once nothing else depends on it.
+    /// The resulting node is marked as a root, so the driver's liveness
+    /// garbage collection will not collect it even once nothing else
+    /// depends on it.
     pub async fn eval_root<P: CompParam, R: CompResult>(&self, comp: &Comp<P, R>, param: P) -> Result<R, CompError> {
         let ctx = Ctx {
             engine: self.inner.clone(),
@@ -484,8 +481,8 @@ impl Engine {
 impl Engine {
     /// Test-only: forces the node for `key` to be treated as dirty, so the
     /// next `eval`/`eval_root` against it re-executes instead of hitting
-    /// the memoized cache. A stand-in for step 5's real invalidation until
-    /// change propagation exists.
+    /// the memoized cache. A stand-in for the driver's real invalidation,
+    /// useful for unit-testing this module in isolation from `driver.rs`.
     pub(crate) fn mark_dirty_for_test(&self, key: &CompKey) {
         let mut nodes = self.inner.nodes.lock().unwrap();
         if let Some(node) = nodes.get_mut(key) {
@@ -514,7 +511,7 @@ impl EngineBuilder {
         Comp::from_def_id(id)
     }
 
-    /// Attaches the sources/sinks the (step 5) driver will use. An engine
+    /// Attaches the sources/sinks [`crate::driver`] will use. An engine
     /// built without calling this has an empty registry, which is fine for
     /// tests that never write to a real sink.
     pub fn registry(&mut self, registry: Registry) -> &mut Self {
@@ -545,8 +542,8 @@ mod tests {
 
     /// A body's second execution can produce fewer sink outputs than its
     /// first; the ones it stopped producing must be deleted from the sink.
-    /// Re-execution is simulated with `mark_dirty_for_test` since real
-    /// change propagation is step 5's job, not this module's.
+    /// Re-execution is simulated with `mark_dirty_for_test` to unit-test
+    /// this behavior without depending on `driver.rs`'s change propagation.
     #[tokio::test]
     async fn output_diffing_deletes_dropped_sink_outputs() {
         let kv = MemKvSource::new("kv");

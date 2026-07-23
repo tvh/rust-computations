@@ -96,11 +96,7 @@ pub struct RawDep {
 /// Object-safe, byte-erased view of a [`SourceBase`].
 ///
 /// The engine and driver store sources heterogeneously behind this trait and
-/// only need untyped operations; step 4/5 are the actual consumers of it
-/// (exercised directly in this crate only by the erasure round-trip tests).
-// Only called through `Arc<dyn ErasedSource>` from the engine/driver (steps
-// 4-5) and from this crate's own tests; not yet called by non-test code.
-#[allow(dead_code)]
+/// only need untyped operations.
 pub(crate) trait ErasedSource: Send + Sync {
     fn instance_id(&self) -> SourceId;
     fn wait_changes(&self) -> BoxFuture<'_, HashSet<RawDep>>;
@@ -109,9 +105,8 @@ pub(crate) trait ErasedSource: Send + Sync {
 
 /// Adapts any concrete `S: SourceBase` to the erased [`ErasedSource`]
 /// interface, postcard-(de)serializing keys/versions at the boundary.
-// Constructed by `Registry::register_source`; its `ErasedSource` impl is
-// exercised by step 4/5 and by this crate's own erasure tests.
-#[allow(dead_code)]
+///
+/// Constructed by `Registry::register_source`.
 pub(crate) struct SourceAdapter<S>(pub Arc<S>);
 
 impl<S: SourceBase> ErasedSource for SourceAdapter<S> {
@@ -139,9 +134,6 @@ impl<S: SourceBase> ErasedSource for SourceAdapter<S> {
 
 /// Erases a set of typed deps into their postcard-encoded, source-tagged
 /// form, for the engine to store and match heterogeneously.
-// Only reachable via `SourceAdapter::wait_changes`, which is itself unused
-// outside tests until step 4/5 wires the engine up to `ErasedSource`.
-#[allow(dead_code)]
 pub(crate) fn raw_deps<K, V>(source: &SourceId, deps: &HashSet<Dep<K, V>>) -> HashSet<RawDep>
 where
     K: Serialize,

@@ -39,25 +39,21 @@ impl Registry {
     }
 
     /// Iterates over every registered source, erased.
-    // Consumed by the engine/driver (steps 4-5): not called yet in this crate
-    // outside tests.
-    #[allow(dead_code)]
     pub(crate) fn sources(&self) -> impl Iterator<Item = &Arc<dyn ErasedSource>> {
         self.sources.values()
     }
 
+    /// Iterates over every registered sink, erased.
+    pub(crate) fn sinks(&self) -> impl Iterator<Item = &Arc<dyn ErasedSink>> {
+        self.sinks.values()
+    }
+
     /// Looks up a registered source by id.
-    // Consumed by the engine/driver (steps 4-5): not called yet in this crate
-    // outside tests.
-    #[allow(dead_code)]
     pub(crate) fn source(&self, id: &SourceId) -> Option<&Arc<dyn ErasedSource>> {
         self.sources.get(id)
     }
 
     /// Looks up a registered sink by id.
-    // Consumed by the engine/driver (steps 4-5): not called yet in this crate
-    // outside tests.
-    #[allow(dead_code)]
     pub(crate) fn sink(&self, id: &SinkId) -> Option<&Arc<dyn ErasedSink>> {
         self.sinks.get(id)
     }
