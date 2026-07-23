@@ -56,6 +56,33 @@ const MIN_BUCKET: Duration = Duration::from_millis(100);
 /// A newtype over [`Duration`] with named convenience constants for the
 /// common granularities. Arbitrary durations are allowed via [`Bucket::new`]
 /// (minimum 100ms).
+///
+/// ## Alignment is to the Unix epoch (UTC), not to any calendar
+///
+/// A bucket boundary is computed by pure epoch arithmetic — `floor(nanos
+/// since `UNIX_EPOCH` / bucket duration) * bucket duration` (see
+/// [`round_down`](Bucket::round_down)) — so every boundary is a fixed
+/// distance from `UNIX_EPOCH`, which is itself a UTC instant. That makes
+/// [`Bucket::HOUR`] boundaries line up with UTC hour boundaries, which is
+/// *not* the same as local hour boundaries in any timezone with a
+/// fractional UTC offset (e.g. `+05:30`, `+05:45`) — the mismatch just
+/// happens to be invisible for whole-hour offsets.
+///
+/// There is deliberately no `Bucket::DAY` (nor any other constant a day or
+/// longer): a fixed 24h duration since the epoch is "midnight UTC", not
+/// midnight in any local timezone, and local calendar days are not even
+/// uniformly 24h once daylight saving time is involved. `Bucket` cannot
+/// deliver calendar-aware rounding — local midnight, DST-aware days,
+/// months — because the arithmetic has no notion of a calendar at all, only
+/// of elapsed duration since the epoch.
+///
+/// A caller who wants "daily at local midnight" (or any other
+/// calendar-relative instant) should compute that instant themselves
+/// (timezone- and DST-aware) and watch it with [`IsAfter`], rescheduling
+/// the next one after each firing. A caller who just wants *some* recurring
+/// ~24h-ish boundary and doesn't care that it's UTC-aligned can still use
+/// `Bucket::new(Duration::from_secs(24 * 60 * 60))` — just knowing it is
+/// epoch-aligned, not calendar-aligned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Bucket(Duration);
 
@@ -65,7 +92,6 @@ impl Bucket {
     pub const FIVE_MINUTES: Bucket = Bucket(Duration::from_secs(5 * 60));
     pub const FIFTEEN_MINUTES: Bucket = Bucket(Duration::from_secs(15 * 60));
     pub const HOUR: Bucket = Bucket(Duration::from_secs(60 * 60));
-    pub const DAY: Bucket = Bucket(Duration::from_secs(24 * 60 * 60));
 
     /// Builds a `Bucket` for an arbitrary granularity.
     ///
@@ -85,6 +111,11 @@ impl Bucket {
 
     /// Rounds `t` down to this bucket's most recent boundary at or before
     /// `t`.
+    ///
+    /// Boundaries are fixed durations aligned to `UNIX_EPOCH` (UTC) —
+    /// `floor(nanos since epoch / bucket duration) * bucket duration` —
+    /// never to a local calendar. See the [type docs](Bucket) for what that
+    /// does and doesn't mean for timezones and daylight saving time.
     pub fn round_down(&self, t: SystemTime) -> SystemTime {
         let nanos = nanos_since_epoch(t);
         let bucket_nanos = self.0.as_nanos();
@@ -123,6 +154,11 @@ pub struct InvalidBucket(pub Duration);
 ///
 /// Corresponds to the paper's built-in `compGetTime` source, applied to a
 /// granularity (1min, 5min, ...).
+///
+/// Rounding is epoch-aligned (UTC), not calendar-aligned — see the
+/// [`Bucket`] type docs. For a calendar-relative instant (local midnight, a
+/// DST-aware day, a month boundary), compute that instant yourself and
+/// watch it with [`IsAfter`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RoundedTime(pub Bucket);
 
