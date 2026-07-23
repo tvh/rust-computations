@@ -24,15 +24,15 @@
 //!   each wave itself deduplicated/parallelized via `Ctx::eval_all`).
 //!
 //! `sync_dir` calling itself is the standard recursion pattern for this
-//! engine: [`Comp::named`] creates a handle from the definition's name alone,
-//! with no body attached, so a definition's own body can close over a
-//! handle to itself (created before the definition exists) and the two are
-//! reconciled once `EngineBuilder::register` is called with that same name.
+//! engine, handled here by [`define_comp_rec`]: it hands the body a working
+//! handle to its own computation (`sync_dir` below), so there is no need to
+//! separately write `Comp::named("sync_dir")` and `define_comp("sync_dir",
+//! ...)` with the name repeated (and possibly drifting) between the two.
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use computations::{Comp, Engine, Registry, define_comp};
-use computations_fs::{DirEntry, EntryKind, FsSink, FsSource, ListDir, MakeDirs, ReadFile, WriteFile};
+use computations::{Engine, define_comp, define_comp_rec};
+use computations_fs::{DirEntry, EntryKind, FsSink, FsSource};
 
 struct Args {
     source: PathBuf,
@@ -91,20 +91,12 @@ async fn main() -> anyhow::Result<()> {
     let source = FsSource::new("dirsync-source")?;
     let sink = Arc::new(FsSink::new("dirsync-sink", &args.target));
 
-    let mut registry = Registry::default();
-    registry.register_source(source.clone());
-    registry.register_sink(sink.clone());
-
     let mut builder = Engine::builder();
-    builder.registry(registry);
-
-    // Pre-created handle so `sync_dir`'s own body can call itself
-    // recursively; see the module docs for why this works (`Comp::named`
-    // names a computation without requiring its `CompDef` to exist yet).
-    let sync_dir: Comp<PathBuf, ()> = Comp::named("sync_dir");
+    builder.source(source.clone());
+    builder.sink(sink.clone());
 
     let source_root = args.source.clone();
-    let sync_file: Comp<PathBuf, ()> = builder.register(define_comp("sync_file", {
+    let sync_file = builder.register(define_comp("sync_file", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -114,9 +106,9 @@ async fn main() -> anyhow::Result<()> {
             let source_root = source_root.clone();
             async move {
                 let full = source_root.join(&rel);
-                match ctx.src_req(&source, ReadFile(full)).await {
+                match source.read_file(&ctx, full).await {
                     Ok(contents) => {
-                        ctx.sink_req(&sink, WriteFile { rel_path: rel, contents }).await?;
+                        sink.write_file(&ctx, rel, contents).await?;
                     }
                     Err(e) => {
                         // The file may have vanished (or been replaced by a
@@ -137,27 +129,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    let sync_dir_def: Comp<PathBuf, ()> = builder.register(define_comp("sync_dir", {
+    let sync_dir = builder.register(define_comp_rec("sync_dir", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
         let sync_file = sync_file.clone();
-        let sync_dir = sync_dir.clone();
-        move |ctx, rel: PathBuf| {
+        move |sync_dir, ctx, rel: PathBuf| {
             let source = source.clone();
             let sink = sink.clone();
             let source_root = source_root.clone();
             let sync_file = sync_file.clone();
-            let sync_dir = sync_dir.clone();
             async move {
                 // The target root itself always exists (`FsSink::new`
                 // creates it); `MakeDirs` also rejects an empty relative
                 // path, so only non-root directories need it created.
                 if !rel.as_os_str().is_empty() {
-                    ctx.sink_req(&sink, MakeDirs { rel_path: rel.clone() }).await?;
+                    sink.make_dirs(&ctx, rel.clone()).await?;
                 }
 
-                let entries = ctx.src_req(&source, ListDir(source_root.join(&rel))).await?;
+                let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
                 let mut file_rels = Vec::new();
                 let mut dir_rels = Vec::new();
                 for DirEntry { name, kind } in entries {
@@ -180,6 +170,6 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     let engine = builder.build();
-    engine.run(&sync_dir_def, PathBuf::new()).await?;
+    engine.run(&sync_dir, PathBuf::new()).await?;
     Ok(())
 }

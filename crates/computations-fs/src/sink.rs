@@ -6,9 +6,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use computations::error::SinkError;
-use computations::{Request, Sink, SinkBase, SinkId};
+use computations::error::{CompError, SinkError};
+use computations::{Ctx, Request, Sink, SinkBase, SinkId};
 
 /// Writes `contents` to `rel_path` (relative to the sink's root), creating
 /// parent directories as needed. `Output = ()`.
@@ -87,6 +88,39 @@ impl FsSink {
 
     fn full_path(&self, rel: &Path) -> PathBuf {
         self.root.join(rel)
+    }
+
+    /// Writes `contents` to `rel_path` (relative to the sink's root),
+    /// reporting the write as an output of the currently executing
+    /// computation. A typed convenience over
+    /// `ctx.sink_req(sink, WriteFile { rel_path, contents })`.
+    pub async fn write_file(
+        self: &Arc<Self>,
+        ctx: &Ctx,
+        rel_path: impl Into<PathBuf>,
+        contents: Vec<u8>,
+    ) -> Result<(), CompError> {
+        ctx.sink_req(
+            self,
+            WriteFile {
+                rel_path: rel_path.into(),
+                contents,
+            },
+        )
+        .await
+    }
+
+    /// Creates `rel_path` (relative to the sink's root), reporting it as an
+    /// output of the currently executing computation. A typed convenience
+    /// over `ctx.sink_req(sink, MakeDirs { rel_path })`.
+    pub async fn make_dirs(self: &Arc<Self>, ctx: &Ctx, rel_path: impl Into<PathBuf>) -> Result<(), CompError> {
+        ctx.sink_req(
+            self,
+            MakeDirs {
+                rel_path: rel_path.into(),
+            },
+        )
+        .await
     }
 
     /// Removes now-empty directories, walking upward from `start` and

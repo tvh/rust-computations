@@ -55,19 +55,16 @@ Rust port, not a full port of every feature):
 ## 2. Quick example
 
 ```rust,ignore
-use computations::{Ctx, Engine, Registry, define_comp};
-use computations_fs::{FsSink, FsSource, ReadFile, WriteFile};
+use computations::{Ctx, Engine, define_comp};
+use computations_fs::{FsSink, FsSource};
 
 # async fn example() -> anyhow::Result<()> {
 let source = FsSource::new("fs")?;
 let sink = std::sync::Arc::new(FsSink::new("fs", "/tmp/out"));
 
-let mut registry = Registry::default();
-registry.register_source(source.clone());
-registry.register_sink(sink.clone());
-
 let mut builder = Engine::builder();
-builder.registry(registry);
+builder.source(source.clone());
+builder.sink(sink.clone());
 
 // `uppercase_file`: reads a file and writes its upper-cased contents.
 let uppercase_file = builder.register(define_comp("uppercase_file", {
@@ -77,12 +74,9 @@ let uppercase_file = builder.register(define_comp("uppercase_file", {
         let source = source.clone();
         let sink = sink.clone();
         async move {
-            let bytes = ctx.src_req(&source, ReadFile(path.clone())).await?;
+            let bytes = source.read_file(&ctx, path.clone()).await?;
             let upper = String::from_utf8_lossy(&bytes).to_uppercase();
-            ctx.sink_req(&sink, WriteFile {
-                rel_path: "out.txt".into(),
-                contents: upper.into_bytes(),
-            }).await?;
+            sink.write_file(&ctx, "out.txt", upper.into_bytes()).await?;
             Ok(())
         }
     }
@@ -146,7 +140,14 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
   (the paper's `CompM` monad). Every effect a computation can have —
   calling another computation, reading a source, writing a sink — goes
   through `Ctx`, which is what lets the engine record it as a dependency of
-  whichever application is currently executing.
+  whichever application is currently executing. A computation that needs to
+  call itself recursively should be built with `define_comp_rec` rather than
+  `define_comp`: it hands the body a working `Comp` handle to its own
+  definition, so there's no separate `Comp::named("x")` / `define_comp("x",
+  ...)` pair with the name `"x"` repeated (and possibly drifting) between
+  the two. Mutual recursion between two or more definitions still goes
+  through `Comp::named` directly (see the `cycle_a`/`cycle_b` test in
+  `crates/computations/tests/engine.rs`).
 - **Sources** (`source.rs`): a plugin trait pair (`SourceBase` + `Source<R>`
   per request type `R`) for external inputs. Each read reports the
   `Dep`s (key + version) it touched; the version is opaque to the engine,
@@ -157,6 +158,13 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
   `Sink<R>`). Each write reports the outputs it produced, tracked per node
   so that outputs a node stops producing — or that belonged to a node that
   died entirely — can be deleted (garbage collection, not left to rot).
+- **Registry** (`registry.rs`): the startup-time table of source/sink
+  instances the driver polls and writes through. `EngineBuilder::source`/
+  `EngineBuilder::sink` register directly into the builder's own registry
+  (as seen in the quick example above); `EngineBuilder::registry` remains
+  for callers that already assemble a `Registry` value separately (it
+  *replaces* the builder's registry outright, so call it before any
+  `source`/`sink` calls whose registrations should survive).
 - **Driver** (`driver.rs`): the top-level loop (`Engine::run`). Initial
   evaluation, a startup GC pass (deleting any sink outputs nothing live
   produces), then forever: wait for a source-change batch, map it to
@@ -176,6 +184,7 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
 | Rust (this crate) | Paper / Haskell (`skogsbaer/computations`) |
 |---|---|
 | `define_comp` | `defineComp` |
+| `define_comp_rec` | *(not in the paper; a convenience over `define_comp` + `Comp::named` for self-recursive bodies)* |
 | `Comp<P, R>` | `Comp` |
 | `Ctx::eval` | `evalComp` |
 | `Ctx::src_req` | `compSrcReq` |
@@ -228,8 +237,8 @@ by a 100ms poll interval) for filesystem-change delivery that behaves
 identically across platforms and sandboxes, which matters more for its test
 suite than shaving milliseconds off change detection.
 
-Run the test suite (38 unit/integration tests across both crates, plus a
-tracing smoke test):
+Run the test suite (41 unit/integration tests across both crates, plus a
+tracing smoke test and a doc test):
 
 ```sh
 cargo test --workspace --all-features

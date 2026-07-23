@@ -1,6 +1,6 @@
 //! End-to-end convergence test for the `dirsync` demo's wiring.
 //!
-//! Duplicates the ~40 lines of computation wiring from
+//! Duplicates the computation wiring from
 //! `examples/dirsync.rs` (examples aren't importable from an integration
 //! test crate) and drives it against real temp directories via
 //! `Engine::run`, asserting that the target directory converges to mirror
@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use computations::{Comp, Engine, Registry, define_comp};
-use computations_fs::{DirEntry, EntryKind, FsSink, FsSource, ListDir, MakeDirs, ReadFile, WriteFile};
+use computations::{Comp, Engine, define_comp, define_comp_rec};
+use computations_fs::{DirEntry, EntryKind, FsSink, FsSource};
 
 /// Polls `f` every 20ms until it returns `true`, panicking with `msg` if 15s
 /// pass first. Generous relative to the source's 100ms poll interval so
@@ -79,16 +79,11 @@ fn assert_mirrors(source: &Path, target: &Path) {
 fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBuf, ()>) {
     let source = FsSource::new("test-source").unwrap();
 
-    let mut registry = Registry::default();
-    registry.register_source(source.clone());
-    registry.register_sink(sink.clone());
-
     let mut builder = Engine::builder();
-    builder.registry(registry);
+    builder.source(source.clone());
+    builder.sink(sink.clone());
 
-    let sync_dir: Comp<PathBuf, ()> = Comp::named("sync_dir");
-
-    let sync_file: Comp<PathBuf, ()> = builder.register(define_comp("sync_file", {
+    let sync_file = builder.register(define_comp("sync_file", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -98,9 +93,9 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
             let source_root = source_root.clone();
             async move {
                 let full = source_root.join(&rel);
-                match ctx.src_req(&source, ReadFile(full)).await {
+                match source.read_file(&ctx, full).await {
                     Ok(contents) => {
-                        ctx.sink_req(&sink, WriteFile { rel_path: rel, contents }).await?;
+                        sink.write_file(&ctx, rel, contents).await?;
                     }
                     Err(e) => {
                         tracing::warn!(rel = %rel.display(), error = %e, "read failed; skipping this round");
@@ -111,24 +106,22 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
         }
     }));
 
-    let sync_dir_def: Comp<PathBuf, ()> = builder.register(define_comp("sync_dir", {
+    let sync_dir = builder.register(define_comp_rec("sync_dir", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
         let sync_file = sync_file.clone();
-        let sync_dir = sync_dir.clone();
-        move |ctx, rel: PathBuf| {
+        move |sync_dir, ctx, rel: PathBuf| {
             let source = source.clone();
             let sink = sink.clone();
             let source_root = source_root.clone();
             let sync_file = sync_file.clone();
-            let sync_dir = sync_dir.clone();
             async move {
                 if !rel.as_os_str().is_empty() {
-                    ctx.sink_req(&sink, MakeDirs { rel_path: rel.clone() }).await?;
+                    sink.make_dirs(&ctx, rel.clone()).await?;
                 }
 
-                let entries = ctx.src_req(&source, ListDir(source_root.join(&rel))).await?;
+                let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
                 let mut file_rels = Vec::new();
                 let mut dir_rels = Vec::new();
                 for DirEntry { name, kind } in entries {
@@ -149,7 +142,7 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
     }));
 
     let engine = builder.build();
-    (engine, sync_dir_def)
+    (engine, sync_dir)
 }
 
 /// Drives `sync_dir(root)` end to end through a sequence of live edits to

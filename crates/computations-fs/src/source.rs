@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
-use computations::error::SourceError;
-use computations::{Dep, Request, Source, SourceBase, SourceId, StableHash};
+use computations::error::{CompError, SourceError};
+use computations::{Ctx, Dep, Request, Source, SourceBase, SourceId, StableHash};
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -347,6 +347,20 @@ impl FsSource {
                 let _ = watcher.unwatch(path);
             }
         }
+    }
+
+    /// Reads the full contents of `path`, recording the read (and its
+    /// eventual changes) as a dependency of the currently executing
+    /// computation. A typed convenience over `ctx.src_req(source, ReadFile(path))`.
+    pub async fn read_file(self: &Arc<Self>, ctx: &Ctx, path: impl Into<PathBuf>) -> Result<Vec<u8>, CompError> {
+        ctx.src_req(self, ReadFile(path.into())).await
+    }
+
+    /// Lists the entries of the directory at `path`, recording the listing
+    /// (and its eventual changes) as a dependency of the currently executing
+    /// computation. A typed convenience over `ctx.src_req(source, ListDir(path))`.
+    pub async fn list_dir(self: &Arc<Self>, ctx: &Ctx, path: impl Into<PathBuf>) -> Result<Vec<DirEntry>, CompError> {
+        ctx.src_req(self, ListDir(path.into())).await
     }
 }
 

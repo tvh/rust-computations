@@ -32,8 +32,8 @@ use crate::def::{Comp, CompDef};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
 use crate::registry::Registry;
-use crate::sink::{OutBytes, RawOutput, SinkId};
-use crate::source::{KeyBytes, RawDep, SourceId};
+use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
+use crate::source::{KeyBytes, RawDep, SourceBase, SourceId};
 
 /// The result of one execution: the (erased) value, its content hash, and
 /// how long the body itself took to run (for the `comp.eval` tracing event).
@@ -539,9 +539,44 @@ impl EngineBuilder {
         Comp::from_def_id(id)
     }
 
-    /// Attaches the sources/sinks [`crate::driver`] will use. An engine
-    /// built without calling this has an empty registry, which is fine for
-    /// tests that never write to a real sink.
+    /// Registers a source instance directly on the builder, without having
+    /// to construct a [`Registry`] by hand first.
+    ///
+    /// Equivalent to (and implemented via) [`Registry::register_source`] on
+    /// the builder's internal registry; see that method for panic behavior.
+    /// See [`EngineBuilder::registry`] for how this interacts with a
+    /// wholesale `registry(...)` call.
+    pub fn source<S: SourceBase>(&mut self, src: Arc<S>) -> &mut Self {
+        self.registry.register_source(src);
+        self
+    }
+
+    /// Registers a sink instance directly on the builder, without having to
+    /// construct a [`Registry`] by hand first.
+    ///
+    /// Equivalent to (and implemented via) [`Registry::register_sink`] on
+    /// the builder's internal registry; see that method for panic behavior.
+    /// See [`EngineBuilder::registry`] for how this interacts with a
+    /// wholesale `registry(...)` call.
+    pub fn sink<S: SinkBase>(&mut self, sink: Arc<S>) -> &mut Self {
+        self.registry.register_sink(sink);
+        self
+    }
+
+    /// Attaches the sources/sinks [`crate::driver`] will use, *replacing*
+    /// whatever registry the builder currently holds (including anything
+    /// added via [`EngineBuilder::source`]/[`EngineBuilder::sink`] before
+    /// this call). An engine built without ever calling `registry`,
+    /// `source`, or `sink` has an empty registry, which is fine for tests
+    /// that never write to a real sink.
+    ///
+    /// Prefer `source`/`sink` for new code — they merge into the existing
+    /// registry rather than replacing it, so call order doesn't matter. This
+    /// method still exists for callers that already build a [`Registry`]
+    /// separately (or want to reset the builder's registry to a specific
+    /// one); mixing it with `source`/`sink` is fine as long as you keep in
+    /// mind that `registry(...)` wins over anything registered before it,
+    /// while `source`/`sink` called after it add to what it set.
     pub fn registry(&mut self, registry: Registry) -> &mut Self {
         self.registry = registry;
         self

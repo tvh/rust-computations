@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use computations::error::CompError;
 use computations::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
-use computations::{Comp, Engine, define_comp};
+use computations::{Comp, Engine, define_comp, define_comp_rec};
 
 /// The paper's running example: `store (sum (number_of_lines <$> file_list))`
 /// over a `MemKvSource` of file contents and a `VecSink` of written docs.
@@ -296,4 +296,73 @@ async fn eval_all_runs_concurrently() {
         elapsed < Duration::from_millis(120),
         "eval_all should run concurrently, took {elapsed:?}"
     );
+}
+
+/// `define_comp_rec` hands the body a working handle to its own
+/// computation, so self-recursion needs no separate `Comp::named` +
+/// `define_comp` pair with a duplicated name string (contrast with
+/// `self_recursion_with_different_params_works` above).
+#[tokio::test]
+async fn define_comp_rec_supports_self_recursion() {
+    let mut builder = Engine::builder();
+    let countdown: Comp<i64, i64> = builder.register(define_comp_rec(
+        "countdown_sum_rec",
+        |this, ctx, n: i64| async move {
+            if n <= 0 {
+                Ok(0)
+            } else {
+                let rest = ctx.eval(&this, n - 1).await?;
+                Ok(n + rest)
+            }
+        },
+    ));
+    let engine = builder.build();
+
+    let result = tokio::time::timeout(Duration::from_millis(500), engine.eval_root(&countdown, 5))
+        .await
+        .expect("self-recursion over distinct params must not hang")
+        .unwrap();
+
+    assert_eq!(result, 15); // 5+4+3+2+1+0
+}
+
+/// `EngineBuilder::source`/`EngineBuilder::sink` register directly on the
+/// builder's internal registry, without the caller building a `Registry` by
+/// hand — the erased source/sink must actually reach the driver's wiring
+/// (proven here via the same output-GC path exercised by the
+/// `Registry`-based test in `engine.rs`'s unit test module).
+#[tokio::test]
+async fn builder_source_and_sink_register_without_explicit_registry() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("name", "a").await;
+
+    let mut builder = Engine::builder();
+    builder.source(kv.clone());
+    builder.sink(sink.clone());
+
+    let comp: Comp<(), ()> = builder.register(define_comp("write_named_doc", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let name = ctx.src_req(&kv, GetKey("name".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name,
+                        content: "x".to_string(),
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }));
+    let engine = builder.build();
+
+    engine.eval_root(&comp, ()).await.unwrap();
+    assert_eq!(sink.get("a"), Some("x".to_string()));
 }

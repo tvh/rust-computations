@@ -53,6 +53,59 @@ where
     }
 }
 
+/// Defines a computation named `name` whose body receives a handle to
+/// itself (`this`) as its first argument.
+///
+/// This is [`define_comp`] plus the recursion boilerplate: instead of
+/// writing `Comp::named("x")` once and `define_comp("x", ...)` separately —
+/// two places that must repeat the same string literal, silently drifting
+/// apart if one is ever renamed without the other — `define_comp_rec` builds
+/// the `Comp::named(name)` handle itself and hands a clone of it to `body`
+/// on every invocation. `Comp::named` (and thus mutual, as opposed to
+/// self, recursion) is still available directly for the rarer case of two
+/// or more computations that call each other.
+///
+/// # Example
+///
+/// ```
+/// use computations::{Ctx, Engine, define_comp_rec};
+///
+/// # async fn example() -> Result<(), computations::error::CompError> {
+/// let mut builder = Engine::builder();
+/// let countdown_sum = builder.register(define_comp_rec(
+///     "countdown_sum",
+///     |this, ctx: Ctx, n: i64| async move {
+///         if n <= 0 {
+///             Ok(0)
+///         } else {
+///             let rest = ctx.eval(&this, n - 1).await?;
+///             Ok(n + rest)
+///         }
+///     },
+/// ));
+/// let engine = builder.build();
+/// assert_eq!(engine.eval_root(&countdown_sum, 5).await?, 15); // 5+4+3+2+1+0
+/// # Ok(())
+/// # }
+/// ```
+pub fn define_comp_rec<P, R, F, Fut>(name: &str, body: F) -> CompDef<P, R>
+where
+    P: CompParam,
+    R: CompResult,
+    F: Fn(Comp<P, R>, Ctx, P) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+{
+    let this = Comp::named(name);
+    let id = this.def_id().clone();
+    CompDef {
+        id,
+        body: Arc::new(move |ctx, param| {
+            let this = this.clone();
+            Box::pin(body(this, ctx, param))
+        }),
+    }
+}
+
 /// A cheap, cloneable handle referring to a computation by name only.
 ///
 /// A `Comp<P, R>` carries no body: cloning it is an `Arc` bump on the
