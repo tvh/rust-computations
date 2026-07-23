@@ -5,7 +5,7 @@
 //! change notifications for previously touched keys, and stop watching keys
 //! on request via [`SourceBase::unregister`] (paper appendix A).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -66,6 +66,31 @@ pub trait SourceBase: Send + Sync + 'static {
 
     /// Stops watching `keys` (their watchers died).
     fn unregister(&self, keys: &HashSet<Self::Key>);
+
+    /// Reports the CURRENT version of each key in `keys`, and resumes
+    /// watching them.
+    ///
+    /// Returning `None` means probing is unsupported by this source: the
+    /// engine must treat every dependent of every key in `keys` as changed.
+    /// A `Some` map entry whose value is `None` means "this key is currently
+    /// unobservable" (e.g. a deleted file) — also treated as changed unless
+    /// the previously stored version happens to compare equal to the probed
+    /// one (which, for an unobservable key, it never will, since `None` is
+    /// never equal to a previously stored `Some` version).
+    ///
+    /// # Contract
+    /// Probing a key MUST also (re)subscribe it for change notifications,
+    /// exactly as if a request had touched it. After a process restart,
+    /// dependencies restored from a persisted graph are never re-executed —
+    /// this is their only path back into the watch set. An implementation
+    /// that returns `Some` but forgets to (re)watch the probed keys will
+    /// silently stop delivering change notifications for them.
+    fn probe_versions(
+        &self,
+        _keys: &HashSet<Self::Key>,
+    ) -> impl Future<Output = Option<HashMap<Self::Key, Option<Self::Ver>>>> + Send {
+        async { None }
+    }
 }
 
 /// A source that can execute requests of type `R`.
@@ -101,6 +126,11 @@ pub(crate) trait ErasedSource: Send + Sync {
     fn instance_id(&self) -> SourceId;
     fn wait_changes(&self) -> BoxFuture<'_, HashSet<RawDep>>;
     fn unregister(&self, keys: &[KeyBytes]);
+    /// Byte-erased counterpart of [`SourceBase::probe_versions`]. Keys that
+    /// fail to deserialize as `S::Key` are simply skipped (mirrors
+    /// [`ErasedSource::unregister`]'s handling of undecodable keys) rather
+    /// than treated as an error.
+    fn probe_versions(&self, keys: &[KeyBytes]) -> BoxFuture<'_, Option<HashMap<KeyBytes, Option<VerBytes>>>>;
 }
 
 /// Adapts any concrete `S: SourceBase` to the erased [`ErasedSource`]
@@ -129,6 +159,30 @@ impl<S: SourceBase> ErasedSource for SourceAdapter<S> {
             .filter_map(|bytes| postcard::from_bytes(bytes).ok())
             .collect();
         self.0.unregister(&keys);
+    }
+
+    fn probe_versions(&self, keys: &[KeyBytes]) -> BoxFuture<'_, Option<HashMap<KeyBytes, Option<VerBytes>>>> {
+        let keys: HashSet<S::Key> = keys
+            .iter()
+            .filter_map(|bytes| postcard::from_bytes(bytes).ok())
+            .collect();
+        Box::pin(async move {
+            let probed = self.0.probe_versions(&keys).await?;
+            Some(
+                probed
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let key_bytes = postcard::to_stdvec(&k)
+                            .expect("postcard serialization of a well-formed value should not fail");
+                        let ver_bytes = v.map(|ver| {
+                            postcard::to_stdvec(&ver)
+                                .expect("postcard serialization of a well-formed value should not fail")
+                        });
+                        (key_bytes, ver_bytes)
+                    })
+                    .collect(),
+            )
+        })
     }
 }
 

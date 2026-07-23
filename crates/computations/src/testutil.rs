@@ -104,6 +104,21 @@ impl SourceBase for MemKvSource {
             state.watched.remove(key);
         }
     }
+
+    /// Reports each key's current version (defaulting to 0 for a key never
+    /// `set`, mirroring [`Source::execute`]'s behavior for [`GetKey`]) and
+    /// (re)watches every key, so a subsequent `set` notifies via
+    /// `wait_changes` exactly as if the key had been read normally.
+    async fn probe_versions(&self, keys: &HashSet<String>) -> Option<HashMap<String, Option<u64>>> {
+        let mut state = self.state.lock().unwrap();
+        let mut out = HashMap::new();
+        for key in keys {
+            let ver = *state.versions.get(key).unwrap_or(&0);
+            state.watched.insert(key.clone());
+            out.insert(key.clone(), Some(ver));
+        }
+        Some(out)
+    }
 }
 
 impl Source<GetKey> for MemKvSource {
@@ -225,6 +240,38 @@ mod tests {
 
         src.set("a", "1").await;
         let changes = src.wait_changes().await;
+        assert_eq!(changes.len(), 1);
+        let dep = changes.into_iter().next().unwrap();
+        assert_eq!(dep.key, "a");
+        assert_eq!(dep.ver, 1);
+    }
+
+    #[tokio::test]
+    async fn mem_kv_probe_versions_reports_current_versions() {
+        let src = MemKvSource::new("kv");
+        src.set("a", "1").await;
+
+        let mut keys = HashSet::new();
+        keys.insert("a".to_string());
+        keys.insert("missing".to_string());
+
+        let probed = src.probe_versions(&keys).await.expect("probing supported");
+        assert_eq!(probed.get("a"), Some(&Some(1)));
+        assert_eq!(probed.get("missing"), Some(&Some(0)));
+    }
+
+    #[tokio::test]
+    async fn mem_kv_probe_versions_resubscribes_for_future_notifications() {
+        let src = MemKvSource::new("kv");
+        // Never read/watched "a" via `execute` — only via `probe_versions`.
+        let mut keys = HashSet::new();
+        keys.insert("a".to_string());
+        let _ = src.probe_versions(&keys).await.expect("probing supported");
+
+        src.set("a", "1").await;
+        let changes = tokio::time::timeout(std::time::Duration::from_millis(500), src.wait_changes())
+            .await
+            .expect("probed key should have been (re)subscribed for change notifications");
         assert_eq!(changes.len(), 1);
         let dep = changes.into_iter().next().unwrap();
         assert_eq!(dep.key, "a");

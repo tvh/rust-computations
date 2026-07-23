@@ -372,6 +372,33 @@ impl SourceBase for FsSource {
         self.id.clone()
     }
 
+    /// Reports each path's current [`FsVer`] and (re)watches it — exactly
+    /// [`FsSource::register`], driven for a batch of keys instead of a
+    /// single request.
+    ///
+    /// A key still tracked from a previous `register` (i.e. this same
+    /// `FsSource` instance already watches it) reuses its known `is_dir`.
+    /// Otherwise (typically: a key restored from a persisted graph, in a
+    /// fresh process that has never watched it) `is_dir` is determined by
+    /// asking the filesystem directly; a path that doesn't currently exist
+    /// is treated as a file, which is harmless — `compute_file_ver` and
+    /// `compute_dir_ver` agree on `FsVer::Missing` for a nonexistent path
+    /// either way, and the file/dir distinction only starts to matter once
+    /// something exists there again.
+    async fn probe_versions(&self, keys: &HashSet<PathBuf>) -> Option<HashMap<PathBuf, Option<FsVer>>> {
+        let mut out = HashMap::new();
+        for key in keys {
+            let is_dir = {
+                let watched = self.shared.watched.lock().unwrap();
+                watched.get(key).map(|e| e.is_dir)
+            }
+            .unwrap_or_else(|| key.is_dir());
+            let ver = self.register(key, is_dir);
+            out.insert(key.clone(), Some(ver));
+        }
+        Some(out)
+    }
+
     async fn wait_changes(&self) -> HashSet<Dep<PathBuf, FsVer>> {
         let mut rx = self.changes_rx.lock().await;
         let mut batch = HashSet::new();
@@ -563,6 +590,50 @@ mod tests {
             timed_out.is_err(),
             "unregistered key should not notify, got {timed_out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_versions_reports_current_version_for_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let file_key = canonical_key(&file_path).unwrap();
+        let dir_key = canonical_key(dir.path()).unwrap();
+
+        // A fresh source, never having executed a request against either
+        // key — as if these keys were restored from a persisted graph.
+        let src = FsSource::new("fs").unwrap();
+        let mut keys = HashSet::new();
+        keys.insert(file_key.clone());
+        keys.insert(dir_key.clone());
+
+        let probed = src.probe_versions(&keys).await.expect("probing supported");
+        assert!(matches!(probed.get(&file_key), Some(Some(FsVer::File { .. }))));
+        assert!(matches!(probed.get(&dir_key), Some(Some(FsVer::Dir { .. }))));
+    }
+
+    #[tokio::test]
+    async fn probe_versions_resubscribes_for_future_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let file_key = canonical_key(&file_path).unwrap();
+
+        let src = FsSource::new("fs").unwrap();
+        // Never read via `execute` — only via `probe_versions`.
+        let mut keys = HashSet::new();
+        keys.insert(file_key.clone());
+        let _ = src.probe_versions(&keys).await.expect("probing supported");
+
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let changes = wait_changes_timeout(&src)
+            .await
+            .expect("probed key should have been (re)subscribed for change notifications");
+        assert_eq!(changes.len(), 1);
+        let changed = changes.into_iter().next().unwrap();
+        assert_eq!(changed.key, file_key);
     }
 
     #[tokio::test]

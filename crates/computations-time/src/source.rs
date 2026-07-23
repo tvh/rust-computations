@@ -399,6 +399,48 @@ impl SourceBase for TimeSource {
             self.shared.reschedule.notify_one();
         }
     }
+
+    /// Reports each key's current [`TimeVer`] and (re)registers it on the
+    /// schedule — exactly [`Source::execute`]'s registration side, driven
+    /// for a batch of keys instead of a single request.
+    ///
+    /// A [`TimeKey::Bucket`] is always re-added (buckets recur forever, so
+    /// there is no "already passed" case). A [`TimeKey::Deadline`] already
+    /// in the past is reported as `TimeVer::After(true)` without entering
+    /// the schedule at all — mirroring `Source<IsAfter>::execute`'s own
+    /// "an already-past deadline never gets scheduled" rule — since it has
+    /// nothing left to fire and would otherwise sit in the heap forever.
+    async fn probe_versions(&self, keys: &HashSet<TimeKey>) -> Option<HashMap<TimeKey, Option<TimeVer>>> {
+        let now = SystemTime::now();
+        let mut out = HashMap::new();
+        let mut changed = false;
+        {
+            let mut watched = self.shared.watched.lock().unwrap();
+            for key in keys {
+                match key {
+                    TimeKey::Bucket(b) => {
+                        let rounded = b.round_down(now);
+                        let is_new = !watched.buckets.contains_key(b);
+                        watched.buckets.insert(*b, rounded);
+                        changed |= is_new;
+                        out.insert(*key, Some(TimeVer::Rounded(rounded)));
+                    }
+                    TimeKey::Deadline(t) => {
+                        let after = now >= *t;
+                        if !after {
+                            changed |= watched.insert_deadline(*t);
+                        }
+                        out.insert(*key, Some(TimeVer::After(after)));
+                    }
+                }
+            }
+        }
+        if changed {
+            tracing::debug!("time source: probed keys registered, rearming timer");
+            self.shared.reschedule.notify_one();
+        }
+        Some(out)
+    }
 }
 
 impl Source<RoundedTime> for TimeSource {
@@ -605,5 +647,78 @@ mod tests {
         assert!(result.unwrap());
         let dep = deps.into_iter().next().unwrap();
         assert_eq!(dep.ver, TimeVer::After(true));
+    }
+
+    #[tokio::test]
+    async fn probe_versions_reports_current_bucket_and_deadline_state() {
+        let src = TimeSource::new("time");
+        let bucket = Bucket::new(Duration::from_millis(300)).unwrap();
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let past = SystemTime::now() - Duration::from_secs(3600);
+
+        let mut keys = HashSet::new();
+        keys.insert(TimeKey::Bucket(bucket));
+        keys.insert(TimeKey::Deadline(future));
+        keys.insert(TimeKey::Deadline(past));
+
+        let probed = src.probe_versions(&keys).await.expect("probing supported");
+        assert!(matches!(probed.get(&TimeKey::Bucket(bucket)), Some(Some(TimeVer::Rounded(_)))));
+        assert_eq!(probed.get(&TimeKey::Deadline(future)), Some(&Some(TimeVer::After(false))));
+        assert_eq!(
+            probed.get(&TimeKey::Deadline(past)),
+            Some(&Some(TimeVer::After(true))),
+            "a past deadline probes as fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_versions_resubscribes_bucket_for_future_notifications() {
+        let src = TimeSource::new("time");
+        let bucket = Bucket::new(Duration::from_millis(150)).unwrap();
+
+        // Never executed a request against this bucket — only probed, as if
+        // it were restored from a persisted graph.
+        let mut keys = HashSet::new();
+        keys.insert(TimeKey::Bucket(bucket));
+        let _ = src.probe_versions(&keys).await.expect("probing supported");
+
+        let changes = tokio::time::timeout(Duration::from_secs(5), src.wait_changes())
+            .await
+            .expect("probed bucket should have been (re)subscribed for change notifications");
+        let dep = changes.into_iter().next().unwrap();
+        assert_eq!(dep.key, TimeKey::Bucket(bucket));
+    }
+
+    #[tokio::test]
+    async fn probe_versions_resubscribes_deadline_for_future_notifications() {
+        let src = TimeSource::new("time");
+        let deadline = SystemTime::now() + Duration::from_millis(150);
+
+        // Never executed a request against this deadline — only probed.
+        let mut keys = HashSet::new();
+        keys.insert(TimeKey::Deadline(deadline));
+        let _ = src.probe_versions(&keys).await.expect("probing supported");
+
+        let changes = tokio::time::timeout(Duration::from_secs(5), src.wait_changes())
+            .await
+            .expect("probed deadline should have been (re)subscribed for change notifications");
+        let dep = changes.into_iter().next().unwrap();
+        assert_eq!(dep.key, TimeKey::Deadline(deadline));
+        assert_eq!(dep.ver, TimeVer::After(true));
+    }
+
+    #[tokio::test]
+    async fn probe_versions_never_schedules_a_past_deadline() {
+        let src = TimeSource::new("time");
+        let past = SystemTime::now() - Duration::from_secs(3600);
+
+        let mut keys = HashSet::new();
+        keys.insert(TimeKey::Deadline(past));
+        let probed = src.probe_versions(&keys).await.expect("probing supported");
+        assert_eq!(probed.get(&TimeKey::Deadline(past)), Some(&Some(TimeVer::After(true))));
+
+        // Nothing should ever fire for it: it never entered the schedule.
+        let timed_out = tokio::time::timeout(Duration::from_millis(300), src.wait_changes()).await;
+        assert!(timed_out.is_err(), "a past deadline probed should never be scheduled");
     }
 }
