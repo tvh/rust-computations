@@ -24,11 +24,24 @@
 //!   each wave itself deduplicated/parallelized via `Ctx::eval_all`).
 //!
 //! `sync_dir` calling itself is the standard recursion pattern for this
-//! engine, handled here by `EngineBuilder::define_rec`: it hands the body a
-//! working handle to its own computation (`sync_dir` below), so there is no
-//! need to separately write `Comp::named("sync_dir")` and
+//! engine, handled here by `EngineBuilder::define_rec_with`: it hands the
+//! body a working handle to its own computation (`sync_dir` below), so there
+//! is no need to separately write `Comp::named("sync_dir")` and
 //! `define_comp("sync_dir", ...)` with the name repeated (and possibly
 //! drifting) between the two.
+//!
+//! Both definitions are built with the `_with` variants
+//! (`EngineBuilder::define_with` / `EngineBuilder::define_rec_with`): `let
+//! env = (source, sink, source_root);` is built once, after registering
+//! `source`/`sink` on the builder (which each need one clone of their own,
+//! since the builder keeps its own `Arc` alongside the one moved into
+//! `env`), and lent by reference to both `define_with`/`define_rec_with`
+//! calls. Each body destructures its `(source, sink, source_root)` env
+//! parameter directly — those two registration clones are the only clones
+//! left in this wiring for capturing shared state; the one remaining
+//! `rel.clone()` in `sync_dir`'s body is an ordinary value clone (`rel` is
+//! consumed by `make_dirs` and then read again below), unrelated to the env
+//! pattern.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -96,77 +109,61 @@ async fn main() -> anyhow::Result<()> {
     builder.source(source.clone());
     builder.sink(sink.clone());
 
-    let source_root = args.source.clone();
-    let sync_file = builder.define("sync_file", {
-        let source = source.clone();
-        let sink = sink.clone();
-        let source_root = source_root.clone();
-        move |ctx, rel: PathBuf| {
-            let source = source.clone();
-            let sink = sink.clone();
-            let source_root = source_root.clone();
-            async move {
-                let full = source_root.join(&rel);
-                match source.read_file(&ctx, full).await {
-                    Ok(contents) => {
-                        sink.write_file(&ctx, rel, contents).await?;
-                    }
-                    Err(e) => {
-                        // The file may have vanished (or been replaced by a
-                        // directory, etc.) between its parent directory's
-                        // listing and this read. Rather than failing the
-                        // node (which would leave a stale write behind and
-                        // spam retries), we log and succeed with no output:
-                        // the parent directory's `ListDir` dependency will
-                        // itself have changed (the entry disappeared), which
-                        // re-triggers `sync_dir` and, transitively, drops
-                        // this `sync_file` application if it's no longer
-                        // listed — or re-attempts it if the file reappears.
-                        tracing::warn!(rel = %rel.display(), error = %e, "read failed; skipping this round");
-                    }
-                }
-                Ok(())
+    let env = (source, sink, args.source);
+    let sync_file = builder.define_with("sync_file", &env, |(source, sink, source_root), ctx, rel: PathBuf| async move {
+        let full = source_root.join(&rel);
+        match source.read_file(&ctx, full).await {
+            Ok(contents) => {
+                sink.write_file(&ctx, rel, contents).await?;
+            }
+            Err(e) => {
+                // The file may have vanished (or been replaced by a
+                // directory, etc.) between its parent directory's listing
+                // and this read. Rather than failing the node (which would
+                // leave a stale write behind and spam retries), we log and
+                // succeed with no output: the parent directory's `ListDir`
+                // dependency will itself have changed (the entry
+                // disappeared), which re-triggers `sync_dir` and,
+                // transitively, drops this `sync_file` application if it's
+                // no longer listed — or re-attempts it if the file
+                // reappears.
+                tracing::warn!(rel = %rel.display(), error = %e, "read failed; skipping this round");
             }
         }
+        Ok(())
     });
 
-    let sync_dir = builder.define_rec("sync_dir", {
-        let source = source.clone();
-        let sink = sink.clone();
-        let source_root = source_root.clone();
-        move |sync_dir, ctx, rel: PathBuf| {
-            let source = source.clone();
-            let sink = sink.clone();
-            let source_root = source_root.clone();
-            async move {
-                // The target root itself always exists (`FsSink::new`
-                // creates it); `MakeDirs` also rejects an empty relative
-                // path, so only non-root directories need it created.
-                if !rel.as_os_str().is_empty() {
-                    sink.make_dirs(&ctx, rel.clone()).await?;
-                }
-
-                let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
-                let mut file_rels = Vec::new();
-                let mut dir_rels = Vec::new();
-                for DirEntry { name, kind } in entries {
-                    let child_rel = rel.join(&name);
-                    match kind {
-                        EntryKind::File => file_rels.push(child_rel),
-                        EntryKind::Dir => dir_rels.push(child_rel),
-                    }
-                }
-
-                // Haxl-style: both waves of children run concurrently, each
-                // wave itself batched via `eval_all`.
-                let files_fut = ctx.eval_all(&sync_file, file_rels);
-                let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
-                tokio::try_join!(files_fut, dirs_fut)?;
-
-                Ok(())
+    let sync_dir = builder.define_rec_with(
+        "sync_dir",
+        &env,
+        move |(source, sink, source_root), sync_dir, ctx, rel: PathBuf| async move {
+            // The target root itself always exists (`FsSink::new` creates
+            // it); `MakeDirs` also rejects an empty relative path, so only
+            // non-root directories need it created.
+            if !rel.as_os_str().is_empty() {
+                sink.make_dirs(&ctx, rel.clone()).await?;
             }
-        }
-    });
+
+            let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
+            let mut file_rels = Vec::new();
+            let mut dir_rels = Vec::new();
+            for DirEntry { name, kind } in entries {
+                let child_rel = rel.join(&name);
+                match kind {
+                    EntryKind::File => file_rels.push(child_rel),
+                    EntryKind::Dir => dir_rels.push(child_rel),
+                }
+            }
+
+            // Haxl-style: both waves of children run concurrently, each
+            // wave itself batched via `eval_all`.
+            let files_fut = ctx.eval_all(&sync_file, file_rels);
+            let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
+            tokio::try_join!(files_fut, dirs_fut)?;
+
+            Ok(())
+        },
+    );
 
     let engine = builder.build();
     engine.run(&sync_dir, PathBuf::new()).await?;

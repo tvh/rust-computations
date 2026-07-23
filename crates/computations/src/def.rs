@@ -103,6 +103,105 @@ where
     }
 }
 
+/// Defines a computation named `name` whose body is threaded a shared
+/// environment `env` on every invocation, in addition to the usual `Ctx`
+/// and parameter.
+///
+/// This is [`define_comp`] plus one extra argument: instead of `Fn(Ctx, P)
+/// -> Fut`, the body is `Fn(E, Ctx, P) -> Fut`, and `env` is cloned once per
+/// call so the body always gets an owned value rather than a reference. It
+/// exists because a `CompDef`'s body must be `'static` and callable
+/// repeatedly, which otherwise forces callers to hand-write a two-layer
+/// clone dance: clone captured handles into the outer closure, then clone
+/// them again into the inner `async move` block for every call. Taking
+/// `env` once here and cloning it internally removes that boilerplate from
+/// the call site.
+///
+/// `env` is typically a tuple of cheaply-cloneable handles (`Arc<...>`
+/// sources/sinks, config values, `PathBuf` roots, ...); destructure it
+/// directly in the closure's parameter list, e.g. `|(source, sink, root),
+/// ctx, rel| { ... }`.
+///
+/// `define_comp_with` takes `env` by reference (`&E`, cloned once here to
+/// build the stored closure) rather than by value, which supports two call
+/// styles:
+///
+/// - **Shared across several definitions**: build `let env = (...);` once,
+///   then pass `&env` to each `define_comp_with` call that needs it — no
+///   `.clone()` appears anywhere in the call site.
+/// - **Single-use, inline**: pass a temporary directly, e.g.
+///   `define_comp_with("x", &(a, b, c), |...| ...)`. This moves `a`, `b`,
+///   `c` into the anonymous temporary, so it only makes sense when no other
+///   definition needs those values afterward.
+///
+/// The per-invocation `env.clone()` this performs internally is cheap for an
+/// `Arc`-based env (a refcount bump), not a deep copy.
+///
+/// # Example
+///
+/// ```
+/// use computations::{Ctx, Engine, define_comp_with};
+///
+/// # async fn example() -> Result<(), computations::error::CompError> {
+/// let prefix = "hello, ".to_string();
+/// let mut builder = Engine::builder();
+/// let greet = builder.register(define_comp_with(
+///     "greet",
+///     &prefix,
+///     |prefix: String, _ctx: Ctx, name: String| async move { Ok(format!("{prefix}{name}")) },
+/// ));
+/// let engine = builder.build();
+/// assert_eq!(engine.eval_root(&greet, "world".to_string()).await?, "hello, world");
+/// # Ok(())
+/// # }
+/// ```
+pub fn define_comp_with<E, P, R, F, Fut>(name: &'static str, env: &E, body: F) -> CompDef<P, R>
+where
+    E: Clone + Send + Sync + 'static,
+    P: CompParam,
+    R: CompResult,
+    F: Fn(E, Ctx, P) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+{
+    let env = env.clone();
+    CompDef {
+        id: DefId::new(name),
+        body: Arc::new(move |ctx, param| {
+            let env = env.clone();
+            Box::pin(body(env, ctx, param))
+        }),
+    }
+}
+
+/// Defines a self-recursive computation named `name` (see [`define_comp_rec`])
+/// whose body is additionally threaded a shared environment `env` on every
+/// invocation (see [`define_comp_with`]).
+///
+/// The body's signature is `Fn(E, Comp<P, R>, Ctx, P) -> Fut`: an owned clone
+/// of `env`, then the working handle to the computation's own definition,
+/// then the usual `Ctx`/param pair. See [`define_comp_with`] for the two
+/// `&env` call styles (shared-across-definitions vs. single-use inline) and
+/// why `env` is cloned once per invocation rather than passed by reference.
+pub fn define_comp_rec_with<E, P, R, F, Fut>(name: &'static str, env: &E, body: F) -> CompDef<P, R>
+where
+    E: Clone + Send + Sync + 'static,
+    P: CompParam,
+    R: CompResult,
+    F: Fn(E, Comp<P, R>, Ctx, P) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+{
+    let this = Comp::named(name);
+    let id = *this.def_id();
+    let env = env.clone();
+    CompDef {
+        id,
+        body: Arc::new(move |ctx, param| {
+            let env = env.clone();
+            Box::pin(body(env, this, ctx, param))
+        }),
+    }
+}
+
 /// A cheap, `Copy` handle referring to a computation by name only.
 ///
 /// A `Comp<P, R>` carries no body: copying it is just copying its

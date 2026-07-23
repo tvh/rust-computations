@@ -83,61 +83,46 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
     builder.source(source.clone());
     builder.sink(sink.clone());
 
-    let sync_file = builder.define("sync_file", {
-        let source = source.clone();
-        let sink = sink.clone();
-        let source_root = source_root.clone();
-        move |ctx, rel: PathBuf| {
-            let source = source.clone();
-            let sink = sink.clone();
-            let source_root = source_root.clone();
-            async move {
-                let full = source_root.join(&rel);
-                match source.read_file(&ctx, full).await {
-                    Ok(contents) => {
-                        sink.write_file(&ctx, rel, contents).await?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(rel = %rel.display(), error = %e, "read failed; skipping this round");
-                    }
-                }
-                Ok(())
+    let env = (source, sink, source_root);
+    let sync_file = builder.define_with("sync_file", &env, |(source, sink, source_root), ctx, rel: PathBuf| async move {
+        let full = source_root.join(&rel);
+        match source.read_file(&ctx, full).await {
+            Ok(contents) => {
+                sink.write_file(&ctx, rel, contents).await?;
+            }
+            Err(e) => {
+                tracing::warn!(rel = %rel.display(), error = %e, "read failed; skipping this round");
             }
         }
+        Ok(())
     });
 
-    let sync_dir = builder.define_rec("sync_dir", {
-        let source = source.clone();
-        let sink = sink.clone();
-        let source_root = source_root.clone();
-        move |sync_dir, ctx, rel: PathBuf| {
-            let source = source.clone();
-            let sink = sink.clone();
-            let source_root = source_root.clone();
-            async move {
-                if !rel.as_os_str().is_empty() {
-                    sink.make_dirs(&ctx, rel.clone()).await?;
-                }
-
-                let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
-                let mut file_rels = Vec::new();
-                let mut dir_rels = Vec::new();
-                for DirEntry { name, kind } in entries {
-                    let child_rel = rel.join(&name);
-                    match kind {
-                        EntryKind::File => file_rels.push(child_rel),
-                        EntryKind::Dir => dir_rels.push(child_rel),
-                    }
-                }
-
-                let files_fut = ctx.eval_all(&sync_file, file_rels);
-                let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
-                tokio::try_join!(files_fut, dirs_fut)?;
-
-                Ok(())
+    let sync_dir = builder.define_rec_with(
+        "sync_dir",
+        &env,
+        move |(source, sink, source_root), sync_dir, ctx, rel: PathBuf| async move {
+            if !rel.as_os_str().is_empty() {
+                sink.make_dirs(&ctx, rel.clone()).await?;
             }
-        }
-    });
+
+            let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
+            let mut file_rels = Vec::new();
+            let mut dir_rels = Vec::new();
+            for DirEntry { name, kind } in entries {
+                let child_rel = rel.join(&name);
+                match kind {
+                    EntryKind::File => file_rels.push(child_rel),
+                    EntryKind::Dir => dir_rels.push(child_rel),
+                }
+            }
+
+            let files_fut = ctx.eval_all(&sync_file, file_rels);
+            let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
+            tokio::try_join!(files_fut, dirs_fut)?;
+
+            Ok(())
+        },
+    );
 
     let engine = builder.build();
     (engine, sync_dir)

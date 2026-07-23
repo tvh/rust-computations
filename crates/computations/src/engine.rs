@@ -29,7 +29,7 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use tracing::Instrument;
 
 use crate::ctx::Ctx;
-use crate::def::{Comp, CompDef, define_comp, define_comp_rec};
+use crate::def::{Comp, CompDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
 use crate::registry::Registry;
@@ -581,6 +581,78 @@ impl EngineBuilder {
         Fut: Future<Output = Result<R, CompError>> + Send + 'static,
     {
         self.register(define_comp_rec(name, body))
+    }
+
+    /// Defines and registers a computation named `name` in one step,
+    /// threading a shared environment `env` into the body on every
+    /// invocation.
+    ///
+    /// This is exactly [`crate::def::define_comp_with`] followed by
+    /// [`EngineBuilder::register`], collapsed into a single call — the
+    /// environment-passing counterpart to [`EngineBuilder::define`]. Where
+    /// `define`'s body is `Fn(Ctx, P) -> Fut`, `define_with`'s body is `Fn(E,
+    /// Ctx, P) -> Fut`: it receives an owned clone of `env`, freshly made for
+    /// every invocation, so there is no need to hand-write the two-layer
+    /// clone dance (clone into the outer closure, clone again into the inner
+    /// `async move`) that capturing `Arc` handles directly would otherwise
+    /// require.
+    ///
+    /// `env` is typically a tuple of cheaply-cloneable handles (`Arc<...>`
+    /// sources/sinks, config values, `PathBuf` roots, ...); destructure it
+    /// directly in the closure's parameter list, e.g. `|(source, sink,
+    /// root), ctx, rel| { ... }`.
+    ///
+    /// `env` is taken by reference (`&E`) rather than by value, which
+    /// supports two call styles:
+    ///
+    /// - **Shared across several definitions**: build `let env = (...);`
+    ///   once, then lend `&env` to every `define_with`/`define_rec_with` call
+    ///   that needs it — no `.clone()` appears anywhere in the wiring code.
+    /// - **Single-use, inline**: pass a temporary directly, e.g.
+    ///   `builder.define_with("x", &(a, b, c), |...| ...)`. This *moves* `a`,
+    ///   `b`, `c` into the anonymous temporary, so it only suits a value used
+    ///   by exactly one definition.
+    ///
+    /// The per-invocation `env.clone()` performed internally is cheap for an
+    /// `Arc`-based env (a refcount bump), not a deep copy.
+    ///
+    /// # Panics
+    /// Panics if a computation with the same name is already registered.
+    pub fn define_with<E, P, R, F, Fut>(&mut self, name: &'static str, env: &E, body: F) -> Comp<P, R>
+    where
+        E: Clone + Send + Sync + 'static,
+        P: CompParam,
+        R: CompResult,
+        F: Fn(E, Ctx, P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+    {
+        self.register(define_comp_with(name, env, body))
+    }
+
+    /// Defines and registers a self-recursive computation named `name` in
+    /// one step, threading a shared environment `env` into the body on every
+    /// invocation.
+    ///
+    /// This is exactly [`crate::def::define_comp_rec_with`] followed by
+    /// [`EngineBuilder::register`] — the environment-passing counterpart to
+    /// [`EngineBuilder::define_rec`]. The body's signature is `Fn(E,
+    /// Comp<P, R>, Ctx, P) -> Fut`: an owned clone of `env`, then the working
+    /// handle to the computation's own definition (`this`), then the usual
+    /// `Ctx`/param pair. See [`EngineBuilder::define_with`] for the two
+    /// `&env` call styles (shared-across-definitions vs. single-use inline)
+    /// and why `env` is cloned once per invocation.
+    ///
+    /// # Panics
+    /// Panics if a computation with the same name is already registered.
+    pub fn define_rec_with<E, P, R, F, Fut>(&mut self, name: &'static str, env: &E, body: F) -> Comp<P, R>
+    where
+        E: Clone + Send + Sync + 'static,
+        P: CompParam,
+        R: CompResult,
+        F: Fn(E, Comp<P, R>, Ctx, P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+    {
+        self.register(define_comp_rec_with(name, env, body))
     }
 
     /// Registers a source instance directly on the builder, without having

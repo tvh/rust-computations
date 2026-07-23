@@ -55,7 +55,7 @@ Rust port, not a full port of every feature):
 ## 2. Quick example
 
 ```rust,ignore
-use computations::{Ctx, Engine};
+use computations::Engine;
 use computations_fs::{FsSink, FsSource};
 
 # async fn example() -> anyhow::Result<()> {
@@ -67,21 +67,16 @@ builder.source(source.clone());
 builder.sink(sink.clone());
 
 // `uppercase_file`: reads a file and writes its upper-cased contents.
-// `EngineBuilder::define` is `define_comp` + `register` in one step — the
-// preferred way to define a computation.
-let uppercase_file = builder.define("uppercase_file", {
-    let source = source.clone();
-    let sink = sink.clone();
-    move |ctx: Ctx, path: std::path::PathBuf| {
-        let source = source.clone();
-        let sink = sink.clone();
-        async move {
-            let bytes = source.read_file(&ctx, path.clone()).await?;
-            let upper = String::from_utf8_lossy(&bytes).to_uppercase();
-            sink.write_file(&ctx, "out.txt", upper.into_bytes()).await?;
-            Ok(())
-        }
-    }
+// `EngineBuilder::define_with` is the environment-passing counterpart to
+// `define_comp` + `register`: build `env` once, and the body gets an owned
+// clone of it on every invocation — no per-call clone dance to write out
+// by hand.
+let env = (source, sink);
+let uppercase_file = builder.define_with("uppercase_file", &env, |(source, sink), ctx, path: std::path::PathBuf| async move {
+    let bytes = source.read_file(&ctx, path.clone()).await?;
+    let upper = String::from_utf8_lossy(&bytes).to_uppercase();
+    sink.write_file(&ctx, "out.txt", upper.into_bytes()).await?;
+    Ok(())
 });
 
 let engine = builder.build();
@@ -96,6 +91,12 @@ engine.eval_root(&uppercase_file, "/tmp/in.txt".into()).await?;
 This is illustrative (marked `ignore` since it depends on real paths at
 `/tmp`) rather than doc-tested; see `crates/computations-fs/examples/dirsync.rs`
 for a complete, runnable version with two mutually-recursive computations.
+
+`define_with`/`define_rec_with` (this section's flagship pattern) are the
+environment-passing variants of `define`/`define_rec`: reach for the plain
+`define`/`define_rec` instead when a computation's body needs no captured
+environment at all (see the `sum`/`store` computations in
+`crates/computations/tests/engine.rs` for that no-env case).
 
 ## 3. The dirsync demo
 

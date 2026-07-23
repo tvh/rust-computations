@@ -2,8 +2,8 @@
 //! collection, single-flight dedup, cycle detection, and concurrent
 //! evaluation. Run with `cargo test -p computations --features testutil`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use computations::error::CompError;
@@ -325,4 +325,62 @@ async fn builder_source_and_sink_register_without_explicit_registry() {
 
     engine.eval_root(&comp, ()).await.unwrap();
     assert_eq!(sink.get("a"), Some("x".to_string()));
+}
+
+/// `define_with` clones its shared env into the body on every invocation;
+/// destructuring the env tuple directly in the closure's parameter list
+/// gives access to its pieces (here a log and a string prefix) with no
+/// `.clone()` needed anywhere in the call site beyond the env tuple's own
+/// construction.
+#[tokio::test]
+async fn define_with_threads_shared_env_into_every_invocation() {
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let prefix = "n=".to_string();
+
+    let mut builder = Engine::builder();
+    let env = (log.clone(), prefix);
+    let record: Comp<i32, i32> = builder.define_with("record", &env, |(log, prefix), _ctx, n: i32| async move {
+        log.lock().unwrap().push(format!("{prefix}{n}"));
+        Ok(n * 2)
+    });
+    let engine = builder.build();
+
+    assert_eq!(engine.eval_root(&record, 1).await.unwrap(), 2);
+    assert_eq!(engine.eval_root(&record, 2).await.unwrap(), 4);
+    assert_eq!(engine.eval_root(&record, 3).await.unwrap(), 6);
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["n=1".to_string(), "n=2".to_string(), "n=3".to_string()],
+        "every invocation should observe the same shared env"
+    );
+}
+
+/// `define_rec_with` combines self-recursion (a working `this` handle,
+/// passed between the env and `Ctx`) with a shared env: each recursive step
+/// appends to an env-held `Arc<Mutex<Vec<i64>>>`, proving both the
+/// recursive handle and the env are threaded correctly on every call,
+/// including the recursive ones.
+#[tokio::test]
+async fn define_rec_with_supports_recursion_with_shared_env() {
+    let steps: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut builder = Engine::builder();
+    let env = steps.clone();
+    let countdown: Comp<i64, i64> =
+        builder.define_rec_with("countdown_with_env", &env, |steps, this, ctx, n: i64| async move {
+            steps.lock().unwrap().push(n);
+            if n <= 0 {
+                Ok(0)
+            } else {
+                let rest = ctx.eval(&this, n - 1).await?;
+                Ok(n + rest)
+            }
+        });
+    let engine = builder.build();
+
+    let result = engine.eval_root(&countdown, 5).await.unwrap();
+
+    assert_eq!(result, 15); // 5+4+3+2+1+0
+    assert_eq!(*steps.lock().unwrap(), vec![5, 4, 3, 2, 1, 0]);
 }
