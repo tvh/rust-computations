@@ -21,6 +21,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,7 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use tracing::Instrument;
 
 use crate::ctx::Ctx;
-use crate::def::{Comp, CompDef};
+use crate::def::{Comp, CompDef, define_comp, define_comp_rec};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
 use crate::registry::Registry;
@@ -537,6 +538,49 @@ impl EngineBuilder {
         let prev = self.defs.insert(id.clone(), Arc::new(def) as Arc<dyn Any + Send + Sync>);
         assert!(prev.is_none(), "duplicate computation name: {id}");
         Comp::from_def_id(id)
+    }
+
+    /// Defines and registers a computation named `name` in one step.
+    ///
+    /// This is the preferred way to define a computation: it is exactly
+    /// [`crate::def::define_comp`] followed by [`EngineBuilder::register`],
+    /// collapsed into a single call. Reach for `define_comp` + `register`
+    /// separately only when the [`CompDef`] needs to be built somewhere else
+    /// (e.g. by a library handing back a `CompDef` for the caller to
+    /// register).
+    ///
+    /// # Panics
+    /// Panics if a computation with the same name is already registered.
+    pub fn define<P, R, F, Fut>(&mut self, name: &str, body: F) -> Comp<P, R>
+    where
+        P: CompParam,
+        R: CompResult,
+        F: Fn(Ctx, P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+    {
+        self.register(define_comp(name, body))
+    }
+
+    /// Defines and registers a self-recursive computation named `name` in
+    /// one step.
+    ///
+    /// This is the preferred way to define a self-recursive computation: it
+    /// is exactly [`crate::def::define_comp_rec`] followed by
+    /// [`EngineBuilder::register`], collapsed into a single call. Reach for
+    /// `define_comp_rec` + `register` separately only when the [`CompDef`]
+    /// needs to be built somewhere else (e.g. by a library handing back a
+    /// `CompDef` for the caller to register).
+    ///
+    /// # Panics
+    /// Panics if a computation with the same name is already registered.
+    pub fn define_rec<P, R, F, Fut>(&mut self, name: &str, body: F) -> Comp<P, R>
+    where
+        P: CompParam,
+        R: CompResult,
+        F: Fn(Comp<P, R>, Ctx, P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, CompError>> + Send + 'static,
+    {
+        self.register(define_comp_rec(name, body))
     }
 
     /// Registers a source instance directly on the builder, without having

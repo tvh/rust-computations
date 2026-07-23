@@ -55,7 +55,7 @@ Rust port, not a full port of every feature):
 ## 2. Quick example
 
 ```rust,ignore
-use computations::{Ctx, Engine, define_comp};
+use computations::{Ctx, Engine};
 use computations_fs::{FsSink, FsSource};
 
 # async fn example() -> anyhow::Result<()> {
@@ -67,7 +67,9 @@ builder.source(source.clone());
 builder.sink(sink.clone());
 
 // `uppercase_file`: reads a file and writes its upper-cased contents.
-let uppercase_file = builder.register(define_comp("uppercase_file", {
+// `EngineBuilder::define` is `define_comp` + `register` in one step — the
+// preferred way to define a computation.
+let uppercase_file = builder.define("uppercase_file", {
     let source = source.clone();
     let sink = sink.clone();
     move |ctx: Ctx, path: std::path::PathBuf| {
@@ -80,7 +82,7 @@ let uppercase_file = builder.register(define_comp("uppercase_file", {
             Ok(())
         }
     }
-}));
+});
 
 let engine = builder.build();
 // One-shot: `eval_root` runs it once and returns.
@@ -183,8 +185,8 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
 
 | Rust (this crate) | Paper / Haskell (`skogsbaer/computations`) |
 |---|---|
-| `define_comp` | `defineComp` |
-| `define_comp_rec` | *(not in the paper; a convenience over `define_comp` + `Comp::named` for self-recursive bodies)* |
+| `define_comp` (or `EngineBuilder::define`, which is `define_comp` + `register` in one step — the preferred way to define a computation) | `defineComp` |
+| `define_comp_rec` (or `EngineBuilder::define_rec`, the one-step equivalent) | *(not in the paper; a convenience over `define_comp` + `Comp::named` for self-recursive bodies)* |
 | `Comp<P, R>` | `Comp` |
 | `Ctx::eval` | `evalComp` |
 | `Ctx::src_req` | `compSrcReq` |

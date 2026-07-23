@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use computations::error::CompError;
 use computations::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
-use computations::{Comp, Engine, Registry, Sink, define_comp};
+use computations::{Comp, Engine, Registry, Sink};
 
 /// Polls `f` every 10ms until it returns `true`, panicking if 5s pass first.
 async fn wait_until(f: impl Fn() -> bool) {
@@ -48,7 +48,7 @@ async fn minimal_recomputation_two_independent_chains() {
     let mut builder = Engine::builder();
     builder.registry(registry);
 
-    let chain1: Comp<(), ()> = builder.register(define_comp("chain1", {
+    let chain1: Comp<(), ()> = builder.define("chain1", {
         let kv = kv.clone();
         let sink = sink.clone();
         let counter1 = counter1.clone();
@@ -70,9 +70,9 @@ async fn minimal_recomputation_two_independent_chains() {
                 Ok(())
             }
         }
-    }));
+    });
 
-    let chain2: Comp<(), ()> = builder.register(define_comp("chain2", {
+    let chain2: Comp<(), ()> = builder.define("chain2", {
         let kv = kv.clone();
         let sink = sink.clone();
         let counter2 = counter2.clone();
@@ -94,9 +94,9 @@ async fn minimal_recomputation_two_independent_chains() {
                 Ok(())
             }
         }
-    }));
+    });
 
-    let root: Comp<(), ()> = builder.register(define_comp("two_chains_root", {
+    let root: Comp<(), ()> = builder.define("two_chains_root", {
         let chain1 = chain1.clone();
         let chain2 = chain2.clone();
         move |ctx, _: ()| {
@@ -108,7 +108,7 @@ async fn minimal_recomputation_two_independent_chains() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let handle = {
@@ -155,7 +155,7 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
     let mut builder = Engine::builder();
     builder.registry(registry);
 
-    let child: Comp<(), i32> = builder.register(define_comp("cutoff_child", {
+    let child: Comp<(), i32> = builder.define("cutoff_child", {
         let kv = kv.clone();
         let runs = child_runs.clone();
         move |ctx, _: ()| {
@@ -167,9 +167,9 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
                 Ok(42) // constant regardless of the key's value
             }
         }
-    }));
+    });
 
-    let parent: Comp<(), ()> = builder.register(define_comp("cutoff_parent", {
+    let parent: Comp<(), ()> = builder.define("cutoff_parent", {
         let sink = sink.clone();
         let child = child.clone();
         let runs = parent_runs.clone();
@@ -191,7 +191,7 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let handle = {
@@ -236,7 +236,7 @@ async fn deletion_gc_removes_output_for_removed_name() {
     let mut builder = Engine::builder();
     builder.registry(registry);
 
-    let child: Comp<String, ()> = builder.register(define_comp("write_named_doc", {
+    let child: Comp<String, ()> = builder.define("write_named_doc", {
         let sink = sink.clone();
         move |ctx, name: String| {
             let sink = sink.clone();
@@ -252,9 +252,9 @@ async fn deletion_gc_removes_output_for_removed_name() {
                 Ok(())
             }
         }
-    }));
+    });
 
-    let root: Comp<(), ()> = builder.register(define_comp("file_list_root", {
+    let root: Comp<(), ()> = builder.define("file_list_root", {
         let kv = kv.clone();
         let child = child.clone();
         move |ctx, _: ()| {
@@ -270,7 +270,7 @@ async fn deletion_gc_removes_output_for_removed_name() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let handle = {
@@ -310,7 +310,7 @@ async fn startup_gc_removes_stale_pre_existing_output() {
     let mut builder = Engine::builder();
     builder.registry(registry);
 
-    let root: Comp<(), ()> = builder.register(define_comp("startup_gc_root", {
+    let root: Comp<(), ()> = builder.define("startup_gc_root", {
         let sink = sink.clone();
         move |ctx, _: ()| {
             let sink = sink.clone();
@@ -326,7 +326,7 @@ async fn startup_gc_removes_stale_pre_existing_output() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let handle = {
@@ -356,7 +356,7 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
     let mut builder = Engine::builder();
     builder.registry(registry);
 
-    let root: Comp<(), ()> = builder.register(define_comp("resilience_root", {
+    let root: Comp<(), ()> = builder.define("resilience_root", {
         let kv = kv.clone();
         let sink = sink.clone();
         move |ctx, _: ()| {
@@ -378,7 +378,7 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let handle = {

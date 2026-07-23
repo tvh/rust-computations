@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use computations::{Comp, Engine, define_comp, define_comp_rec};
+use computations::{Comp, Engine};
 use computations_fs::{DirEntry, EntryKind, FsSink, FsSource};
 
 /// Polls `f` every 20ms until it returns `true`, panicking with `msg` if 15s
@@ -83,7 +83,7 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
     builder.source(source.clone());
     builder.sink(sink.clone());
 
-    let sync_file = builder.register(define_comp("sync_file", {
+    let sync_file = builder.define("sync_file", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -104,9 +104,9 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
                 Ok(())
             }
         }
-    }));
+    });
 
-    let sync_dir = builder.register(define_comp_rec("sync_dir", {
+    let sync_dir = builder.define_rec("sync_dir", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -139,7 +139,7 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     (engine, sync_dir)

@@ -28,7 +28,7 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
 
     let mut builder = Engine::builder();
 
-    let number_of_lines: Comp<String, usize> = builder.register(define_comp("number_of_lines", {
+    let number_of_lines: Comp<String, usize> = builder.define("number_of_lines", {
         let kv = kv.clone();
         let runs = nol_runs.clone();
         move |ctx, key: String| {
@@ -40,9 +40,9 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
                 Ok(content.lines().count())
             }
         }
-    }));
+    });
 
-    let sum: Comp<(), usize> = builder.register(define_comp("sum", {
+    let sum: Comp<(), usize> = builder.define("sum", {
         let kv = kv.clone();
         let number_of_lines = number_of_lines.clone();
         let runs = sum_runs.clone();
@@ -65,9 +65,9 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
                 Ok(counts.into_iter().sum::<usize>())
             }
         }
-    }));
+    });
 
-    let store: Comp<(), ()> = builder.register(define_comp("store", {
+    let store: Comp<(), ()> = builder.define("store", {
         let sink = sink.clone();
         let sum = sum.clone();
         let runs = store_runs.clone();
@@ -89,7 +89,7 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     engine.eval_root(&store, ()).await.unwrap();
@@ -100,6 +100,9 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
     assert_eq!(store_runs.load(Ordering::SeqCst), 1);
 }
 
+// Deliberately exercises the low-level `register(define_comp(...))` path
+// (rather than the `builder.define(...)` sugar used elsewhere in this file)
+// to keep that path under test.
 #[tokio::test]
 async fn eval_root_memoizes_repeated_calls() {
     let runs = Arc::new(AtomicUsize::new(0));
@@ -131,7 +134,7 @@ async fn diamond_shared_dependency_runs_once() {
     let d_runs = Arc::new(AtomicUsize::new(0));
     let mut builder = Engine::builder();
 
-    let d: Comp<i32, i32> = builder.register(define_comp("diamond_d", {
+    let d: Comp<i32, i32> = builder.define("diamond_d", {
         let runs = d_runs.clone();
         move |_ctx, n: i32| {
             let runs = runs.clone();
@@ -140,25 +143,25 @@ async fn diamond_shared_dependency_runs_once() {
                 Ok(n + 1)
             }
         }
-    }));
+    });
 
-    let b: Comp<i32, i32> = builder.register(define_comp("diamond_b", {
+    let b: Comp<i32, i32> = builder.define("diamond_b", {
         let d = d.clone();
         move |ctx, n: i32| {
             let d = d.clone();
             async move { ctx.eval(&d, n).await }
         }
-    }));
+    });
 
-    let c: Comp<i32, i32> = builder.register(define_comp("diamond_c", {
+    let c: Comp<i32, i32> = builder.define("diamond_c", {
         let d = d.clone();
         move |ctx, n: i32| {
             let d = d.clone();
             async move { ctx.eval(&d, n).await }
         }
-    }));
+    });
 
-    let a: Comp<i32, i32> = builder.register(define_comp("diamond_a", {
+    let a: Comp<i32, i32> = builder.define("diamond_a", {
         let b = b.clone();
         let c = c.clone();
         move |ctx, n: i32| {
@@ -169,7 +172,7 @@ async fn diamond_shared_dependency_runs_once() {
                 Ok(bv + cv)
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     let result = engine.eval_root(&a, 10).await.unwrap();
@@ -184,7 +187,7 @@ async fn diamond_shared_dependency_runs_once() {
 async fn concurrent_eval_root_deduplicates_single_flight() {
     let runs = Arc::new(AtomicUsize::new(0));
     let mut builder = Engine::builder();
-    let comp: Comp<i32, i32> = builder.register(define_comp("slow", {
+    let comp: Comp<i32, i32> = builder.define("slow", {
         let runs = runs.clone();
         move |_ctx, n: i32| {
             let runs = runs.clone();
@@ -194,7 +197,7 @@ async fn concurrent_eval_root_deduplicates_single_flight() {
                 Ok(n * 10)
             }
         }
-    }));
+    });
     let engine = builder.build();
 
     let (a, b) = tokio::join!(engine.eval_root(&comp, 4), engine.eval_root(&comp, 4));
@@ -212,20 +215,20 @@ async fn cycle_with_same_param_is_detected_promptly() {
     let b: Comp<i32, i32> = Comp::named("cycle_b");
 
     let mut builder = Engine::builder();
-    builder.register(define_comp("cycle_a", {
+    builder.define("cycle_a", {
         let b = b.clone();
         move |ctx, n: i32| {
             let b = b.clone();
             async move { ctx.eval(&b, n).await }
         }
-    }));
-    builder.register(define_comp("cycle_b", {
+    });
+    builder.define("cycle_b", {
         let a = a.clone();
         move |ctx, n: i32| {
             let a = a.clone();
             async move { ctx.eval(&a, n).await }
         }
-    }));
+    });
     let engine = builder.build();
 
     let result = tokio::time::timeout(Duration::from_millis(500), engine.eval_root(&a, 1))
@@ -245,7 +248,7 @@ async fn self_recursion_with_different_params_works() {
     let countdown: Comp<i64, i64> = Comp::named("countdown_sum");
 
     let mut builder = Engine::builder();
-    builder.register(define_comp("countdown_sum", {
+    builder.define("countdown_sum", {
         let countdown = countdown.clone();
         move |ctx, n: i64| {
             let countdown = countdown.clone();
@@ -258,7 +261,7 @@ async fn self_recursion_with_different_params_works() {
                 }
             }
         }
-    }));
+    });
     let engine = builder.build();
 
     let result = tokio::time::timeout(Duration::from_millis(500), engine.eval_root(&countdown, 5))
@@ -274,17 +277,17 @@ async fn self_recursion_with_different_params_works() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_all_runs_concurrently() {
     let mut builder = Engine::builder();
-    let sleepy: Comp<i32, i32> = builder.register(define_comp("sleepy", |_ctx, n: i32| async move {
+    let sleepy: Comp<i32, i32> = builder.define("sleepy", |_ctx, n: i32| async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(n * 2)
-    }));
-    let root: Comp<(), Vec<i32>> = builder.register(define_comp("root_eval_all", {
+    });
+    let root: Comp<(), Vec<i32>> = builder.define("root_eval_all", {
         let sleepy = sleepy.clone();
         move |ctx, _: ()| {
             let sleepy = sleepy.clone();
             async move { ctx.eval_all(&sleepy, [1, 2, 3]).await }
         }
-    }));
+    });
     let engine = builder.build();
 
     let start = tokio::time::Instant::now();
@@ -302,6 +305,10 @@ async fn eval_all_runs_concurrently() {
 /// computation, so self-recursion needs no separate `Comp::named` +
 /// `define_comp` pair with a duplicated name string (contrast with
 /// `self_recursion_with_different_params_works` above).
+///
+/// Deliberately exercises the low-level `register(define_comp_rec(...))`
+/// path (rather than the `builder.define_rec(...)` sugar) to keep that path
+/// under test.
 #[tokio::test]
 async fn define_comp_rec_supports_self_recursion() {
     let mut builder = Engine::builder();
@@ -341,7 +348,7 @@ async fn builder_source_and_sink_register_without_explicit_registry() {
     builder.source(kv.clone());
     builder.sink(sink.clone());
 
-    let comp: Comp<(), ()> = builder.register(define_comp("write_named_doc", {
+    let comp: Comp<(), ()> = builder.define("write_named_doc", {
         let kv = kv.clone();
         let sink = sink.clone();
         move |ctx, _: ()| {
@@ -360,7 +367,7 @@ async fn builder_source_and_sink_register_without_explicit_registry() {
                 Ok(())
             }
         }
-    }));
+    });
     let engine = builder.build();
 
     engine.eval_root(&comp, ()).await.unwrap();

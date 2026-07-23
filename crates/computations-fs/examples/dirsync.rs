@@ -24,14 +24,15 @@
 //!   each wave itself deduplicated/parallelized via `Ctx::eval_all`).
 //!
 //! `sync_dir` calling itself is the standard recursion pattern for this
-//! engine, handled here by [`define_comp_rec`]: it hands the body a working
-//! handle to its own computation (`sync_dir` below), so there is no need to
-//! separately write `Comp::named("sync_dir")` and `define_comp("sync_dir",
-//! ...)` with the name repeated (and possibly drifting) between the two.
+//! engine, handled here by `EngineBuilder::define_rec`: it hands the body a
+//! working handle to its own computation (`sync_dir` below), so there is no
+//! need to separately write `Comp::named("sync_dir")` and
+//! `define_comp("sync_dir", ...)` with the name repeated (and possibly
+//! drifting) between the two.
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use computations::{Engine, define_comp, define_comp_rec};
+use computations::Engine;
 use computations_fs::{DirEntry, EntryKind, FsSink, FsSource};
 
 struct Args {
@@ -96,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     builder.sink(sink.clone());
 
     let source_root = args.source.clone();
-    let sync_file = builder.register(define_comp("sync_file", {
+    let sync_file = builder.define("sync_file", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -127,9 +128,9 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         }
-    }));
+    });
 
-    let sync_dir = builder.register(define_comp_rec("sync_dir", {
+    let sync_dir = builder.define_rec("sync_dir", {
         let source = source.clone();
         let sink = sink.clone();
         let source_root = source_root.clone();
@@ -167,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         }
-    }));
+    });
 
     let engine = builder.build();
     engine.run(&sync_dir, PathBuf::new()).await?;
