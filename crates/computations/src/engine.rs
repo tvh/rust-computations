@@ -498,7 +498,7 @@ impl Engine {
             caller: None,
             chain: Arc::new(Vec::new()),
         };
-        ctx.eval(comp, param).await
+        ctx.eval(*comp, param).await
     }
 }
 

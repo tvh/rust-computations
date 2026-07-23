@@ -9,7 +9,7 @@
 //! pass after every round settles.
 //!
 //! Cancel the loop by aborting or dropping the task it runs in
-//! (e.g. `tokio::spawn(async move { engine.run(&comp, param).await })`);
+//! (e.g. `tokio::spawn(async move { engine.run(comp, param).await })`);
 //! `run` never returns on its own once the initial evaluation succeeds.
 
 use std::collections::{HashMap, HashSet};
@@ -53,9 +53,9 @@ impl Engine {
     ///
     /// This future never resolves on the happy path: cancel it by aborting
     /// or dropping the task it runs in.
-    pub async fn run<P: CompParam, R: CompResult>(&self, comp: &Comp<P, R>, param: P) -> Result<(), CompError> {
+    pub async fn run<P: CompParam, R: CompResult>(&self, comp: Comp<P, R>, param: P) -> Result<(), CompError> {
         let start = Instant::now();
-        self.eval_root(comp, param).await?;
+        self.eval_root(&comp, param).await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
         let startup_outputs_deleted = self.inner.startup_gc().await;
@@ -260,8 +260,17 @@ impl EngineInner {
                             }
                         }
                         Err(e) => {
+                            // `comp` (the def name alone) mirrors the
+                            // `comp.eval` span's field convention so this
+                            // standalone event (outside that span — the
+                            // rerun's own nested span has already closed by
+                            // the time we get here) can be filtered/grepped
+                            // on the same field name; `key` keeps the full
+                            // name#hash identity for disambiguating between
+                            // applications of the same computation.
                             tracing::warn!(
-                                comp = ?key,
+                                comp = %key.def().name(),
+                                key = ?key,
                                 error = %e,
                                 "change propagation: computation failed; it stays dirty and will retry on the next relevant change"
                             );

@@ -47,7 +47,7 @@ impl Ctx {
     /// ancestor of this call.
     pub async fn eval<P: CompParam, R: CompResult>(
         &self,
-        comp: &Comp<P, R>,
+        comp: Comp<P, R>,
         param: P,
     ) -> Result<R, CompError> {
         let (value, callee_key) = self
@@ -67,7 +67,7 @@ impl Ctx {
     /// preserving their order in the returned `Vec`.
     pub async fn eval_all<P: CompParam, R: CompResult>(
         &self,
-        comp: &Comp<P, R>,
+        comp: Comp<P, R>,
         params: impl IntoIterator<Item = P>,
     ) -> Result<Vec<R>, CompError> {
         let futs = params.into_iter().map(|p| self.eval(comp, p));

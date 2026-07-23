@@ -60,7 +60,7 @@ use computations_fs::{FsSink, FsSource};
 
 # async fn example() -> anyhow::Result<()> {
 let source = FsSource::new("fs")?;
-let sink = std::sync::Arc::new(FsSink::new("fs", "/tmp/out"));
+let sink = FsSink::new("fs", "/tmp/out");
 
 let mut builder = Engine::builder();
 builder.source(source.clone());
@@ -83,7 +83,7 @@ let engine = builder.build();
 // One-shot: `eval_root` runs it once and returns.
 engine.eval_root(&uppercase_file, "/tmp/in.txt".into()).await?;
 // Continuous: `run` evaluates once, then reacts to source changes forever.
-// engine.run(&uppercase_file, "/tmp/in.txt".into()).await?;
+// engine.run(uppercase_file, "/tmp/in.txt".into()).await?;
 # Ok(())
 # }
 ```

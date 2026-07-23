@@ -101,9 +101,9 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
         "sync_dir",
         &env,
         move |(source, sink, source_root), sync_dir, ctx, rel: PathBuf| async move {
-            if !rel.as_os_str().is_empty() {
-                sink.make_dirs(&ctx, rel.clone()).await?;
-            }
+            // A no-op for the root itself (empty `rel`): the target root
+            // already exists (`FsSink::new` creates it).
+            sink.make_dirs(&ctx, rel.clone()).await?;
 
             let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
             let mut file_rels = Vec::new();
@@ -116,8 +116,8 @@ fn build_engine(source_root: PathBuf, sink: Arc<FsSink>) -> (Engine, Comp<PathBu
                 }
             }
 
-            let files_fut = ctx.eval_all(&sync_file, file_rels);
-            let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
+            let files_fut = ctx.eval_all(sync_file, file_rels);
+            let dirs_fut = ctx.eval_all(sync_dir, dir_rels);
             tokio::try_join!(files_fut, dirs_fut)?;
 
             Ok(())
@@ -147,12 +147,12 @@ async fn dirsync_converges_through_a_sequence_of_edits() {
 
     std::fs::write(tgt.join("stale.txt"), b"should be removed by startup GC").unwrap();
 
-    let sink = Arc::new(FsSink::new("test-sink", tgt));
+    let sink = FsSink::new("test-sink", tgt);
     let (engine, root) = build_engine(src.to_path_buf(), sink);
 
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&root, PathBuf::new()).await })
+        tokio::spawn(async move { engine.run(root, PathBuf::new()).await })
     };
 
     // 1. Initial sync + startup GC.

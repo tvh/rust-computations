@@ -25,6 +25,10 @@ impl Request for WriteFile {
 
 /// Creates `rel_path` (relative to the sink's root) and any missing parent
 /// directories. `Output = ()`.
+///
+/// An empty `rel_path` (the root itself) is a no-op that reports no output:
+/// the root always exists already (`FsSink::new` creates it), so there is
+/// nothing to do and nothing to track.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MakeDirs {
     pub rel_path: PathBuf,
@@ -68,17 +72,21 @@ impl FsSink {
     /// Creates a new `FsSink` rooted at `root`, creating `root` if it does
     /// not already exist.
     ///
-    /// This constructor is infallible by design (matching the signature
-    /// used to build sources/sinks elsewhere in this crate): if creating the
-    /// root directory fails here, the error simply resurfaces on the first
-    /// actual write, which already has to handle I/O errors.
-    pub fn new(id: &str, root: impl Into<PathBuf>) -> Self {
+    /// Returns `Arc<Self>` directly (matching [`super::FsSource::new`]'s
+    /// signature): every real use of a sink needs it behind an `Arc` anyway
+    /// (the typed helpers like [`FsSink::write_file`] take `self: &Arc<Self>`),
+    /// so callers no longer need to wrap the result themselves.
+    ///
+    /// This constructor is infallible by design: if creating the root
+    /// directory fails here, the error simply resurfaces on the first actual
+    /// write, which already has to handle I/O errors.
+    pub fn new(id: &str, root: impl Into<PathBuf>) -> Arc<Self> {
         let root = root.into();
         let _ = std::fs::create_dir_all(&root);
-        FsSink {
+        Arc::new(FsSink {
             id: SinkId::new(id),
             root,
-        }
+        })
     }
 
     /// Test-only inspection: the root directory this sink writes under.
@@ -252,6 +260,11 @@ impl Sink<WriteFile> for FsSink {
 impl Sink<MakeDirs> for FsSink {
     async fn execute(&self, req: MakeDirs) -> (HashSet<PathBuf>, Result<(), SinkError>) {
         let MakeDirs { rel_path } = req;
+        if rel_path.as_os_str().is_empty() {
+            // The root itself: already exists (`FsSink::new` creates it), so
+            // this is a successful no-op with no output to report.
+            return (HashSet::new(), Ok(()));
+        }
         if let Err(e) = validate_rel_path(&rel_path) {
             return (HashSet::new(), Err(e));
         }
@@ -337,6 +350,21 @@ mod tests {
             existing,
             HashSet::from([PathBuf::from("sub/x.txt"), PathBuf::from("y.txt")])
         );
+    }
+
+    #[tokio::test]
+    async fn make_dirs_on_empty_rel_path_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FsSink::new("fs", dir.path());
+
+        let (outs, result) = sink
+            .execute(MakeDirs {
+                rel_path: PathBuf::new(),
+            })
+            .await;
+        assert!(result.is_ok());
+        assert!(outs.is_empty());
+        assert!(dir.path().exists(), "root must still exist");
     }
 
     #[tokio::test]

@@ -16,12 +16,12 @@
 //! the roots themselves being arbitrary absolute paths):
 //!
 //! - `sync_file(rel)`: reads `source_root/rel` and writes it to `target_root/rel`.
-//! - `sync_dir(rel)`: creates `target_root/rel` (skipped for the root itself,
-//!   since the sink refuses an empty relative path and the target root
-//!   already exists), lists `source_root/rel`, then evaluates `sync_file`
-//!   over every file entry and `sync_dir` over every subdirectory entry
-//!   concurrently (Haxl-style: both waves of child evaluations run at once,
-//!   each wave itself deduplicated/parallelized via `Ctx::eval_all`).
+//! - `sync_dir(rel)`: creates `target_root/rel` (a no-op for the root itself,
+//!   since the sink's root already exists), lists `source_root/rel`, then
+//!   evaluates `sync_file` over every file entry and `sync_dir` over every
+//!   subdirectory entry concurrently (Haxl-style: both waves of child
+//!   evaluations run at once, each wave itself deduplicated/parallelized via
+//!   `Ctx::eval_all`).
 //!
 //! `sync_dir` calling itself is the standard recursion pattern for this
 //! engine, handled here by `EngineBuilder::define_rec_with`: it hands the
@@ -43,7 +43,6 @@
 //! consumed by `make_dirs` and then read again below), unrelated to the env
 //! pattern.
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use computations::Engine;
 use computations_fs::{DirEntry, EntryKind, FsSink, FsSource};
@@ -103,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     println!("dirsync: mirroring {} -> {}", args.source.display(), args.target.display());
 
     let source = FsSource::new("dirsync-source")?;
-    let sink = Arc::new(FsSink::new("dirsync-sink", &args.target));
+    let sink = FsSink::new("dirsync-sink", &args.target);
 
     let mut builder = Engine::builder();
     builder.source(source.clone());
@@ -137,12 +136,9 @@ async fn main() -> anyhow::Result<()> {
         "sync_dir",
         &env,
         move |(source, sink, source_root), sync_dir, ctx, rel: PathBuf| async move {
-            // The target root itself always exists (`FsSink::new` creates
-            // it); `MakeDirs` also rejects an empty relative path, so only
-            // non-root directories need it created.
-            if !rel.as_os_str().is_empty() {
-                sink.make_dirs(&ctx, rel.clone()).await?;
-            }
+            // A no-op for the root itself (empty `rel`): the target root
+            // already exists (`FsSink::new` creates it).
+            sink.make_dirs(&ctx, rel.clone()).await?;
 
             let entries = source.list_dir(&ctx, source_root.join(&rel)).await?;
             let mut file_rels = Vec::new();
@@ -157,8 +153,8 @@ async fn main() -> anyhow::Result<()> {
 
             // Haxl-style: both waves of children run concurrently, each
             // wave itself batched via `eval_all`.
-            let files_fut = ctx.eval_all(&sync_file, file_rels);
-            let dirs_fut = ctx.eval_all(&sync_dir, dir_rels);
+            let files_fut = ctx.eval_all(sync_file, file_rels);
+            let dirs_fut = ctx.eval_all(sync_dir, dir_rels);
             tokio::try_join!(files_fut, dirs_fut)?;
 
             Ok(())
@@ -166,6 +162,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let engine = builder.build();
-    engine.run(&sync_dir, PathBuf::new()).await?;
+    engine.run(sync_dir, PathBuf::new()).await?;
     Ok(())
 }

@@ -59,7 +59,7 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
-                let counts = ctx.eval_all(&number_of_lines, names).await?;
+                let counts = ctx.eval_all(number_of_lines, names).await?;
                 Ok(counts.into_iter().sum::<usize>())
             }
         }
@@ -73,7 +73,7 @@ async fn paper_pipeline_computes_and_stores_line_count_sum() {
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
-                let total = ctx.eval(&sum, ()).await?;
+                let total = ctx.eval(sum, ()).await?;
                 ctx.sink_req(
                     &sink,
                     WriteDoc {
@@ -141,12 +141,12 @@ async fn diamond_shared_dependency_runs_once() {
         }
     });
 
-    let b: Comp<i32, i32> = builder.define("diamond_b", move |ctx, n: i32| async move { ctx.eval(&d, n).await });
+    let b: Comp<i32, i32> = builder.define("diamond_b", move |ctx, n: i32| async move { ctx.eval(d, n).await });
 
-    let c: Comp<i32, i32> = builder.define("diamond_c", move |ctx, n: i32| async move { ctx.eval(&d, n).await });
+    let c: Comp<i32, i32> = builder.define("diamond_c", move |ctx, n: i32| async move { ctx.eval(d, n).await });
 
     let a: Comp<i32, i32> = builder.define("diamond_a", move |ctx, n: i32| async move {
-        let (bv, cv) = futures::try_join!(ctx.eval(&b, n), ctx.eval(&c, n))?;
+        let (bv, cv) = futures::try_join!(ctx.eval(b, n), ctx.eval(c, n))?;
         Ok(bv + cv)
     });
 
@@ -191,8 +191,8 @@ async fn cycle_with_same_param_is_detected_promptly() {
     let b: Comp<i32, i32> = Comp::named("cycle_b");
 
     let mut builder = Engine::builder();
-    builder.define("cycle_a", move |ctx, n: i32| async move { ctx.eval(&b, n).await });
-    builder.define("cycle_b", move |ctx, n: i32| async move { ctx.eval(&a, n).await });
+    builder.define("cycle_a", move |ctx, n: i32| async move { ctx.eval(b, n).await });
+    builder.define("cycle_b", move |ctx, n: i32| async move { ctx.eval(a, n).await });
     let engine = builder.build();
 
     let result = tokio::time::timeout(Duration::from_millis(500), engine.eval_root(&a, 1))
@@ -216,7 +216,7 @@ async fn self_recursion_with_different_params_works() {
         if n <= 0 {
             Ok(0)
         } else {
-            let rest = ctx.eval(&countdown, n - 1).await?;
+            let rest = ctx.eval(countdown, n - 1).await?;
             Ok(n + rest)
         }
     });
@@ -240,7 +240,7 @@ async fn eval_all_runs_concurrently() {
         Ok(n * 2)
     });
     let root: Comp<(), Vec<i32>> =
-        builder.define("root_eval_all", move |ctx, _: ()| async move { ctx.eval_all(&sleepy, [1, 2, 3]).await });
+        builder.define("root_eval_all", move |ctx, _: ()| async move { ctx.eval_all(sleepy, [1, 2, 3]).await });
     let engine = builder.build();
 
     let start = tokio::time::Instant::now();
@@ -271,7 +271,7 @@ async fn define_comp_rec_supports_self_recursion() {
             if n <= 0 {
                 Ok(0)
             } else {
-                let rest = ctx.eval(&this, n - 1).await?;
+                let rest = ctx.eval(this, n - 1).await?;
                 Ok(n + rest)
             }
         },
@@ -373,7 +373,7 @@ async fn define_rec_with_supports_recursion_with_shared_env() {
             if n <= 0 {
                 Ok(0)
             } else {
-                let rest = ctx.eval(&this, n - 1).await?;
+                let rest = ctx.eval(this, n - 1).await?;
                 Ok(n + rest)
             }
         });

@@ -97,15 +97,15 @@ async fn minimal_recomputation_two_independent_chains() {
     });
 
     let root: Comp<(), ()> = builder.define("two_chains_root", move |ctx, _: ()| async move {
-        ctx.eval(&chain1, ()).await?;
-        ctx.eval(&chain2, ()).await?;
+        ctx.eval(chain1, ()).await?;
+        ctx.eval(chain2, ()).await?;
         Ok(())
     });
 
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&root, ()).await })
+        tokio::spawn(async move { engine.run(root, ()).await })
     };
 
     wait_until(|| counter1.load(Ordering::SeqCst) >= 1 && counter2.load(Ordering::SeqCst) >= 1).await;
@@ -168,7 +168,7 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
-                let v = ctx.eval(&child, ()).await?;
+                let v = ctx.eval(child, ()).await?;
                 ctx.sink_req(
                     &sink,
                     WriteDoc {
@@ -185,7 +185,7 @@ async fn early_cutoff_stops_propagation_on_unchanged_hash() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&parent, ()).await })
+        tokio::spawn(async move { engine.run(parent, ()).await })
     };
 
     wait_until(|| sink.get("doc") == Some("42".to_string())).await;
@@ -252,7 +252,7 @@ async fn deletion_gc_removes_output_for_removed_name() {
                     .await?
                     .unwrap_or_default();
                 let names: Vec<String> = list.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
-                ctx.eval_all(&child, names).await?;
+                ctx.eval_all(child, names).await?;
                 Ok(())
             }
         }
@@ -261,7 +261,7 @@ async fn deletion_gc_removes_output_for_removed_name() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&root, ()).await })
+        tokio::spawn(async move { engine.run(root, ()).await })
     };
 
     wait_until(|| sink.names().len() == 2).await;
@@ -316,7 +316,7 @@ async fn startup_gc_removes_stale_pre_existing_output() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&root, ()).await })
+        tokio::spawn(async move { engine.run(root, ()).await })
     };
 
     wait_until(|| sink.get("stale").is_none() && sink.get("kept").is_some()).await;
@@ -367,7 +367,7 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
     let engine = builder.build();
     let handle = {
         let engine = engine.clone();
-        tokio::spawn(async move { engine.run(&root, ()).await })
+        tokio::spawn(async move { engine.run(root, ()).await })
     };
 
     wait_until(|| sink.get("doc") == Some("ok1".to_string())).await;

@@ -78,7 +78,7 @@ where
 ///         if n <= 0 {
 ///             Ok(0)
 ///         } else {
-///             let rest = ctx.eval(&this, n - 1).await?;
+///             let rest = ctx.eval(this, n - 1).await?;
 ///             Ok(n + rest)
 ///         }
 ///     },
