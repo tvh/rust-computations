@@ -52,6 +52,17 @@ Rust port, not a full port of every feature):
   life of the `Engine`; there is no serialize/reload story across process
   restarts (unlike the reference implementation's on-disk registry).
 
+Two `Source` backends ship in this workspace: `computations-fs`
+(filesystem — §3 below) and `computations-time`, a wall-clock time source
+with no polling loop of its own. `computations_time::TimeSource` answers
+two requests — `RoundedTime(bucket)` (current time rounded down to a
+granularity like `Bucket::MINUTE` or `Bucket::FIVE_MINUTES`) and
+`IsAfter(t)` (has wall-clock time passed `t`, flipping `false` to `true`
+exactly once) — via one background task that sleeps until the next bucket
+boundary or deadline actually due, recomputed fresh from the wall clock on
+every wakeup. This is the analogue of the paper's built-in `compGetTime`
+source (see [§5](#5-api-mapping)).
+
 ## 2. Quick example
 
 ```rust,ignore
@@ -198,6 +209,7 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
 | memoize + hash cutoff (always on) | `fullCaching` |
 | `Source` / `SourceBase` | `CompSrc` |
 | `Sink` / `SinkBase` | `CompSink` |
+| `computations_time::TimeSource` (`RoundedTime`, `IsAfter`) | `compGetTime` |
 | *(not implemented)* | `hashCaching` (cutoff without memoizing the value) |
 | *(not implemented)* | `defineIncComp` (incremental fold computations) |
 
@@ -231,17 +243,21 @@ RUST_LOG=computations=debug,computations_fs=debug cargo run -p computations-fs -
 
 This is a working, tested implementation of the paper's core model — dynamic
 dependency tracking, memoization with hash-based early cutoff, single-flight
-concurrency dedup, cycle detection, and liveness-driven output GC — plus one
-real plugin backend (the filesystem). It does not implement request
-batching, incremental fold computations, or dependency-graph persistence
-across restarts (see [§1](#1-what-this-is) for why). The `computations-fs`
-crate's `notify::PollWatcher`-based source trades a little latency (bounded
-by a 100ms poll interval) for filesystem-change delivery that behaves
-identically across platforms and sandboxes, which matters more for its test
-suite than shaving milliseconds off change detection.
+concurrency dedup, cycle detection, and liveness-driven output GC — plus two
+real plugin backends (the filesystem, and wall-clock time). It does not
+implement request batching, incremental fold computations, or
+dependency-graph persistence across restarts (see [§1](#1-what-this-is) for
+why). The `computations-fs` crate's `notify::PollWatcher`-based source
+trades a little latency (bounded by a 100ms poll interval) for
+filesystem-change delivery that behaves identically across platforms and
+sandboxes, which matters more for its test suite than shaving milliseconds
+off change detection. The `computations-time` crate's source has no such
+tradeoff to make: it drives every change notification off a single
+background task sleeping until the next bucket boundary or deadline
+actually due, with no polling loop at all.
 
-Run the test suite (41 unit/integration tests across both crates, plus a
-tracing smoke test and a doc test):
+Run the test suite (56 unit/integration tests across all three crates,
+plus a tracing smoke test and a doc test):
 
 ```sh
 cargo test --workspace --all-features

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/computations", "crates/computations-fs"]
+members = ["crates/computations", "crates/computations-fs", "crates/computations-time"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

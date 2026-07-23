@@ -119,6 +119,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "computations-time"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "computations",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
