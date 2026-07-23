@@ -16,3 +16,5 @@ pub mod source;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
+
+pub use key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
