@@ -1,0 +1,16 @@
+[package]
+name = "computations-fs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+computations = { path = "../computations" }
+tokio = { workspace = true, features = ["fs"] }
+notify = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+computations = { path = "../computations", features = ["testutil"] }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

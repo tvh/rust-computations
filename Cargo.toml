@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/computations", "crates/computations-fs"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+blake3 = "1"
+tracing = "0.1"
+thiserror = "2"
+notify = "8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+tempfile = "3"
