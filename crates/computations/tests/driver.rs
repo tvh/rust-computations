@@ -1,20 +1,21 @@
 //! Integration tests for the driver: initial evaluation, startup GC,
-//! push-based change propagation with early cutoff, liveness GC, and
-//! failure resilience. Run with `cargo test -p computations --features
-//! testutil`.
+//! push-based change propagation with early cutoff, liveness GC, two-tier
+//! dirty priorities, and failure resilience. Run with `cargo test -p
+//! computations --features testutil`.
 //!
 //! `Engine::run` never returns on the happy path, so every test spawns it
 //! via `tokio::spawn`, polls assertions through `wait_until` (bounded by a
 //! 5s timeout so a propagation bug can never hang `cargo test`), and aborts
 //! the task before returning.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use computations::error::CompError;
 use computations::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
-use computations::{Comp, Engine, Registry, Sink};
+use computations::{Comp, CompKey, DirtyPriority, Engine, Registry, Sink};
 
 /// Polls `f` every 10ms until it returns `true`, panicking if 5s pass first.
 async fn wait_until(f: impl Fn() -> bool) {
@@ -384,6 +385,284 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
 
     kv.set("flag", "ok2").await;
     wait_until(|| sink.get("doc") == Some("ok2".to_string())).await;
+
+    handle.abort();
+}
+
+/// A shared, ordered event log: each `record` call appends `label` tagged
+/// with a fresh, monotonically increasing sequence number, so tests can
+/// assert *relative* ordering between events from independent tasks
+/// (running comp bodies) without depending on wall-clock timing.
+#[derive(Clone, Default)]
+struct SeqLog {
+    next: Arc<AtomicUsize>,
+    events: Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+}
+
+impl SeqLog {
+    fn record(&self, label: &'static str) {
+        let seq = self.next.fetch_add(1, Ordering::SeqCst);
+        self.events.lock().unwrap().push((label, seq));
+    }
+
+    /// The highest sequence number recorded under `label`, if any.
+    fn last_seq(&self, label: &str) -> Option<usize> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, _)| *l == label)
+            .map(|(_, seq)| *seq)
+            .max()
+    }
+}
+
+/// `mark_all_dirty(Revalidate)` on a settled, two-chain graph must
+/// eventually re-run every node (run counters advance for both chains), but
+/// since neither chain's computed value actually changes, the sink content
+/// stays exactly as it was — early cutoff-worthy behavior at the
+/// Revalidate tier too: nothing downstream should observe a change, and
+/// nothing here rewrites a doc to a new value.
+#[tokio::test]
+async fn mark_all_dirty_revalidate_reruns_everything_without_changing_output() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+
+    let counter1 = Arc::new(AtomicUsize::new(0));
+    let counter2 = Arc::new(AtomicUsize::new(0));
+
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+
+    let chain1: Comp<(), ()> = builder.define("revalidate_chain1", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        let counter1 = counter1.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let counter1 = counter1.clone();
+            async move {
+                counter1.fetch_add(1, Ordering::SeqCst);
+                let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "doc_a".to_string(),
+                        content: val,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    });
+
+    let chain2: Comp<(), ()> = builder.define("revalidate_chain2", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        let counter2 = counter2.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let counter2 = counter2.clone();
+            async move {
+                counter2.fetch_add(1, Ordering::SeqCst);
+                let val = ctx.src_req(&kv, GetKey("b".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "doc_b".to_string(),
+                        content: val,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    });
+
+    let root: Comp<(), ()> = builder.define("revalidate_root", move |ctx, _: ()| async move {
+        ctx.eval(chain1, ()).await?;
+        ctx.eval(chain2, ()).await?;
+        Ok(())
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| counter1.load(Ordering::SeqCst) >= 1 && counter2.load(Ordering::SeqCst) >= 1).await;
+    assert_eq!(sink.get("doc_a"), Some(String::new()));
+    assert_eq!(sink.get("doc_b"), Some(String::new()));
+
+    let c1_before = counter1.load(Ordering::SeqCst);
+    let c2_before = counter2.load(Ordering::SeqCst);
+
+    engine.mark_all_dirty(DirtyPriority::Revalidate);
+
+    wait_until(|| counter1.load(Ordering::SeqCst) > c1_before && counter2.load(Ordering::SeqCst) > c2_before).await;
+    // Give the round a moment to fully settle before checking nothing else
+    // changes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        sink.get("doc_a"),
+        Some(String::new()),
+        "revalidation must not rewrite doc_a's content: the recomputed value is unchanged"
+    );
+    assert_eq!(
+        sink.get("doc_b"),
+        Some(String::new()),
+        "revalidation must not rewrite doc_b's content: the recomputed value is unchanged"
+    );
+
+    handle.abort();
+}
+
+/// Input-tier work must not be starved by an in-progress Revalidate-tier
+/// sweep: mark a slow, two-stage Revalidate chain dirty, then immediately
+/// change a key feeding an unrelated (fast) Input chain. The Input chain's
+/// rerun must complete — and its doc must be updated — strictly before the
+/// slow Revalidate sweep's last rerun, proving the driver preempts between
+/// Revalidate waves rather than draining the whole sweep first.
+///
+/// Ordering is asserted via `SeqLog`'s monotonic sequence numbers (not
+/// wall-clock timestamps), so this only depends on relative event order,
+/// not on any particular timing margin.
+#[tokio::test]
+async fn input_priority_preempts_in_progress_revalidate_sweep() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "before").await;
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+
+    let log = SeqLog::default();
+    let chain1_runs = Arc::new(AtomicUsize::new(0));
+    let slow_a_runs = Arc::new(AtomicUsize::new(0));
+    let slow_b_runs = Arc::new(AtomicUsize::new(0));
+
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+
+    // Fast Input-tier chain: reads "a", writes doc_a, no artificial delay.
+    let chain1: Comp<(), ()> = builder.define("priority_chain1", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        let runs = chain1_runs.clone();
+        let log = log.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let runs = runs.clone();
+            let log = log.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "doc_a".to_string(),
+                        content: val,
+                    },
+                )
+                .await?;
+                log.record("input");
+                Ok(())
+            }
+        }
+    });
+
+    // Slow, two-stage Revalidate-tier chain: no source deps, each stage
+    // sleeps and returns an ever-incrementing value (so its hash always
+    // changes and propagation to the next stage is never cut off).
+    let slow_a: Comp<(), usize> = builder.define("priority_slow_a", {
+        let runs = slow_a_runs.clone();
+        let log = log.clone();
+        move |_ctx, _: ()| {
+            let runs = runs.clone();
+            let log = log.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let n = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                log.record("revalidate");
+                Ok(n)
+            }
+        }
+    });
+
+    let slow_b: Comp<(), usize> = builder.define("priority_slow_b", {
+        let runs = slow_b_runs.clone();
+        let log = log.clone();
+        move |ctx, _: ()| {
+            let runs = runs.clone();
+            let log = log.clone();
+            async move {
+                let a = ctx.eval(slow_a, ()).await?;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let n = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                log.record("revalidate");
+                Ok(a + n)
+            }
+        }
+    });
+
+    let root: Comp<(), ()> = builder.define("priority_root", move |ctx, _: ()| async move {
+        ctx.eval(chain1, ()).await?;
+        ctx.eval(slow_b, ()).await?;
+        Ok(())
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| chain1_runs.load(Ordering::SeqCst) >= 1 && slow_b_runs.load(Ordering::SeqCst) >= 1).await;
+    assert_eq!(sink.get("doc_a"), Some("before".to_string()));
+
+    let c1_before = chain1_runs.load(Ordering::SeqCst);
+    let slow_b_before = slow_b_runs.load(Ordering::SeqCst);
+
+    // Mark only the head of the slow chain dirty at Revalidate priority;
+    // slow_b is pulled in afterwards, purely by rdep propagation, so the
+    // sweep genuinely spans two waves.
+    let slow_a_key = CompKey::new(*slow_a.def_id(), &());
+    let mut revalidate_keys = HashSet::new();
+    revalidate_keys.insert(slow_a_key);
+    engine.mark_dirty(&revalidate_keys, DirtyPriority::Revalidate);
+
+    // Immediately (no delay): a genuine input change on an unrelated chain.
+    kv.set("a", "after").await;
+
+    wait_until(|| chain1_runs.load(Ordering::SeqCst) > c1_before).await;
+    wait_until(|| slow_b_runs.load(Ordering::SeqCst) > slow_b_before).await;
+
+    let input_seq = log.last_seq("input").expect("chain1 recorded an input-tier rerun");
+    let revalidate_seq = log
+        .last_seq("revalidate")
+        .expect("the slow chain recorded at least one revalidate-tier rerun");
+    assert!(
+        input_seq < revalidate_seq,
+        "chain1's input-tier rerun (seq {input_seq}) should complete before the slow \
+         revalidate sweep's last rerun (seq {revalidate_seq})"
+    );
+
+    assert_eq!(
+        sink.get("doc_a"),
+        Some("after".to_string()),
+        "chain1's doc should reflect the input change"
+    );
 
     handle.abort();
 }

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, FutureExt, Shared};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::Instrument;
 
 use crate::ctx::Ctx;
@@ -57,9 +58,40 @@ pub(crate) enum NodeState {
     Running,
 }
 
+/// Priority of a node's pending dirty work.
+///
+/// [`DirtyPriority::Input`] marks a node dirtied because a genuine source
+/// input changed. [`DirtyPriority::Revalidate`] marks a node dirtied for a
+/// background reason that doesn't necessarily reflect a real input change —
+/// e.g. (future work) a node restored from a persisted graph whose defining
+/// code may have changed since it was last computed, which needs checking
+/// but shouldn't hold up genuinely changed inputs.
+///
+/// [`crate::driver`] always drains all `Input`-tier dirty work to a
+/// fixpoint before starting any `Revalidate`-tier work, and preempts
+/// in-progress `Revalidate` work (between waves, never mid-wave) whenever
+/// new `Input`-tier work arrives.
+///
+/// When a node that already has pending dirty work is marked dirty again,
+/// the higher of the two priorities wins ("max priority wins", `Ord`
+/// order): an `Input` mark is never downgraded back to `Revalidate` by a
+/// later `Revalidate` mark, but a `Revalidate` mark is promoted to `Input`
+/// by a later `Input` mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DirtyPriority {
+    Revalidate = 1,
+    Input = 2,
+}
+
 /// One computation application's memoized state.
 pub(crate) struct Node {
     pub(crate) state: NodeState,
+    /// The priority of this node's pending dirty work; `None` exactly when
+    /// `state == Clean` (cleared on every successful run, left untouched on
+    /// a failed one so the node stays dirty at the priority it was being
+    /// processed at). Set — and merged via max, "max priority wins" — by
+    /// [`crate::driver`]'s dirtying paths; see [`DirtyPriority`].
+    pub(crate) dirty_priority: Option<DirtyPriority>,
     /// The cached result, erased. `Some` even when `state == Dirty` (a
     /// stale-but-not-yet-superseded value), `None` only before the first
     /// successful execution.
@@ -119,6 +151,13 @@ pub(crate) struct EngineInner {
     /// graph and must not be collected even with no `rdeps`.
     pub(crate) roots: Mutex<HashSet<CompKey>>,
     pub(crate) registry: Registry,
+    /// Wakes the driver's `run` loop when dirty work is marked from outside
+    /// an active propagation round (`EngineInner::mark_dirty`/
+    /// `mark_all_dirty`, e.g. a future persistence-restore step, or a test
+    /// driving the engine directly) — every key such a call marks dirty is
+    /// pushed here. See `crate::driver::EngineInner::recv_marked_dirty`.
+    pub(crate) dirty_tx: mpsc::UnboundedSender<CompKey>,
+    pub(crate) dirty_rx: AsyncMutex<mpsc::UnboundedReceiver<CompKey>>,
 }
 
 impl EngineInner {
@@ -173,6 +212,7 @@ impl EngineInner {
             });
             Node {
                 state: NodeState::Dirty,
+                dirty_priority: None,
                 value: None,
                 result_hash: None,
                 comp_deps: HashSet::new(),
@@ -268,6 +308,7 @@ impl EngineInner {
                         .get_mut(key)
                         .expect("node present: created by prepare() before run() is called");
                     node.state = NodeState::Clean;
+                    node.dirty_priority = None;
                     node.value = Some(value_any.clone());
                     node.result_hash = Some(hash);
                     node.last_changed = changed;
@@ -700,6 +741,7 @@ impl EngineBuilder {
 
     /// Finishes building the `Engine`.
     pub fn build(self) -> Engine {
+        let (dirty_tx, dirty_rx) = mpsc::unbounded_channel();
         Engine {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
@@ -707,6 +749,8 @@ impl EngineBuilder {
                 source_index: Mutex::new(HashMap::new()),
                 roots: Mutex::new(HashSet::new()),
                 registry: self.registry,
+                dirty_tx,
+                dirty_rx: AsyncMutex::new(dirty_rx),
             }),
         }
     }

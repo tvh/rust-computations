@@ -2,11 +2,19 @@
 //!
 //! [`Engine::run`] is the driver's entry point: it performs the initial
 //! evaluation of the application, a startup garbage-collection pass over
-//! every sink's existing outputs, and then loops forever reacting to
-//! upstream source changes — dirtying the affected nodes, re-running them in
-//! waves along the dependency graph (stopping early wherever a
-//! recomputation's result hash didn't change), and running a liveness GC
-//! pass after every round settles.
+//! every sink's existing outputs, and then loops forever reacting to either
+//! upstream source changes or dirty work marked directly via
+//! [`Engine::mark_dirty`]/[`Engine::mark_all_dirty`] — dirtying the affected
+//! nodes, re-running them in waves along the dependency graph (stopping
+//! early wherever a recomputation's result hash didn't change), and running
+//! a liveness GC pass after every round settles.
+//!
+//! Dirty work carries a [`crate::engine::DirtyPriority`]: `Input`-tier work
+//! (genuine source changes) always drains to a fixpoint before any
+//! `Revalidate`-tier work starts, and an in-progress Revalidate sweep is
+//! preempted — between waves, never mid-wave — by newly arrived Input-tier
+//! work. See this module's `EngineInner::propagate` for the tier-aware wave
+//! loop.
 //!
 //! Cancel the loop by aborting or dropping the task it runs in
 //! (e.g. `tokio::spawn(async move { engine.run(comp, param).await })`);
@@ -16,11 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::future::{BoxFuture, join_all, select_all};
+use futures::future::{BoxFuture, FutureExt, join_all, select_all};
 use tracing::Instrument;
 
 use crate::def::Comp;
-use crate::engine::{Engine, EngineInner, NodeState, RerunFn};
+use crate::engine::{DirtyPriority, Engine, EngineInner, NodeState, RerunFn};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
@@ -66,18 +74,35 @@ impl Engine {
         }
 
         loop {
-            let changed = self.inner.wait_for_any_change().await;
-            if changed.is_empty() {
-                continue;
-            }
-            let dirtied = self.inner.affected_keys(&changed);
-            if dirtied.is_empty() {
-                continue;
-            }
+            // Wait for either a genuine source change, or dirty work marked
+            // from outside this loop entirely (`Engine::mark_dirty`/
+            // `mark_all_dirty`, e.g. a future persistence-restore step) —
+            // the latter is how the loop wakes up even with no source
+            // change in sight.
+            let (dirtied, triggering_deps) = tokio::select! {
+                changed = self.inner.wait_for_any_change() => {
+                    if changed.is_empty() {
+                        continue;
+                    }
+                    let dirtied = self.inner.affected_keys(&changed);
+                    if dirtied.is_empty() {
+                        continue;
+                    }
+                    let triggering_deps = changed.len();
+                    self.inner.mark_dirty_quiet(&dirtied, DirtyPriority::Input);
+                    (dirtied, triggering_deps)
+                }
+                dirtied = self.inner.recv_marked_dirty() => {
+                    if dirtied.is_empty() {
+                        continue;
+                    }
+                    (dirtied, 0)
+                }
+            };
 
             let span = tracing::debug_span!(
                 "driver.propagate",
-                triggering_deps = changed.len(),
+                triggering_deps,
                 dirtied = dirtied.len()
             );
             async {
@@ -95,6 +120,25 @@ impl Engine {
             .instrument(span)
             .await;
         }
+    }
+
+    /// Marks every currently-known node dirty at `priority`, waking the
+    /// `run` loop so it picks the work up even if no source change ever
+    /// arrives. See [`DirtyPriority`] for the max-wins merge rule applied
+    /// when a node already has pending dirty work.
+    ///
+    /// Intended for a future persistence-restore step (mark every restored
+    /// node `Revalidate` so it gets checked against the current code in the
+    /// background, without holding up genuinely changed inputs) and for
+    /// tests driving the engine directly. Ordinary application code never
+    /// needs this — nodes are dirtied indirectly, through source changes.
+    pub fn mark_all_dirty(&self, priority: DirtyPriority) {
+        self.inner.mark_all_dirty(priority);
+    }
+
+    /// Marks `keys` dirty at `priority`. See [`Engine::mark_all_dirty`].
+    pub fn mark_dirty(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+        self.inner.mark_dirty(keys, priority);
     }
 }
 
@@ -198,92 +242,291 @@ impl EngineInner {
         affected
     }
 
-    /// Wave propagation: repeatedly re-runs the current dirty frontier
-    /// concurrently, then dirties the rdeps of every node whose result hash
-    /// changed (nodes whose hash didn't change stop propagation there —
-    /// early cutoff), until no dirty frontier remains. Each node re-runs at
-    /// most once per round, tracked via `done`.
+    /// Marks every key in `keys` dirty at `priority`, taking the max of any
+    /// existing pending priority for that key ("max priority wins"; see
+    /// [`DirtyPriority`]). A key with no node is ignored — nothing to mark.
+    ///
+    /// Does not wake the `run` loop; use this only for marking that happens
+    /// *from inside* an already-running propagation round, where the loop
+    /// is already awake and driving things (initial source-change
+    /// dirtying, rdep propagation, preemption polling). Marking from
+    /// outside an active round must go through [`Self::mark_dirty`] instead
+    /// so the loop actually wakes up to service it.
+    fn mark_dirty_quiet(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+        let mut nodes = self.nodes.lock().unwrap();
+        for key in keys {
+            if let Some(node) = nodes.get_mut(key) {
+                node.dirty_priority = Some(match node.dirty_priority {
+                    Some(existing) => existing.max(priority),
+                    None => priority,
+                });
+                node.state = NodeState::Dirty;
+            }
+        }
+    }
+
+    /// Marks `keys` dirty at `priority` (see [`Self::mark_dirty_quiet`])
+    /// and wakes the `run` loop so it services the work even if it is
+    /// currently blocked waiting for a source change. The entry point for
+    /// [`Engine::mark_dirty`].
+    pub(crate) fn mark_dirty(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+        self.mark_dirty_quiet(keys, priority);
+        for key in keys {
+            let _ = self.dirty_tx.send(key.clone());
+        }
+    }
+
+    /// Marks every currently-known node dirty at `priority`. See
+    /// [`Self::mark_dirty`]. (At rest, between propagation rounds, the node
+    /// table only ever holds live nodes — liveness GC sweeps dead ones away
+    /// at every round boundary — so "every node" and "every live node"
+    /// coincide here.)
+    pub(crate) fn mark_all_dirty(&self, priority: DirtyPriority) {
+        let keys: HashSet<CompKey> = {
+            let nodes = self.nodes.lock().unwrap();
+            nodes.keys().cloned().collect()
+        };
+        self.mark_dirty(&keys, priority);
+    }
+
+    /// Awaits the next batch of dirty keys marked from outside an active
+    /// propagation round (via [`Self::mark_dirty`]/[`Self::mark_all_dirty`]),
+    /// draining whatever else is queued without blocking further — mirrors
+    /// `wait_for_any_change`'s draining of a source's change channel.
+    async fn recv_marked_dirty(&self) -> HashSet<CompKey> {
+        let mut rx = self.dirty_rx.lock().await;
+        let mut batch = HashSet::new();
+        match rx.recv().await {
+            Some(key) => {
+                batch.insert(key);
+            }
+            None => return batch,
+        }
+        while let Ok(key) = rx.try_recv() {
+            batch.insert(key);
+        }
+        batch
+    }
+
+    /// Non-blocking check for source changes that arrived while
+    /// Revalidate-tier work was in progress, used to preempt it: polls
+    /// every registered source once (never waits — see
+    /// [`futures::future::FutureExt::now_or_never`]) and, if anything
+    /// reports a change, marks the affected computations dirty at
+    /// [`DirtyPriority::Input`] and returns their keys (empty if nothing
+    /// new arrived).
+    fn poll_pending_input_changes(&self) -> HashSet<CompKey> {
+        let sources: Vec<Arc<dyn crate::source::ErasedSource>> = self.registry.sources().cloned().collect();
+        let mut changed: HashSet<RawDep> = HashSet::new();
+        for source in &sources {
+            if let Some(deps) = source.wait_changes().now_or_never() {
+                changed.extend(deps);
+            }
+        }
+        if changed.is_empty() {
+            return HashSet::new();
+        }
+        let dirtied = self.affected_keys(&changed);
+        if dirtied.is_empty() {
+            return HashSet::new();
+        }
+        self.mark_dirty_quiet(&dirtied, DirtyPriority::Input);
+        dirtied
+    }
+
+    /// Splits `keys` into (Input frontier, Revalidate frontier) by reading
+    /// each key's currently recorded `dirty_priority`. A key with no node,
+    /// or no pending priority (nothing to do — already settled), is
+    /// dropped from both.
+    fn split_by_tier(&self, keys: HashSet<CompKey>) -> (HashSet<CompKey>, HashSet<CompKey>) {
+        let nodes = self.nodes.lock().unwrap();
+        let mut input = HashSet::new();
+        let mut revalidate = HashSet::new();
+        for key in keys {
+            match nodes.get(&key).and_then(|n| n.dirty_priority) {
+                Some(DirtyPriority::Input) => {
+                    input.insert(key);
+                }
+                Some(DirtyPriority::Revalidate) => {
+                    revalidate.insert(key);
+                }
+                None => {}
+            }
+        }
+        (input, revalidate)
+    }
+
+    /// Wave propagation, tier-aware: `Input`-tier dirty work (genuine
+    /// source changes) always runs to a fixpoint before any
+    /// `Revalidate`-tier work even starts, and Revalidate work is preempted
+    /// — checked between waves, never mid-wave, so running futures always
+    /// complete — by any Input-tier work that arrives while it runs. See
+    /// [`DirtyPriority`].
+    ///
+    /// Within a tier this is exactly the propagation algorithm this method
+    /// used before tiers existed: repeatedly re-run the current dirty
+    /// frontier concurrently, then dirty the rdeps of every node whose
+    /// result hash changed (nodes whose hash didn't change stop propagation
+    /// there — early cutoff), until no dirty frontier remains for that
+    /// tier. Each node re-runs at most once per round — across every tier
+    /// and every preemption interleaving — tracked via `done`.
+    ///
+    /// Every key in `initial` must already have been marked dirty (with its
+    /// intended priority) by the caller; this only reads that state to
+    /// route each key into its tier's frontier.
     ///
     /// A node that becomes unreachable mid-round (e.g. its last live caller
     /// was just cut off) may still be re-run once here rather than being
-    /// skipped; the liveness GC pass that follows the round cleans it up
-    /// regardless, so this is a harmless wasted rerun rather than a
-    /// correctness issue.
+    /// skipped; the liveness GC pass that follows the round (after every
+    /// tier has settled) cleans it up regardless, so this is a harmless
+    /// wasted rerun rather than a correctness issue.
     async fn propagate(&self, initial: HashSet<CompKey>) -> PropagateStats {
-        let mut frontier = initial;
         let mut done: HashSet<CompKey> = HashSet::new();
         let mut waves = 0usize;
         let mut total_reran = 0usize;
 
+        let (input_frontier, revalidate_frontier) = self.split_by_tier(initial);
+
+        total_reran += self
+            .propagate_tier(DirtyPriority::Input, input_frontier, &mut done, &mut waves)
+            .await;
+
+        let mut frontier = revalidate_frontier;
         while !frontier.is_empty() {
             let batch: Vec<CompKey> = frontier.into_iter().filter(|k| done.insert(k.clone())).collect();
             if batch.is_empty() {
                 break;
             }
             waves += 1;
-            let dirty_count = batch.len();
-
-            let jobs: Vec<(CompKey, RerunFn)> = {
-                let mut nodes = self.nodes.lock().unwrap();
-                batch
-                    .iter()
-                    .filter_map(|key| {
-                        let node = nodes.get_mut(key)?;
-                        node.state = NodeState::Dirty;
-                        Some((key.clone(), node.rerun.clone()))
-                    })
-                    .collect()
-            };
-
-            let results = join_all(jobs.iter().map(|(_, rerun)| rerun())).await;
-
-            let mut next_frontier = HashSet::new();
-            let mut reran = 0usize;
-            let mut cutoffs = 0usize;
-            {
-                let nodes = self.nodes.lock().unwrap();
-                for ((key, _), result) in jobs.iter().zip(results.iter()) {
-                    match result {
-                        Ok(()) => {
-                            reran += 1;
-                            let Some(node) = nodes.get(key) else {
-                                continue;
-                            };
-                            if node.last_changed {
-                                for rdep in &node.rdeps {
-                                    if !done.contains(rdep) {
-                                        next_frontier.insert(rdep.clone());
-                                    }
-                                }
-                            } else {
-                                cutoffs += 1;
-                            }
-                        }
-                        Err(e) => {
-                            // `comp` (the def name alone) mirrors the
-                            // `comp.eval` span's field convention so this
-                            // standalone event (outside that span — the
-                            // rerun's own nested span has already closed by
-                            // the time we get here) can be filtered/grepped
-                            // on the same field name; `key` keeps the full
-                            // name#hash identity for disambiguating between
-                            // applications of the same computation.
-                            tracing::warn!(
-                                comp = %key.def().name(),
-                                key = ?key,
-                                error = %e,
-                                "change propagation: computation failed; it stays dirty and will retry on the next relevant change"
-                            );
-                        }
-                    }
-                }
-            }
+            let (reran, next) = self.run_wave(DirtyPriority::Revalidate, batch, &done, waves).await;
             total_reran += reran;
-            tracing::debug!(wave = waves, dirty = dirty_count, reran, cutoffs, "propagation wave complete");
-            frontier = next_frontier;
+            frontier = next;
+
+            // Background-ish: yield between waves so this stays low
+            // priority under load, then check whether real input work
+            // arrived while the wave ran; if so, drain it to a full
+            // fixpoint before resuming Revalidate work.
+            tokio::task::yield_now().await;
+            let preempting_input = self.poll_pending_input_changes();
+            if !preempting_input.is_empty() {
+                total_reran += self
+                    .propagate_tier(DirtyPriority::Input, preempting_input, &mut done, &mut waves)
+                    .await;
+            }
         }
 
         PropagateStats { waves, total_reran }
+    }
+
+    /// Runs `tier`'s frontier to a fixpoint (waves until its frontier is
+    /// empty), threading the round's `done` set and wave counter through.
+    /// Returns the number of nodes that actually reran.
+    async fn propagate_tier(
+        &self,
+        tier: DirtyPriority,
+        initial: HashSet<CompKey>,
+        done: &mut HashSet<CompKey>,
+        waves: &mut usize,
+    ) -> usize {
+        let mut frontier = initial;
+        let mut total_reran = 0usize;
+        while !frontier.is_empty() {
+            let batch: Vec<CompKey> = frontier.into_iter().filter(|k| done.insert(k.clone())).collect();
+            if batch.is_empty() {
+                break;
+            }
+            *waves += 1;
+            let (reran, next) = self.run_wave(tier, batch, done, *waves).await;
+            total_reran += reran;
+            frontier = next;
+        }
+        total_reran
+    }
+
+    /// Runs one wave: re-executes `batch` concurrently, then computes the
+    /// next frontier — the rdeps of every node whose result hash changed
+    /// (early cutoff otherwise) that isn't already `done` this round —
+    /// marking each of them dirty at `tier` (dirtiness propagates at the
+    /// priority of the node that changed). Returns the number of nodes that
+    /// actually reran.
+    async fn run_wave(
+        &self,
+        tier: DirtyPriority,
+        batch: Vec<CompKey>,
+        done: &HashSet<CompKey>,
+        wave: usize,
+    ) -> (usize, HashSet<CompKey>) {
+        let dirty_count = batch.len();
+
+        let jobs: Vec<(CompKey, RerunFn)> = {
+            let mut nodes = self.nodes.lock().unwrap();
+            batch
+                .iter()
+                .filter_map(|key| {
+                    let node = nodes.get_mut(key)?;
+                    node.state = NodeState::Dirty;
+                    Some((key.clone(), node.rerun.clone()))
+                })
+                .collect()
+        };
+
+        let results = join_all(jobs.iter().map(|(_, rerun)| rerun())).await;
+
+        let mut next_frontier = HashSet::new();
+        let mut reran = 0usize;
+        let mut cutoffs = 0usize;
+        {
+            let nodes = self.nodes.lock().unwrap();
+            for ((key, _), result) in jobs.iter().zip(results.iter()) {
+                match result {
+                    Ok(()) => {
+                        reran += 1;
+                        let Some(node) = nodes.get(key) else {
+                            continue;
+                        };
+                        if node.last_changed {
+                            for rdep in &node.rdeps {
+                                if !done.contains(rdep) {
+                                    next_frontier.insert(rdep.clone());
+                                }
+                            }
+                        } else {
+                            cutoffs += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // `comp` (the def name alone) mirrors the
+                        // `comp.eval` span's field convention so this
+                        // standalone event (outside that span — the
+                        // rerun's own nested span has already closed by
+                        // the time we get here) can be filtered/grepped
+                        // on the same field name; `key` keeps the full
+                        // name#hash identity for disambiguating between
+                        // applications of the same computation.
+                        tracing::warn!(
+                            comp = %key.def().name(),
+                            key = ?key,
+                            error = %e,
+                            "change propagation: computation failed; it stays dirty and will retry on the next relevant change"
+                        );
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            wave,
+            tier = ?tier,
+            dirty = dirty_count,
+            reran,
+            cutoffs,
+            "propagation wave complete"
+        );
+
+        if !next_frontier.is_empty() {
+            self.mark_dirty_quiet(&next_frontier, tier);
+        }
+
+        (reran, next_frontier)
     }
 
     /// Liveness GC: mark-sweep from `roots` over `comp_deps`. Any node not
@@ -387,5 +630,81 @@ impl EngineInner {
             outputs_deleted,
             keys_unregistered,
         }
+    }
+}
+
+// `pub(crate)`, not `pub`, so `mark_dirty`/`mark_dirty_quiet`/`nodes` aren't
+// visible from the `tests/driver.rs` integration test crate: the max-wins
+// merge rule is exercised directly here instead, deterministically and
+// without depending on any real propagation timing (see
+// `tests/driver.rs`'s `input_priority_preempts_in_progress_revalidate_sweep`
+// for the timing-sensitive, end-to-end version of tiered dirtying).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::def::define_comp;
+
+    /// Marking a node Revalidate then Input must leave it at Input (the
+    /// higher priority); marking it Revalidate again afterwards must not
+    /// downgrade it back down. "Max priority wins."
+    #[tokio::test]
+    async fn mark_dirty_max_priority_wins() {
+        let mut builder = Engine::builder();
+        let comp: Comp<(), ()> = builder.register(define_comp::<(), (), _, _>("max_wins_probe", |_ctx, _: ()| async {
+            Ok(())
+        }));
+        let engine = builder.build();
+        engine.eval_root(&comp, ()).await.unwrap();
+
+        let key = CompKey::new(*comp.def_id(), &());
+        let mut keys = HashSet::new();
+        keys.insert(key.clone());
+
+        engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
+        assert_eq!(
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            Some(DirtyPriority::Revalidate)
+        );
+        assert_eq!(
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().state,
+            NodeState::Dirty
+        );
+
+        engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Input);
+        assert_eq!(
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            Some(DirtyPriority::Input),
+            "Input must win over a prior Revalidate mark"
+        );
+
+        engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
+        assert_eq!(
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            Some(DirtyPriority::Input),
+            "a later Revalidate mark must not downgrade an already-Input pending priority"
+        );
+    }
+
+    /// `mark_all_dirty` must reach every node currently in the table, not
+    /// just ones explicitly named, and must apply the same max-wins rule.
+    #[tokio::test]
+    async fn mark_all_dirty_reaches_every_node() {
+        let mut builder = Engine::builder();
+        let a: Comp<(), ()> =
+            builder.register(define_comp::<(), (), _, _>("all_dirty_a", |_ctx, _: ()| async { Ok(()) }));
+        let b: Comp<(), ()> =
+            builder.register(define_comp::<(), (), _, _>("all_dirty_b", |_ctx, _: ()| async { Ok(()) }));
+        let engine = builder.build();
+        engine.eval_root(&a, ()).await.unwrap();
+        engine.eval_root(&b, ()).await.unwrap();
+
+        let key_a = CompKey::new(*a.def_id(), &());
+        let key_b = CompKey::new(*b.def_id(), &());
+
+        engine.inner.mark_all_dirty(DirtyPriority::Revalidate);
+
+        let nodes = engine.inner.nodes.lock().unwrap();
+        assert_eq!(nodes.get(&key_a).unwrap().dirty_priority, Some(DirtyPriority::Revalidate));
+        assert_eq!(nodes.get(&key_b).unwrap().dirty_priority, Some(DirtyPriority::Revalidate));
     }
 }
