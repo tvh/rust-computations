@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use serde::de::DeserializeOwned;
+
 /// A 256-bit content hash (a blake3 digest of a canonical byte encoding).
 ///
 /// `Hash256` is a plain value type: cheap to copy, comparable, hashable, and
@@ -148,6 +150,17 @@ impl CompKey {
     pub fn param_hash(&self) -> Hash256 {
         self.param_hash
     }
+
+    /// Reconstructs a `CompKey` directly from its constituent parts, without
+    /// hashing a live parameter value.
+    ///
+    /// Used by `crate::persist` to rebuild a dependency edge's `CompKey`
+    /// from its persisted `(def name, param hash)` pair, where the
+    /// dependency's own parameter value was never stored (only ever the
+    /// identity of the dependency, which is exactly `def` + `param_hash`).
+    pub(crate) fn from_parts(def: DefId, param_hash: Hash256) -> Self {
+        CompKey { def, param_hash }
+    }
 }
 
 impl fmt::Debug for CompKey {
@@ -159,14 +172,22 @@ impl fmt::Debug for CompKey {
 }
 
 /// Bound satisfied by every valid computation parameter type.
-pub trait CompParam: serde::Serialize + Clone + fmt::Debug + Send + Sync + 'static {}
+///
+/// `DeserializeOwned` (in addition to `Serialize`) is required so a param
+/// can be revived from its persisted postcard bytes when restoring a node
+/// from a previous run (see `crate::persist`).
+pub trait CompParam: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
-impl<T> CompParam for T where T: serde::Serialize + Clone + fmt::Debug + Send + Sync + 'static {}
+impl<T> CompParam for T where T: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
 /// Bound satisfied by every valid computation result type.
-pub trait CompResult: serde::Serialize + Clone + fmt::Debug + Send + Sync + 'static {}
+///
+/// `DeserializeOwned` (in addition to `Serialize`) is required so a cached
+/// value can be revived from its persisted postcard bytes when restoring a
+/// node from a previous run (see `crate::persist`).
+pub trait CompResult: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
-impl<T> CompResult for T where T: serde::Serialize + Clone + fmt::Debug + Send + Sync + 'static {}
+impl<T> CompResult for T where T: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
 #[cfg(test)]
 mod tests {

@@ -63,6 +63,15 @@ impl Engine {
     /// or dropping the task it runs in.
     pub async fn run<P: CompParam, R: CompResult>(&self, comp: Comp<P, R>, param: P) -> Result<(), CompError> {
         let start = Instant::now();
+
+        // Restore a persisted graph, if configured (see `crate::persist`),
+        // before the initial evaluation: restored `Clean` nodes are cache
+        // hits below, and anything a fingerprint mismatch or a source's
+        // `probe_versions` couldn't vouch for is already marked dirty by
+        // the time we get here, so it re-executes as part of this very
+        // evaluation rather than waiting for the loop's first iteration.
+        self.inner.persist_load().await;
+
         self.eval_root(&comp, param).await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
@@ -72,13 +81,18 @@ impl Engine {
         } else {
             tracing::debug!("startup GC complete: nothing to collect");
         }
+        self.inner.persist_flush().await;
 
         loop {
             // Wait for either a genuine source change, or dirty work marked
             // from outside this loop entirely (`Engine::mark_dirty`/
-            // `mark_all_dirty`, e.g. a future persistence-restore step) —
+            // `mark_all_dirty`, e.g. a test driving the engine directly) —
             // the latter is how the loop wakes up even with no source
-            // change in sight.
+            // change in sight. Persistence's own restore-time dirtying
+            // (`crate::persist::mark_dirty_transitive`) happens earlier,
+            // before this loop even starts (see `persist_load` above), so
+            // the affected nodes are already handled by the initial
+            // evaluation rather than needing to wake this loop up.
             let (dirtied, triggering_deps) = tokio::select! {
                 changed = self.inner.wait_for_any_change() => {
                     if changed.is_empty() {
@@ -108,6 +122,7 @@ impl Engine {
             async {
                 let prop_stats = self.inner.propagate(dirtied).await;
                 let gc_stats = self.inner.liveness_gc().await;
+                self.inner.persist_flush().await;
                 tracing::debug!(
                     waves = prop_stats.waves,
                     total_reran = prop_stats.total_reran,
@@ -122,16 +137,48 @@ impl Engine {
         }
     }
 
+    /// Saves whatever has changed or been removed since the last
+    /// successful save, if [`crate::EngineBuilder::persistence`] was
+    /// configured — a no-op otherwise. `Engine::run` already calls this
+    /// automatically after every settled round and after the initial
+    /// evaluation; this is for a caller (typically a test simulating a
+    /// restart) that wants a deterministic "everything settled is now
+    /// safely on disk" point without waiting for the driver's own timing.
+    pub async fn persist_now(&self) {
+        self.inner.persist_flush().await;
+    }
+
+    /// Closes the persisted database file, if persistence is configured,
+    /// releasing redb's exclusive lock on it without needing this
+    /// `Engine`'s last reference to be dropped first.
+    ///
+    /// This exists because an `Engine` is not, in general, ever fully
+    /// dropped merely by dropping every handle to it: any node that has
+    /// ever executed carries a `rerun` closure that captures its own
+    /// `Arc<EngineInner>` — a deliberate, permanent self-reference (so a
+    /// node can always be re-evaluated later), which in practice means
+    /// `EngineInner` lives for the process's whole lifetime. A real
+    /// process restart doesn't need this method at all (the whole process,
+    /// self-references included, goes away with it); it matters for a test
+    /// that simulates a restart against the same file within a single
+    /// process, where the previous engine's database must be closed before
+    /// a new one can open the same file (redb allows only one open
+    /// `Database` per file at a time).
+    pub fn persist_close(&self) {
+        self.inner.persist.lock().unwrap().take();
+    }
+
     /// Marks every currently-known node dirty at `priority`, waking the
     /// `run` loop so it picks the work up even if no source change ever
     /// arrives. See [`DirtyPriority`] for the max-wins merge rule applied
     /// when a node already has pending dirty work.
     ///
-    /// Intended for a future persistence-restore step (mark every restored
-    /// node `Revalidate` so it gets checked against the current code in the
-    /// background, without holding up genuinely changed inputs) and for
-    /// tests driving the engine directly. Ordinary application code never
-    /// needs this — nodes are dirtied indirectly, through source changes.
+    /// Used by `crate::persist`'s load step (mark every restored node
+    /// `Revalidate` on a fingerprint mismatch, so it gets checked against
+    /// the current code in the background without holding up genuinely
+    /// changed inputs) and by tests driving the engine directly. Ordinary
+    /// application code never needs this — nodes are dirtied indirectly,
+    /// through source changes.
     pub fn mark_all_dirty(&self, priority: DirtyPriority) {
         self.inner.mark_all_dirty(priority);
     }
@@ -249,10 +296,13 @@ impl EngineInner {
     /// Does not wake the `run` loop; use this only for marking that happens
     /// *from inside* an already-running propagation round, where the loop
     /// is already awake and driving things (initial source-change
-    /// dirtying, rdep propagation, preemption polling). Marking from
-    /// outside an active round must go through [`Self::mark_dirty`] instead
-    /// so the loop actually wakes up to service it.
-    fn mark_dirty_quiet(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+    /// dirtying, rdep propagation, preemption polling), or before the loop
+    /// has even started (persistence's load step — see
+    /// `crate::persist::mark_dirty_transitive` — marks up-front, before the
+    /// initial evaluation ever runs). Marking from outside an active round,
+    /// once the loop is already running, must go through [`Self::mark_dirty`]
+    /// instead so the loop actually wakes up to service it.
+    pub(crate) fn mark_dirty_quiet(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
         let mut nodes = self.nodes.lock().unwrap();
         for key in keys {
             if let Some(node) = nodes.get_mut(key) {
@@ -592,6 +642,10 @@ impl EngineInner {
 
             (dead_keys, outputs_by_sink, dead_source_deps)
         };
+
+        for key in &dead_keys {
+            crate::persist::mark_removed(self, key.clone());
+        }
 
         // Unregister source keys that no surviving node depends on anymore.
         let mut to_unregister: HashMap<SourceId, Vec<KeyBytes>> = HashMap::new();

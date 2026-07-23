@@ -30,16 +30,20 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::Instrument;
 
 use crate::ctx::Ctx;
-use crate::def::{Comp, CompDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with};
+use crate::def::{
+    Comp, CompDef, DefAdapter, ErasedDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with,
+};
 use crate::error::CompError;
-use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
+use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256};
+use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
 use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceBase, SourceId};
 
-/// The result of one execution: the (erased) value, its content hash, and
-/// how long the body itself took to run (for the `comp.eval` tracing event).
-type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Hash256, Duration), CompError>;
+/// The result of one execution: the (erased) value, its postcard-encoded
+/// bytes (persisted verbatim by `crate::persist`), its content hash, and how
+/// long the body itself took to run (for the `comp.eval` tracing event).
+type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Vec<u8>, Hash256, Duration), CompError>;
 /// The shared, joinable handle to an in-flight execution.
 type SharedExec = Shared<BoxFuture<'static, ExecResult>>;
 /// A closure that re-executes a node's computation via the normal eval path.
@@ -96,7 +100,16 @@ pub(crate) struct Node {
     /// stale-but-not-yet-superseded value), `None` only before the first
     /// successful execution.
     value: Option<Arc<dyn Any + Send + Sync>>,
-    result_hash: Option<Hash256>,
+    /// Postcard-encoded bytes of `value`, kept alongside it so
+    /// `crate::persist` can save a node's cached result without needing to
+    /// know its concrete result type. `Some` exactly when `value` is.
+    pub(crate) value_bytes: Option<Vec<u8>>,
+    pub(crate) result_hash: Option<Hash256>,
+    /// Postcard-encoded bytes of this node's parameter, computed once when
+    /// the node is first created (a `CompKey`'s param never changes across
+    /// reruns of that same key). Read by `crate::persist` to save a node
+    /// without needing to know its concrete parameter type.
+    pub(crate) param_bytes: Vec<u8>,
     /// Computations this node called during its last execution.
     pub(crate) comp_deps: HashSet<CompKey>,
     /// Source reads this node made during its last execution.
@@ -118,6 +131,52 @@ pub(crate) struct Node {
     /// `Debug`-rendered param, for diagnostics (tracing, panic messages)
     /// without needing `Node` itself to be generic over `P`.
     param_debug: String,
+}
+
+impl Node {
+    /// Constructs a `Node` directly in the `Clean` state from a persisted
+    /// record's revived pieces (see `crate::persist`), without ever having
+    /// executed the computation in this process.
+    ///
+    /// `rdeps` starts empty: `crate::persist`'s loader rebuilds it
+    /// afterward, once every record has been turned into a `Node` this way,
+    /// by walking every loaded node's `comp_deps` (mirroring how a live
+    /// node's `rdeps` are built incrementally by `EngineInner::record_call_dep`
+    /// as it actually runs).
+    pub(crate) fn from_persisted(revived: RevivedNode) -> Node {
+        Node {
+            state: NodeState::Clean,
+            dirty_priority: None,
+            value: Some(revived.value),
+            value_bytes: Some(revived.value_bytes),
+            result_hash: Some(revived.result_hash),
+            param_bytes: revived.param_bytes,
+            comp_deps: revived.comp_deps,
+            source_deps: revived.source_deps,
+            rdeps: HashSet::new(),
+            outputs: revived.outputs,
+            last_changed: false,
+            inflight: None,
+            rerun: revived.rerun,
+            param_debug: revived.param_debug,
+        }
+    }
+}
+
+/// Every piece [`Node::from_persisted`] needs to revive a `Clean` node from
+/// a persisted record, bundled into one struct purely to keep that
+/// constructor's argument list manageable (see `crate::persist`, which
+/// builds one of these per decodable, still-registered record).
+pub(crate) struct RevivedNode {
+    pub(crate) param_bytes: Vec<u8>,
+    pub(crate) param_debug: String,
+    pub(crate) value: Arc<dyn Any + Send + Sync>,
+    pub(crate) value_bytes: Vec<u8>,
+    pub(crate) result_hash: Hash256,
+    pub(crate) comp_deps: HashSet<CompKey>,
+    pub(crate) source_deps: HashSet<RawDep>,
+    pub(crate) outputs: HashSet<RawOutput>,
+    pub(crate) rerun: RerunFn,
 }
 
 /// The node's state just before a fresh run, snapshotted so the run can
@@ -153,11 +212,35 @@ pub(crate) struct EngineInner {
     pub(crate) registry: Registry,
     /// Wakes the driver's `run` loop when dirty work is marked from outside
     /// an active propagation round (`EngineInner::mark_dirty`/
-    /// `mark_all_dirty`, e.g. a future persistence-restore step, or a test
-    /// driving the engine directly) — every key such a call marks dirty is
-    /// pushed here. See `crate::driver::EngineInner::recv_marked_dirty`.
+    /// `mark_all_dirty`, e.g. a test driving the engine directly) — every
+    /// key such a call marks dirty is pushed here. See
+    /// `crate::driver::EngineInner::recv_marked_dirty`. Persistence's own
+    /// restore-time dirtying happens before this loop even starts (see
+    /// `crate::persist`), so it never needs this channel.
     pub(crate) dirty_tx: mpsc::UnboundedSender<CompKey>,
     pub(crate) dirty_rx: AsyncMutex<mpsc::UnboundedReceiver<CompKey>>,
+    /// Type-erased revival operations (see `crate::persist`) for every
+    /// registered definition, keyed by `DefId`. Built once, alongside
+    /// `defs`, at registration time; never mutated afterward.
+    pub(crate) erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
+    /// Maps a definition's name back to its (real, `'static`) `DefId`, so
+    /// `crate::persist` can turn a persisted record's owned `String` name
+    /// into the `DefId` a live `CompKey` needs, without ever fabricating a
+    /// `&'static str`. Built once, alongside `defs`; never mutated
+    /// afterward.
+    pub(crate) def_names: HashMap<String, DefId>,
+    /// Persistence configuration set via `EngineBuilder::persistence`, if
+    /// any. `None` means persistence was never opted into. Consulted only
+    /// by `Engine::run`'s startup (`crate::persist::EngineInner::persist_load`)
+    /// to decide whether to attempt a load at all.
+    pub(crate) persist_opts: Option<PersistOptions>,
+    /// The live persistence handle, populated by `persist_load` once the
+    /// database has actually been opened (or disabled — `None` — if
+    /// persistence was never configured, or opening it failed even after a
+    /// wipe-and-retry). Behind a `Mutex` only because it starts empty and
+    /// is filled in exactly once, asynchronously, after `EngineInner`
+    /// itself already exists as an `Arc`; never contended in practice.
+    pub(crate) persist: Mutex<Option<Arc<PersistHandle>>>,
 }
 
 impl EngineInner {
@@ -171,6 +254,26 @@ impl EngineInner {
             CompError::Failed(format!(
                 "computation `{id}` was registered with parameter/result types that do not match this handle"
             ))
+        })
+    }
+
+    /// Builds the `rerun` closure for `def_id` applied to `param`:
+    /// re-evaluates it via the normal `eval_root` path when called.
+    ///
+    /// Shared by [`Self::prepare`] (building a brand-new live node) and
+    /// [`crate::def::DefAdapter::revive_param`] (reviving a node restored
+    /// from a persisted record — see `crate::persist`), so a restored
+    /// node's `rerun` is exactly the same closure shape a live one gets,
+    /// with no separate revival-only code path to drift out of sync.
+    pub(crate) fn make_rerun<P: CompParam, R: CompResult>(self: &Arc<Self>, def_id: DefId, param: P) -> RerunFn {
+        let engine_for_rerun = self.clone();
+        Arc::new(move || {
+            let engine = Engine {
+                inner: engine_for_rerun.clone(),
+            };
+            let comp = Comp::<P, R>::from_def_id(def_id);
+            let param = param.clone();
+            Box::pin(async move { engine.eval_root(&comp, param).await.map(|_| ()) })
         })
     }
 
@@ -198,32 +301,23 @@ impl EngineInner {
             }
         }
 
-        let engine_for_rerun = self.clone();
-        let def_id_for_rerun = *def_id;
-        let param_for_rerun = param.clone();
-        let node = nodes.entry(key.clone()).or_insert_with(|| {
-            let rerun: RerunFn = Arc::new(move || {
-                let engine = Engine {
-                    inner: engine_for_rerun.clone(),
-                };
-                let comp = Comp::<P, R>::from_def_id(def_id_for_rerun);
-                let param = param_for_rerun.clone();
-                Box::pin(async move { engine.eval_root(&comp, param).await.map(|_| ()) })
-            });
-            Node {
-                state: NodeState::Dirty,
-                dirty_priority: None,
-                value: None,
-                result_hash: None,
-                comp_deps: HashSet::new(),
-                source_deps: HashSet::new(),
-                rdeps: HashSet::new(),
-                outputs: HashSet::new(),
-                last_changed: false,
-                inflight: None,
-                rerun,
-                param_debug: format!("{param:?}"),
-            }
+        let rerun: RerunFn = self.make_rerun::<P, R>(*def_id, param.clone());
+        let node = nodes.entry(key.clone()).or_insert_with(|| Node {
+            state: NodeState::Dirty,
+            dirty_priority: None,
+            value: None,
+            value_bytes: None,
+            result_hash: None,
+            param_bytes: postcard::to_stdvec(param)
+                .expect("postcard serialization of a well-formed value should not fail"),
+            comp_deps: HashSet::new(),
+            source_deps: HashSet::new(),
+            rdeps: HashSet::new(),
+            outputs: HashSet::new(),
+            last_changed: false,
+            inflight: None,
+            rerun,
+            param_debug: format!("{param:?}"),
         });
 
         let old_hash = node.result_hash;
@@ -284,9 +378,15 @@ impl EngineInner {
             let start = Instant::now();
             let result = (def.body)(ctx, param).await?;
             let elapsed = start.elapsed();
-            let hash = result.stable_hash();
+            // Hashed directly from `value_bytes` (rather than via
+            // `StableHash::stable_hash`) so the postcard encoding needed for
+            // early cutoff and the one `crate::persist` saves are the same
+            // bytes, computed once.
+            let value_bytes = postcard::to_stdvec(&result)
+                .expect("postcard serialization of a well-formed value should not fail");
+            let hash = Hash256::from_bytes(*blake3::hash(&value_bytes).as_bytes());
             let value: Arc<dyn Any + Send + Sync> = Arc::new(result);
-            Ok((value, hash, elapsed))
+            Ok((value, value_bytes, hash, elapsed))
         });
         let shared: SharedExec = fut.shared();
 
@@ -300,7 +400,7 @@ impl EngineInner {
         let outcome = shared.await;
 
         match outcome {
-            Ok((value_any, hash, elapsed)) => {
+            Ok((value_any, value_bytes, hash, elapsed)) => {
                 let changed = old_hash != Some(hash);
                 let (new_source_deps, new_outputs, param_debug) = {
                     let mut nodes = self.nodes.lock().unwrap();
@@ -310,11 +410,22 @@ impl EngineInner {
                     node.state = NodeState::Clean;
                     node.dirty_priority = None;
                     node.value = Some(value_any.clone());
+                    node.value_bytes = Some(value_bytes);
                     node.result_hash = Some(hash);
                     node.last_changed = changed;
                     node.inflight = None;
                     (node.source_deps.clone(), node.outputs.clone(), node.param_debug.clone())
                 };
+
+                // Only a genuinely changed result needs a fresh save: a
+                // recomputation that hit early cutoff already has its (still
+                // correct) record on disk. A brand-new node's first run
+                // always counts as changed (`old_hash` was `None`), so this
+                // naturally covers "just created" too, without a separate
+                // case.
+                if changed {
+                    crate::persist::mark_changed(self, key.clone());
+                }
 
                 self.remove_stale_source_index(key, &old_source_deps, &new_source_deps);
 
@@ -422,7 +533,7 @@ impl EngineInner {
                     downcast_value::<R>(v, &key)?
                 }
                 Action::Join(shared) => match shared.await {
-                    Ok((v, _hash, _elapsed)) => {
+                    Ok((v, _value_bytes, _hash, _elapsed)) => {
                         tracing::debug!(outcome = "dedup_join", "comp.eval finished");
                         downcast_value::<R>(v, &key)?
                     }
@@ -523,7 +634,10 @@ impl Engine {
     pub fn builder() -> EngineBuilder {
         EngineBuilder {
             defs: HashMap::new(),
+            erased_defs: HashMap::new(),
+            def_names: HashMap::new(),
             registry: Registry::default(),
+            persist_opts: None,
         }
     }
 
@@ -565,7 +679,10 @@ impl Engine {
 /// the [`Registry`] of sources/sinks the driver wires up.
 pub struct EngineBuilder {
     defs: HashMap<DefId, Arc<dyn Any + Send + Sync>>,
+    erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
+    def_names: HashMap<String, DefId>,
     registry: Registry,
+    persist_opts: Option<PersistOptions>,
 }
 
 impl EngineBuilder {
@@ -576,8 +693,11 @@ impl EngineBuilder {
     /// this is a startup configuration error, not a runtime condition.
     pub fn register<P: CompParam, R: CompResult>(&mut self, def: CompDef<P, R>) -> Comp<P, R> {
         let id = def.id;
-        let prev = self.defs.insert(id, Arc::new(def) as Arc<dyn Any + Send + Sync>);
+        let def = Arc::new(def);
+        let prev = self.defs.insert(id, def.clone() as Arc<dyn Any + Send + Sync>);
         assert!(prev.is_none(), "duplicate computation name: {id}");
+        self.erased_defs.insert(id, Arc::new(DefAdapter(def)) as Arc<dyn ErasedDef>);
+        self.def_names.insert(id.name().to_string(), id);
         Comp::from_def_id(id)
     }
 
@@ -739,6 +859,22 @@ impl EngineBuilder {
         self
     }
 
+    /// Opts this engine into persisting its dependency graph to a local
+    /// redb file, so a restart can resume from cache instead of
+    /// recomputing everything from scratch. See [`crate::persist`] for the
+    /// full contract — in short, a corrupt database, a format mismatch, or
+    /// a record that no longer matches a registered definition is always
+    /// safe to drop and recompute; persistence never fails the engine.
+    ///
+    /// The actual load happens later, inside [`Engine::run`], before its
+    /// initial evaluation. Not calling this at all (the default) leaves
+    /// persistence disabled: the engine behaves exactly as it did before
+    /// this feature existed.
+    pub fn persistence(&mut self, opts: PersistOptions) -> &mut Self {
+        self.persist_opts = Some(opts);
+        self
+    }
+
     /// Finishes building the `Engine`.
     pub fn build(self) -> Engine {
         let (dirty_tx, dirty_rx) = mpsc::unbounded_channel();
@@ -751,6 +887,10 @@ impl EngineBuilder {
                 registry: self.registry,
                 dirty_tx,
                 dirty_rx: AsyncMutex::new(dirty_rx),
+                erased_defs: self.erased_defs,
+                def_names: self.def_names,
+                persist_opts: self.persist_opts,
+                persist: Mutex::new(None),
             }),
         }
     }

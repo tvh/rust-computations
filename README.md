@@ -48,9 +48,11 @@ Rust port, not a full port of every feature):
 - **No incremental fold computations.** The paper's `defineIncComp` (an
   incremental fold over a changing list) has no analogue here; every
   computation re-runs its whole body from scratch on invalidation.
-- **No graph persistence.** The dependency graph lives in memory for the
-  life of the `Engine`; there is no serialize/reload story across process
-  restarts (unlike the reference implementation's on-disk registry).
+- **Persistence is opt-in and its own module, not a core engine
+  responsibility.** Unlike the reference implementation's on-disk registry
+  (always on), this port keeps the dependency graph in memory by default;
+  calling `EngineBuilder::persistence` opts a given `Engine` into saving it
+  to a local file and restoring it on the next run. See [§8](#8-persistence).
 
 Two `Source` backends ship in this workspace: `computations-fs`
 (filesystem — §3 below) and `computations-time`, a wall-clock time source
@@ -244,10 +246,10 @@ RUST_LOG=computations=debug,computations_fs=debug cargo run -p computations-fs -
 This is a working, tested implementation of the paper's core model — dynamic
 dependency tracking, memoization with hash-based early cutoff, single-flight
 concurrency dedup, cycle detection, and liveness-driven output GC — plus two
-real plugin backends (the filesystem, and wall-clock time). It does not
-implement request batching, incremental fold computations, or
-dependency-graph persistence across restarts (see [§1](#1-what-this-is) for
-why). The `computations-fs` crate's `notify::PollWatcher`-based source
+real plugin backends (the filesystem, and wall-clock time), plus opt-in
+dependency-graph persistence across restarts (see [§8](#8-persistence)). It
+does not implement request batching or incremental fold computations (see
+[§1](#1-what-this-is) for why). The `computations-fs` crate's `notify::PollWatcher`-based source
 trades a little latency (bounded by a 100ms poll interval) for
 filesystem-change delivery that behaves identically across platforms and
 sandboxes, which matters more for its test suite than shaving milliseconds
@@ -256,9 +258,64 @@ tradeoff to make: it drives every change notification off a single
 background task sleeping until the next bucket boundary or deadline
 actually due, with no polling loop at all.
 
-Run the test suite (56 unit/integration tests across all three crates,
+Run the test suite (unit and integration tests across all three crates,
 plus a tracing smoke test and a doc test):
 
 ```sh
 cargo test --workspace --all-features
 ```
+
+## 8. Persistence
+
+Persistence is opt-in, per-`Engine`, and exists purely as a warm-start
+cache — nothing about it is a source of truth, and nothing about it can
+fail the engine.
+
+```rust
+use computations::{Engine, Fingerprint, PersistOptions};
+
+builder.persistence(PersistOptions {
+    path: "graph.redb".into(),
+    fingerprint: Fingerprint::current_exe(),
+});
+```
+
+**Storage.** The graph is saved to a local [redb](https://www.redb.org)
+file: a `meta` row (format version + fingerprint) and one `nodes` row per
+memoized computation application (its parameter, result, dependency edges,
+and sink outputs — all postcard-encoded). After every settled propagation
+round, and once after the initial evaluation, only the nodes that actually
+changed or were garbage-collected are written — never a wholesale rewrite.
+`Engine::persist_now` forces an immediate save (useful for a caller that
+wants a deterministic "everything settled is now on disk" point, e.g. a
+test simulating a restart).
+
+**Fingerprint.** A `Fingerprint` identifies "the code that produced these
+results" — `Fingerprint::current_exe()` hashes the running binary (the
+common case: did the executable change since this graph was saved);
+`Fingerprint::custom(data)` lets a caller fingerprint anything else that
+should invalidate trust in a persisted graph (a version string, a config
+hash, ...). A mismatch at load time never discards the graph — it marks
+every restored node for background revalidation instead (see below).
+
+**Load-anyway, then verify.** On restart, every persisted node whose
+definition is still registered is restored as a cache hit — no
+recomputation — and then two independent checks decide how much that cache
+hit should actually be trusted:
+
+- A fingerprint mismatch marks the *entire* restored graph
+  `DirtyPriority::Revalidate`: cheap to double-check in the background,
+  and (per the two-tier dirty priority scheme) never allowed to block a
+  genuinely changed input.
+- Every restored source dependency is re-checked via
+  `SourceBase::probe_versions` against its source's current value.
+  Anything that changed (or that a source can't or won't confirm) marks
+  its dependents `DirtyPriority::Input`, indistinguishable from a change
+  that had just arrived.
+
+**Cache, not source of truth.** A missing file, an unreadable or
+wrong-format database, or a record referencing a definition/type that no
+longer exists is always safe to drop — the affected node (or, in the
+worst case, the whole database) is simply treated as absent and
+recomputed. Persistence failures are logged (`tracing::warn`) and never
+propagated: the engine always starts, cold if it has to.

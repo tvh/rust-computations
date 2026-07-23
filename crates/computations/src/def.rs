@@ -13,6 +13,7 @@
 //! later, and only the name needs to be known up front. Registration order
 //! never affects the correctness of a handle.
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -21,8 +22,9 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::ctx::Ctx;
+use crate::engine::{EngineInner, RerunFn};
 use crate::error::CompError;
-use crate::key::{CompParam, CompResult, DefId};
+use crate::key::{CompKey, CompParam, CompResult, DefId};
 
 /// The type-erased body of a computation definition.
 pub(crate) type BodyFn<P, R> =
@@ -33,6 +35,55 @@ pub(crate) type BodyFn<P, R> =
 pub struct CompDef<P, R> {
     pub(crate) id: DefId,
     pub(crate) body: BodyFn<P, R>,
+}
+
+/// Object-safe, byte-erased revival operations for a registered
+/// [`CompDef`], used by `crate::persist` to restore a node from a persisted
+/// record without knowing its concrete `P`/`R` types.
+///
+/// The def.rs analogue of [`crate::source::ErasedSource`] /
+/// [`crate::source::SourceAdapter`]: [`DefAdapter`] adapts a concrete
+/// `CompDef<P, R>` to this object-safe interface, postcard-decoding bytes at
+/// the boundary. Built once per definition, alongside `defs`, by
+/// `EngineBuilder::register`.
+pub(crate) trait ErasedDef: Send + Sync {
+    /// The "param reviver": decodes `param_bytes` as this definition's
+    /// param type and, on success, returns the `CompKey` it identifies
+    /// (recomputed by hashing the decoded param, exactly as a live
+    /// [`CompKey::new`] would), a `rerun` closure for it (byte-for-byte the
+    /// same closure shape [`EngineInner::make_rerun`] builds for a live
+    /// node), and its `Debug`-rendered param string (mirroring the
+    /// `param_debug` a live node's `prepare()` computes).
+    ///
+    /// Returns `None` if `param_bytes` fails to decode as this definition's
+    /// param type — a corrupt or stale record, dropped by the caller rather
+    /// than treated as fatal.
+    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn, String)>;
+
+    /// The "value reviver": decodes `value_bytes` as this definition's
+    /// result type, erased. Returns `None` if the bytes fail to decode (a
+    /// corrupt or stale record).
+    fn revive_value(&self, value_bytes: &[u8]) -> Option<Arc<dyn Any + Send + Sync>>;
+}
+
+/// Adapts a concrete `CompDef<P, R>` to the erased [`ErasedDef`] interface.
+///
+/// Constructed by `EngineBuilder::register`.
+pub(crate) struct DefAdapter<P, R>(pub Arc<CompDef<P, R>>);
+
+impl<P: CompParam, R: CompResult> ErasedDef for DefAdapter<P, R> {
+    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn, String)> {
+        let param: P = postcard::from_bytes(param_bytes).ok()?;
+        let key = CompKey::new(self.0.id, &param);
+        let param_debug = format!("{param:?}");
+        let rerun = engine.make_rerun::<P, R>(self.0.id, param);
+        Some((key, rerun, param_debug))
+    }
+
+    fn revive_value(&self, value_bytes: &[u8]) -> Option<Arc<dyn Any + Send + Sync>> {
+        let value: R = postcard::from_bytes(value_bytes).ok()?;
+        Some(Arc::new(value) as Arc<dyn Any + Send + Sync>)
+    }
 }
 
 /// Defines a computation named `name` with the given body.

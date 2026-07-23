@@ -14,7 +14,9 @@ postcard = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+redb = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+tempfile = { workspace = true }
