@@ -111,6 +111,7 @@ dependencies = [
  "anyhow",
  "computations",
  "notify",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
