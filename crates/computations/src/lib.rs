@@ -18,6 +18,9 @@ pub mod source;
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
 
+pub use ctx::Ctx;
+pub use def::{Comp, CompDef, define_comp};
+pub use engine::{Engine, EngineBuilder};
 pub use key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
 pub use registry::Registry;
 pub use sink::{OutBytes, RawOutput, Sink, SinkBase, SinkId};
