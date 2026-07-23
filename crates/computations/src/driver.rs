@@ -19,6 +19,12 @@
 //! Cancel the loop by aborting or dropping the task it runs in
 //! (e.g. `tokio::spawn(async move { engine.run(comp, param).await })`);
 //! `run` never returns on its own once the initial evaluation succeeds.
+//!
+//! If persistence is configured (see `crate::persist`), saving happens
+//! entirely off this loop: a background persister task flushes on its own
+//! debounced schedule, so no round here ever awaits a write. Use
+//! [`Engine::persist_now`] for a deterministic "everything outstanding is
+//! now durable" point.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -81,7 +87,6 @@ impl Engine {
         } else {
             tracing::debug!("startup GC complete: nothing to collect");
         }
-        self.inner.persist_flush().await;
 
         loop {
             // Wait for either a genuine source change, or dirty work marked
@@ -122,7 +127,14 @@ impl Engine {
             async {
                 let prop_stats = self.inner.propagate(dirtied).await;
                 let gc_stats = self.inner.liveness_gc().await;
-                self.inner.persist_flush().await;
+                // Persistence is no longer awaited here: every node's
+                // record (and every GC'd node's removal) was already
+                // enqueued synchronously as `propagate`/`liveness_gc` ran
+                // (see `crate::persist::enqueue_changed`/`mark_removed`); a
+                // background persister task decides on its own timing when
+                // to actually flush that to disk (see `crate::persist`'s
+                // module docs). A round is "done" the moment its results
+                // are enqueued, not once they're durable.
                 tracing::debug!(
                     waves = prop_stats.waves,
                     total_reran = prop_stats.total_reran,
@@ -137,20 +149,28 @@ impl Engine {
         }
     }
 
-    /// Saves whatever has changed or been removed since the last
-    /// successful save, if [`crate::EngineBuilder::persistence`] was
-    /// configured — a no-op otherwise. `Engine::run` already calls this
-    /// automatically after every settled round and after the initial
-    /// evaluation; this is for a caller (typically a test simulating a
-    /// restart) that wants a deterministic "everything settled is now
-    /// safely on disk" point without waiting for the driver's own timing.
+    /// Forces an immediate flush of everything currently pending — every
+    /// node change and GC removal already enqueued (synchronously, as it
+    /// happened) since the last flush — and awaits its completion, if
+    /// [`crate::EngineBuilder::persistence`] was configured (a no-op
+    /// otherwise). The background persister task (see `crate::persist`)
+    /// flushes on its own debounced schedule regardless; this is for a
+    /// caller (typically a test simulating a restart, or a graceful
+    /// shutdown path) that wants a deterministic "everything settled is now
+    /// durable" point without waiting for that timing.
     pub async fn persist_now(&self) {
-        self.inner.persist_flush().await;
+        self.inner.persist_force_flush().await;
     }
 
     /// Closes the persisted database file, if persistence is configured,
     /// releasing redb's exclusive lock on it without needing this
-    /// `Engine`'s last reference to be dropped first.
+    /// `Engine`'s last reference to be dropped first. Also lets the
+    /// background persister task (see `crate::persist`) notice its handle
+    /// is gone and exit.
+    ///
+    /// Does **not** itself flush: call [`Self::persist_now`] first if
+    /// anything enqueued since the last flush needs to survive the close
+    /// (every call site in this crate's own tests does exactly that).
     ///
     /// This exists because an `Engine` is not, in general, ever fully
     /// dropped merely by dropping every handle to it: any node that has
@@ -166,6 +186,23 @@ impl Engine {
     /// `Database` per file at a time).
     pub fn persist_close(&self) {
         self.inner.persist.lock().unwrap().take();
+    }
+
+    /// Test-only: how many entries are currently enqueued but not yet
+    /// flushed to disk (`0` if persistence isn't configured/loaded, or
+    /// nothing is pending). Lets a test observe "a round settled but
+    /// nothing has been written yet" without reaching into a second redb
+    /// handle on the same file.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn persist_pending_count(&self) -> usize {
+        self.inner.persist_pending_count()
+    }
+
+    /// Test-only: how many flushes have completed successfully so far
+    /// (`0` if persistence isn't configured/loaded).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn persist_flush_count(&self) -> u64 {
+        self.inner.persist_flush_count()
     }
 
     /// Marks every currently-known node dirty at `priority`, waking the

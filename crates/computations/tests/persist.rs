@@ -31,10 +31,19 @@ async fn wait_until(f: impl Fn() -> bool) {
 }
 
 fn persist_opts(path: &std::path::Path, fingerprint: &str) -> PersistOptions {
-    PersistOptions {
-        path: path.to_path_buf(),
-        fingerprint: Fingerprint::custom(fingerprint),
-    }
+    PersistOptions::new(path.to_path_buf(), Fingerprint::custom(fingerprint))
+}
+
+/// Like [`persist_opts`], but with flush timing pushed out far beyond any
+/// test's runtime, so the background persister task never flushes on its
+/// own — only an explicit `persist_now()` ever writes anything. Used by
+/// tests that need to observe "settled but not yet durable" as a distinct,
+/// stable state.
+fn persist_opts_no_auto_flush(path: &std::path::Path, fingerprint: &str) -> PersistOptions {
+    persist_opts(path, fingerprint)
+        .flush_debounce(Duration::from_secs(3600))
+        .flush_max_pending(usize::MAX)
+        .flush_max_staleness(Duration::from_secs(3600))
 }
 
 /// Round trip: a settled two-chain graph, persisted, then restored in a
@@ -664,4 +673,422 @@ async fn corrupted_db_file_starts_cold_without_panic() {
     assert!(!handle.is_finished(), "a corrupted db must not crash the engine");
 
     handle.abort();
+}
+
+/// A settled round must not wait for a flush: with the debounce/staleness
+/// knobs pushed far out (see [`persist_opts_no_auto_flush`]), a mutation's
+/// round can visibly settle (the sink reflects the new value) while
+/// nothing has actually been written to disk yet — proven via
+/// `persist_flush_count` staying put and `persist_pending_count` becoming
+/// nonzero — and only `persist_now()` actually makes it durable.
+#[tokio::test]
+async fn rounds_do_not_block_on_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("graph.redb");
+
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "1").await;
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+    builder.persistence(persist_opts_no_auto_flush(&db_path, "fp-noblock"));
+
+    // Returns the value it read (rather than `()`) so its result hash
+    // actually changes across reruns with different source content — a
+    // `Comp<_, ()>` would hash the same constant `()` every time and, after
+    // its first run, would never again look "changed" to persistence (its
+    // sink write is a side effect the result hash doesn't capture), which
+    // would make this test vacuous.
+    let chain: Comp<(), String> = builder.define("nb_chain", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "doc_a".to_string(),
+                        content: val.clone(),
+                    },
+                )
+                .await?;
+                Ok(val)
+            }
+        }
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(chain, ()).await })
+    };
+
+    wait_until(|| sink.get("doc_a") == Some("1".to_string())).await;
+    engine.persist_now().await;
+    let baseline_flushes = engine.persist_flush_count();
+    assert_eq!(baseline_flushes, 1, "the startup evaluation's result must be durable after an explicit flush");
+    assert_eq!(engine.persist_pending_count(), 0);
+
+    kv.set("a", "2").await;
+    wait_until(|| sink.get("doc_a") == Some("2".to_string())).await;
+
+    // The round has visibly settled, yet nothing has been auto-flushed:
+    // the round did not wait for that.
+    assert_eq!(
+        engine.persist_flush_count(),
+        baseline_flushes,
+        "a settled round must not itself trigger (or wait for) a flush"
+    );
+    assert!(
+        engine.persist_pending_count() > 0,
+        "the new result must be enqueued for persistence even though it hasn't been flushed yet"
+    );
+
+    engine.persist_now().await;
+    assert_eq!(engine.persist_flush_count(), baseline_flushes + 1, "persist_now must force exactly one more flush");
+    assert_eq!(engine.persist_pending_count(), 0, "persist_now must drain everything outstanding");
+
+    engine.persist_close();
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Two mutations to the same key before any flush must coalesce into one
+/// final pending entry (a later update overwrites an earlier one for the
+/// same key), and the record actually written reflects only the final
+/// value — checked via restart correctness (a fresh engine must see the
+/// second, not the first, mutation's value as a cache hit) rather than by
+/// reaching into flush internals.
+#[tokio::test]
+async fn coalesced_updates_persist_only_the_final_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("graph.redb");
+
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "v0").await;
+
+    fn build(
+        kv: &Arc<MemKvSource>,
+        sink: &Arc<VecSink>,
+        db_path: &std::path::Path,
+        counter: &Arc<AtomicUsize>,
+    ) -> (Engine, Comp<(), String>) {
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+        registry.register_sink(sink.clone());
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+        builder.persistence(persist_opts_no_auto_flush(db_path, "fp-coalesce"));
+
+        // Returns the value read (see `rounds_do_not_block_on_flush` for why
+        // a `Comp<_, ()>` would make this test vacuous).
+        let chain: Comp<(), String> = builder.define("coalesce_chain", {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let counter = counter.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                let sink = sink.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                    ctx.sink_req(
+                        &sink,
+                        WriteDoc {
+                            name: "doc_a".to_string(),
+                            content: val.clone(),
+                        },
+                    )
+                    .await?;
+                    Ok(val)
+                }
+            }
+        });
+        (builder.build(), chain)
+    }
+
+    let counter1 = Arc::new(AtomicUsize::new(0));
+    let (engine1, root1) = build(&kv, &sink, &db_path, &counter1);
+    let handle1 = {
+        let engine1 = engine1.clone();
+        tokio::spawn(async move { engine1.run(root1, ()).await })
+    };
+    wait_until(|| sink.get("doc_a") == Some("v0".to_string())).await;
+    engine1.persist_now().await;
+
+    // Two mutations, back to back, with no flush in between (the debounce
+    // knobs make sure of that).
+    kv.set("a", "v1").await;
+    wait_until(|| sink.get("doc_a") == Some("v1".to_string())).await;
+    kv.set("a", "v2").await;
+    wait_until(|| sink.get("doc_a") == Some("v2".to_string())).await;
+
+    assert_eq!(
+        engine1.persist_pending_count(),
+        1,
+        "two updates to the same key before any flush must coalesce into one pending entry"
+    );
+
+    engine1.persist_now().await;
+    assert_eq!(engine1.persist_pending_count(), 0);
+
+    engine1.persist_close();
+    handle1.abort();
+    let _ = handle1.await;
+    drop(engine1);
+
+    let counter2 = Arc::new(AtomicUsize::new(0));
+    let (engine2, root2) = build(&kv, &sink, &db_path, &counter2);
+    let handle2 = {
+        let engine2 = engine2.clone();
+        tokio::spawn(async move { engine2.run(root2, ()).await })
+    };
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(counter2.load(Ordering::SeqCst), 0, "the restored record must be a pure cache hit");
+    assert_eq!(sink.get("doc_a"), Some("v2".to_string()), "only the final coalesced value must have persisted");
+
+    handle2.abort();
+}
+
+/// A removal enqueued after an update to the *same* key (a node updated,
+/// then collected by liveness GC once it becomes unreachable, all before
+/// any flush) must supersede that update: nothing survives to disk for
+/// that key. Checked via restart correctness — if the removal had lost to
+/// the stale update, the key would wrongly come back as a cache hit
+/// instead of running fresh.
+#[tokio::test]
+async fn removal_supersedes_pending_update_across_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("graph.redb");
+
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("mode", "on").await;
+    kv.set("val", "v1").await;
+
+    fn build(
+        kv: &Arc<MemKvSource>,
+        sink: &Arc<VecSink>,
+        db_path: &std::path::Path,
+        leaf_runs: &Arc<AtomicUsize>,
+    ) -> (Engine, Comp<(), ()>) {
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+        registry.register_sink(sink.clone());
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+        builder.persistence(persist_opts_no_auto_flush(db_path, "fp-gc"));
+
+        // Returns the value read (rather than `()`) so its second run
+        // (after `val` changes to "v2") actually enqueues a fresh pending
+        // update for persistence — the update this test needs a later
+        // removal to supersede. A `Comp<_, ()>` would hash the same
+        // constant `()` on every run, so after its first run it would
+        // never look "changed" to persistence again (its sink write is a
+        // side effect the result hash doesn't capture), leaving no pending
+        // update for the removal to actually supersede.
+        let leaf: Comp<(), String> = builder.define("gc_leaf", {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let leaf_runs = leaf_runs.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                let sink = sink.clone();
+                let leaf_runs = leaf_runs.clone();
+                async move {
+                    leaf_runs.fetch_add(1, Ordering::SeqCst);
+                    let val = ctx.src_req(&kv, GetKey("val".to_string())).await?.unwrap_or_default();
+                    ctx.sink_req(
+                        &sink,
+                        WriteDoc {
+                            name: "leaf_doc".to_string(),
+                            content: val.clone(),
+                        },
+                    )
+                    .await?;
+                    Ok(val)
+                }
+            }
+        });
+
+        let root: Comp<(), ()> = builder.define("gc_root", {
+            let kv = kv.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                async move {
+                    let mode = ctx.src_req(&kv, GetKey("mode".to_string())).await?.unwrap_or_default();
+                    if mode == "on" {
+                        ctx.eval(leaf, ()).await?;
+                    }
+                    Ok(())
+                }
+            }
+        });
+
+        (builder.build(), root)
+    }
+
+    let leaf_runs1 = Arc::new(AtomicUsize::new(0));
+    let (engine1, root1) = build(&kv, &sink, &db_path, &leaf_runs1);
+    let handle1 = {
+        let engine1 = engine1.clone();
+        tokio::spawn(async move { engine1.run(root1, ()).await })
+    };
+    wait_until(|| sink.get("leaf_doc") == Some("v1".to_string())).await;
+    engine1.persist_now().await;
+    assert_eq!(engine1.persist_flush_count(), 1);
+
+    // Update leaf's value (queues an update for its key), then -- before
+    // any flush -- make it unreachable (queues a removal for that very
+    // same key via liveness GC).
+    kv.set("val", "v2").await;
+    wait_until(|| sink.get("leaf_doc") == Some("v2".to_string())).await;
+    kv.set("mode", "off").await;
+    wait_until(|| sink.get("leaf_doc").is_none()).await;
+
+    assert_eq!(engine1.persist_flush_count(), 1, "no auto-flush should have happened yet");
+    assert_eq!(
+        engine1.persist_pending_count(),
+        1,
+        "the GC removal must have coalesced with (superseded) the still-pending update for the same key"
+    );
+
+    engine1.persist_now().await;
+    assert_eq!(engine1.persist_flush_count(), 2);
+    assert_eq!(engine1.persist_pending_count(), 0);
+
+    engine1.persist_close();
+    handle1.abort();
+    let _ = handle1.await;
+    drop(engine1);
+
+    // "Restart" with mode flipped back on: root will call leaf again. If
+    // leaf's record had wrongly survived (update beating removal), this
+    // would be a pure cache hit; it must instead run fresh.
+    kv.set("mode", "on").await;
+
+    let leaf_runs2 = Arc::new(AtomicUsize::new(0));
+    let (engine2, root2) = build(&kv, &sink, &db_path, &leaf_runs2);
+    let handle2 = {
+        let engine2 = engine2.clone();
+        tokio::spawn(async move { engine2.run(root2, ()).await })
+    };
+
+    wait_until(|| sink.get("leaf_doc") == Some("v2".to_string())).await;
+    assert!(
+        leaf_runs2.load(Ordering::SeqCst) >= 1,
+        "leaf's persisted record must have been removed by GC, forcing a fresh run rather than a stale cache hit"
+    );
+
+    handle2.abort();
+}
+
+/// A crash after a *known* flush point (forced via `persist_now`) but
+/// before any later change is flushed must lose only that later,
+/// still-pending change — not the whole graph, and not silently: on
+/// restart, `probe_versions` must catch that the live source has moved on
+/// since the persisted snapshot and recompute forward to the current,
+/// correct value.
+#[tokio::test]
+async fn crash_after_known_flush_point_loses_only_unflushed_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("graph.redb");
+
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "before").await;
+
+    fn build(
+        kv: &Arc<MemKvSource>,
+        sink: &Arc<VecSink>,
+        db_path: &std::path::Path,
+        counter: &Arc<AtomicUsize>,
+    ) -> (Engine, Comp<(), ()>) {
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+        registry.register_sink(sink.clone());
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+        builder.persistence(persist_opts_no_auto_flush(db_path, "fp-crash"));
+
+        let chain: Comp<(), ()> = builder.define("crash_chain", {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            let counter = counter.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                let sink = sink.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                    ctx.sink_req(
+                        &sink,
+                        WriteDoc {
+                            name: "doc_a".to_string(),
+                            content: val,
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        });
+        (builder.build(), chain)
+    }
+
+    let counter1 = Arc::new(AtomicUsize::new(0));
+    let (engine1, root1) = build(&kv, &sink, &db_path, &counter1);
+    let handle1 = {
+        let engine1 = engine1.clone();
+        tokio::spawn(async move { engine1.run(root1, ()).await })
+    };
+    wait_until(|| sink.get("doc_a") == Some("before".to_string())).await;
+
+    // A known-durable point.
+    engine1.persist_now().await;
+    assert_eq!(engine1.persist_flush_count(), 1);
+
+    // A further change settles live but is never flushed -- simulating a
+    // crash landing inside the debounce window.
+    kv.set("a", "after").await;
+    wait_until(|| sink.get("doc_a") == Some("after".to_string())).await;
+    assert_eq!(engine1.persist_flush_count(), 1, "the post-flush-point change must still be unflushed at crash time");
+
+    // "Crash": no persist_now, no persist_close.
+    handle1.abort();
+    let _ = handle1.await;
+    drop(engine1);
+
+    let counter2 = Arc::new(AtomicUsize::new(0));
+    let (engine2, root2) = build(&kv, &sink, &db_path, &counter2);
+    let handle2 = {
+        let engine2 = engine2.clone();
+        tokio::spawn(async move { engine2.run(root2, ()).await })
+    };
+
+    // `sink` is the same `Arc` engine1 already wrote "after" into live,
+    // before the crash -- so its content alone can't prove engine2 did
+    // anything (it would already read "after" even if engine2 wrongly
+    // treated the node as a stale cache hit and never recomputed at all).
+    // Waiting on `counter2` instead proves a genuine fresh execution
+    // happened on restart.
+    wait_until(|| counter2.load(Ordering::SeqCst) >= 1).await;
+    assert_eq!(
+        sink.get("doc_a"),
+        Some("after".to_string()),
+        "the recompute must reproduce the current, correct value"
+    );
+
+    handle2.abort();
 }

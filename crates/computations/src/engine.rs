@@ -268,12 +268,26 @@ impl EngineInner {
     pub(crate) fn make_rerun<P: CompParam, R: CompResult>(self: &Arc<Self>, def_id: DefId, param: P) -> RerunFn {
         let engine_for_rerun = self.clone();
         Arc::new(move || {
-            let engine = Engine {
-                inner: engine_for_rerun.clone(),
-            };
-            let comp = Comp::<P, R>::from_def_id(def_id);
+            let engine = engine_for_rerun.clone();
             let param = param.clone();
-            Box::pin(async move { engine.eval_root(&comp, param).await.map(|_| ()) })
+            // Deliberately calls `Self::eval` directly rather than going
+            // through `Engine::eval_root` (which this used to do): the
+            // computation body itself gets exactly the same `Ctx` either
+            // way (`Self::run` always builds it fresh with
+            // `caller: Some(key)`, regardless of how the evaluation was
+            // reached), but `eval_root` additionally marks its argument a
+            // GC root as a side effect of its own outer, `caller: None`
+            // `Ctx::eval` call — appropriate for a *genuine* root
+            // evaluation (the one `crate::driver::Engine::run` performs
+            // once, up front), but wrong here: this closure re-evaluates
+            // an *existing* node, dirtied for any reason (its own source
+            // input changed, a revalidation sweep, ...), not a fresh root.
+            // Routing it through `eval_root` would permanently mark every
+            // node that ever directly serves a propagation wave as a root
+            // — since `roots` only ever grows — which would make liveness
+            // GC never collect it again even after every real caller stops
+            // referencing it.
+            Box::pin(async move { engine.eval::<P, R>(def_id, param, Arc::new(Vec::new())).await.map(|_| ()) })
         })
     }
 
@@ -414,18 +428,24 @@ impl EngineInner {
                     node.result_hash = Some(hash);
                     node.last_changed = changed;
                     node.inflight = None;
+
+                    // Only a genuinely changed result needs a fresh save: a
+                    // recomputation that hit early cutoff already has its
+                    // (still correct) record on disk. A brand-new node's
+                    // first run always counts as changed (`old_hash` was
+                    // `None`), so this naturally covers "just created" too,
+                    // without a separate case. Snapshotting and enqueuing
+                    // here, while `nodes` is still locked, is what makes
+                    // `crate::persist`'s background flush race-free: the
+                    // record it eventually writes is exactly this node's
+                    // state at this instant, never a state some later
+                    // (possibly concurrent) rerun has since overwritten.
+                    if changed {
+                        crate::persist::enqueue_changed(self, key, node);
+                    }
+
                     (node.source_deps.clone(), node.outputs.clone(), node.param_debug.clone())
                 };
-
-                // Only a genuinely changed result needs a fresh save: a
-                // recomputation that hit early cutoff already has its (still
-                // correct) record on disk. A brand-new node's first run
-                // always counts as changed (`old_hash` was `None`), so this
-                // naturally covers "just created" too, without a separate
-                // case.
-                if changed {
-                    crate::persist::mark_changed(self, key.clone());
-                }
 
                 self.remove_stale_source_index(key, &old_source_deps, &new_source_deps);
 
@@ -459,13 +479,35 @@ impl EngineInner {
         }
     }
 
+    /// Drops `key` from `source_index`'s `(source, key-bytes)` bucket for
+    /// every source dependency it read last run (`old`) but not this run
+    /// (`new`) — so a node that has genuinely stopped reading some
+    /// `(source, key-bytes)` pair no longer receives its future change
+    /// notifications.
+    ///
+    /// Compares `old`/`new` by `(source, key-bytes)` identity, deliberately
+    /// ignoring `ver`: `source_index` itself is keyed on identity alone (it
+    /// has no notion of version), so a node that re-reads the *same*
+    /// `(source, key-bytes)` pair at a newer version — the ordinary case
+    /// for any node whose source input just changed — must stay registered
+    /// for it. Diffing `RawDep`'s full equality (as this used to) instead
+    /// treats every version bump as "the old dep vanished, a new one
+    /// appeared", which deletes the node's own just-(re)inserted
+    /// registration for that identical pair one statement later,
+    /// orphaning it: the very next change to that key would then map to no
+    /// node at all in `affected_keys`, permanently.
     fn remove_stale_source_index(&self, key: &CompKey, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
         if old == new {
             return;
         }
+        let new_pairs: HashSet<(SourceId, KeyBytes)> =
+            new.iter().map(|dep| (dep.source.clone(), dep.key.clone())).collect();
         let mut index = self.source_index.lock().unwrap();
-        for dep in old.difference(new) {
+        for dep in old {
             let idx_key = (dep.source.clone(), dep.key.clone());
+            if new_pairs.contains(&idx_key) {
+                continue;
+            }
             if let Some(set) = index.get_mut(&idx_key) {
                 set.remove(key);
                 if set.is_empty() {

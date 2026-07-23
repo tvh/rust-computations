@@ -22,10 +22,14 @@
 //!    (no restart involved — this is "how fast a single change propagates"
 //!    with persistence out of the picture entirely); and
 //! 8. the same live, steady-state incremental measurement with persistence
-//!    *configured* on the running engine, isolating the per-round save
-//!    overhead (the driver calls `persist_flush` before a round is
-//!    considered complete — see `crate::driver::Engine::run` — so phase 8
-//!    minus phase 7 is approximately that overhead).
+//!    *configured* on the running engine. Saving is decoupled from
+//!    propagation (see `crate::persist`'s background persister task): a
+//!    round's settle latency no longer waits on a flush, so phase 8's
+//!    settle time should now land close to phase 7's. Each of phases 7 and
+//!    8 additionally reports a second, "time-to-durable" `RESULT` line —
+//!    that same settle latency plus an explicit, awaited `persist_now()`
+//!    right after — making the (now fully separate) flush cost visible on
+//!    its own.
 //!
 //! Run with:
 //! ```text
@@ -590,10 +594,7 @@ async fn worker_main(phase_id: &str) {
         }
         "8" => {
             let db_path8 = dir.join("persist_bench_live.redb");
-            let opts8 = PersistOptions {
-                path: db_path8,
-                fingerprint: fingerprint_v1,
-            };
+            let opts8 = PersistOptions::new(db_path8, fingerprint_v1);
             run_live_incremental_phase(
                 "8. live incremental, 1 changed input (WITH persistence)",
                 &level_sizes,
@@ -627,10 +628,7 @@ async fn run_phase_1(
     let sink = VecSink::new("docs");
 
     let counter1 = Arc::new(AtomicUsize::new(0));
-    let opts1 = PersistOptions {
-        path: db_path.to_path_buf(),
-        fingerprint: fingerprint_v1,
-    };
+    let opts1 = PersistOptions::new(db_path, fingerprint_v1);
     let (engine1, root1) = build_graph(&kv, &sink, Some(opts1), &counter1, level_sizes);
 
     let baseline = settle_signal.load(Ordering::SeqCst);
@@ -689,10 +687,7 @@ async fn run_restart_phase(
     let sink = VecSink::new("docs");
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let opts = PersistOptions {
-        path: db_path.to_path_buf(),
-        fingerprint,
-    };
+    let opts = PersistOptions::new(db_path, fingerprint);
     let (engine, root) = build_graph(&kv, &sink, Some(opts), &counter, level_sizes);
 
     let baseline = settle_signal.load(Ordering::SeqCst);
@@ -758,10 +753,7 @@ async fn run_fingerprint_mismatch_phase(
     let sink = VecSink::new("docs");
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let opts = PersistOptions {
-        path: db_path.to_path_buf(),
-        fingerprint: fingerprint_v2,
-    };
+    let opts = PersistOptions::new(db_path, fingerprint_v2);
     let (engine, root) = build_graph(&kv, &sink, Some(opts), &counter, level_sizes);
 
     let baseline = settle_signal.load(Ordering::SeqCst);
@@ -789,9 +781,18 @@ async fn run_fingerprint_mismatch_phase(
 /// below is completely unambiguous, let the engine settle, then mutate
 /// exactly one source key and time until the driver's next propagation
 /// round completes. `persist_opts` is `None` for phase 7 and `Some` (its
-/// own fresh database) for phase 8, isolating the per-round
-/// `persist_flush` overhead the driver pays before a round is considered
-/// complete.
+/// own fresh database) for phase 8.
+///
+/// Saving no longer happens synchronously inside a round (see
+/// `crate::persist`'s background persister task): a round's own
+/// settle-latency (the `RESULT` line under `label`) should now land close
+/// to identical between phases 7 and 8. The actual per-flush cost is
+/// reported separately, as a second `RESULT` line under `"{label} +
+/// persist_now (time-to-durable)"`: the same settle latency plus an
+/// explicit, awaited `persist_now()` immediately afterward — i.e. "how
+/// long until this update is not just live, but crash-safe". For phase 7
+/// (no persistence configured) `persist_now()` is a fast no-op, so that
+/// line is expected to sit right on top of the plain settle line.
 async fn run_live_incremental_phase(
     label: &str,
     level_sizes: &[u32; LEVELS],
@@ -826,9 +827,17 @@ async fn run_live_incremental_phase(
     let t = Instant::now();
     kv.set("0", "13371337").await;
     wait_for_signal(round_signal, round_baseline, phase_timeout).await;
-    let ms = t.elapsed().as_millis();
+    let settle_ms = t.elapsed().as_millis();
     let reruns = counter.load(Ordering::Relaxed) - reruns_before;
-    report(label, ms, reruns);
+    report(label, settle_ms, reruns);
+
+    // Time-to-durable: the same settle latency above, plus however long an
+    // explicit, awaited `persist_now()` takes right after — the actual
+    // flush cost, now fully decoupled from round-settle latency.
+    let t2 = Instant::now();
+    engine.persist_now().await;
+    let durable_extra_ms = t2.elapsed().as_millis();
+    report(&format!("{label} + persist_now (time-to-durable)"), settle_ms + durable_extra_ms, reruns);
 
     engine.persist_close();
     handle.abort();

@@ -666,3 +666,156 @@ async fn input_priority_preempts_in_progress_revalidate_sweep() {
 
     handle.abort();
 }
+
+/// A chain must keep reacting to *every* live change to the source key it
+/// reads directly, not just the first one after startup.
+///
+/// Regression test: `EngineInner::remove_stale_source_index` used to diff
+/// `old`/`new` source deps by full `RawDep` equality (including `ver`), so
+/// a node re-reading the very same `(source, key)` pair at a newer version
+/// looked like "the old dep vanished, a new one appeared" — deleting the
+/// node's own just-(re)inserted `source_index` registration for that pair
+/// one statement later. The very next live change to that key then mapped
+/// to no node at all, and the chain would silently stop updating forever.
+#[tokio::test]
+async fn successive_live_changes_to_the_same_key_each_trigger_a_rerun() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "v0").await;
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+
+    let root: Comp<(), ()> = builder.define("repeat_change_root", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "doc_a".to_string(),
+                        content: val,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| sink.get("doc_a") == Some("v0".to_string())).await;
+
+    kv.set("a", "v1").await;
+    wait_until(|| sink.get("doc_a") == Some("v1".to_string())).await;
+
+    // Before the fix, this second live change would never be observed:
+    // `source_index` had already lost the node's registration for `a`
+    // after the first change settled.
+    kv.set("a", "v2").await;
+    wait_until(|| sink.get("doc_a") == Some("v2".to_string())).await;
+
+    kv.set("a", "v3").await;
+    wait_until(|| sink.get("doc_a") == Some("v3".to_string())).await;
+
+    handle.abort();
+}
+
+/// A node with its own *direct* source dependency (so a source change
+/// dirties it directly, and it is re-run via its own `rerun` closure rather
+/// than only ever being reached through a parent's `ctx.eval`) must still
+/// be collected by liveness GC once it becomes unreachable.
+///
+/// Regression test: `EngineInner::make_rerun`'s closure used to re-evaluate
+/// a dirtied node via `Engine::eval_root`, whose outer `Ctx { caller: None
+/// }` unconditionally marks its argument a GC root as a side effect. Since
+/// `roots` only ever grows, the first time change propagation ever
+/// re-ran *any* node directly (which is the ordinary case for a node that
+/// reads a source itself, not only via a parent), that node became a
+/// permanent root — liveness GC would then never collect it again, even
+/// after its real (structural) caller stopped referencing it entirely.
+#[tokio::test]
+async fn gc_collects_a_directly_source_dependent_node_once_unreachable() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("mode", "on").await;
+    kv.set("val", "v1").await;
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+
+    // `leaf` reads `val` *directly*: a change to `val` dirties `leaf`
+    // itself (not `root`), so `leaf` is re-run via its own `rerun` closure
+    // during propagation -- the exact path that used to wrongly mark it a
+    // permanent root.
+    let leaf: Comp<(), ()> = builder.define("direct_gc_leaf", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("val".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(
+                    &sink,
+                    WriteDoc {
+                        name: "leaf_doc".to_string(),
+                        content: val,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    });
+
+    let root: Comp<(), ()> = builder.define("direct_gc_root", {
+        let kv = kv.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            async move {
+                let mode = ctx.src_req(&kv, GetKey("mode".to_string())).await?.unwrap_or_default();
+                if mode == "on" {
+                    ctx.eval(leaf, ()).await?;
+                }
+                Ok(())
+            }
+        }
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| sink.get("leaf_doc") == Some("v1".to_string())).await;
+
+    // Dirty `leaf` directly (not via `root`) -- this is what used to mark
+    // it a permanent root.
+    kv.set("val", "v2").await;
+    wait_until(|| sink.get("leaf_doc") == Some("v2".to_string())).await;
+
+    // Now make `leaf` unreachable: `root` stops calling it.
+    kv.set("mode", "off").await;
+    wait_until(|| sink.get("leaf_doc").is_none()).await;
+
+    handle.abort();
+}
