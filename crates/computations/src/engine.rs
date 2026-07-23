@@ -22,8 +22,10 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, FutureExt, Shared};
+use tracing::Instrument;
 
 use crate::ctx::Ctx;
 use crate::def::{Comp, CompDef};
@@ -33,8 +35,9 @@ use crate::registry::Registry;
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId};
 
-/// The result of one execution: the (erased) value plus its content hash.
-type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Hash256), CompError>;
+/// The result of one execution: the (erased) value, its content hash, and
+/// how long the body itself took to run (for the `comp.eval` tracing event).
+type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Hash256, Duration), CompError>;
 /// The shared, joinable handle to an in-flight execution.
 type SharedExec = Shared<BoxFuture<'static, ExecResult>>;
 /// A closure that re-executes a node's computation via the normal eval path.
@@ -79,7 +82,6 @@ pub(crate) struct Node {
     /// Called by the driver during change propagation to re-execute a
     /// dirtied node through the normal eval path.
     pub(crate) rerun: RerunFn,
-    def: DefId,
     /// `Debug`-rendered param, for diagnostics (tracing, panic messages)
     /// without needing `Node` itself to be generic over `P`.
     param_debug: String,
@@ -179,12 +181,9 @@ impl EngineInner {
                 last_changed: false,
                 inflight: None,
                 rerun,
-                def: def_id.clone(),
                 param_debug: format!("{param:?}"),
             }
         });
-
-        tracing::debug!(comp = ?key, def = %node.def, param = %node.param_debug, "begin execution");
 
         let old_hash = node.result_hash;
         let old_outputs = node.outputs.clone();
@@ -227,6 +226,7 @@ impl EngineInner {
                 if let Some(node) = nodes.get_mut(key) {
                     node.state = NodeState::Dirty;
                 }
+                tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 return Err(e);
             }
         };
@@ -239,13 +239,13 @@ impl EngineInner {
             chain: Arc::new(child_chain),
         };
 
-        let key_for_fut = key.clone();
         let fut: BoxFuture<'static, ExecResult> = Box::pin(async move {
-            tracing::debug!(comp = ?key_for_fut, "execute start");
+            let start = Instant::now();
             let result = (def.body)(ctx, param).await?;
+            let elapsed = start.elapsed();
             let hash = result.stable_hash();
             let value: Arc<dyn Any + Send + Sync> = Arc::new(result);
-            Ok((value, hash))
+            Ok((value, hash, elapsed))
         });
         let shared: SharedExec = fut.shared();
 
@@ -259,9 +259,9 @@ impl EngineInner {
         let outcome = shared.await;
 
         match outcome {
-            Ok((value_any, hash)) => {
+            Ok((value_any, hash, elapsed)) => {
                 let changed = old_hash != Some(hash);
-                let (new_source_deps, new_outputs) = {
+                let (new_source_deps, new_outputs, param_debug) = {
                     let mut nodes = self.nodes.lock().unwrap();
                     let node = nodes
                         .get_mut(key)
@@ -271,7 +271,7 @@ impl EngineInner {
                     node.result_hash = Some(hash);
                     node.last_changed = changed;
                     node.inflight = None;
-                    (node.source_deps.clone(), node.outputs.clone())
+                    (node.source_deps.clone(), node.outputs.clone(), node.param_debug.clone())
                 };
 
                 self.remove_stale_source_index(key, &old_source_deps, &new_source_deps);
@@ -282,7 +282,13 @@ impl EngineInner {
                     self.delete_dropped_outputs(dropped_outputs).await;
                 }
 
-                tracing::debug!(comp = ?key, changed, "execute finished");
+                tracing::debug!(
+                    outcome = "executed",
+                    changed,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    param = %param_debug,
+                    "comp.eval finished"
+                );
                 downcast_value::<R>(value_any, key)
             }
             Err(e) => {
@@ -294,7 +300,7 @@ impl EngineInner {
                     node.state = NodeState::Dirty;
                     node.inflight = None;
                 }
-                tracing::debug!(comp = ?key, error = %e, "execute failed");
+                tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 Err(e)
             }
         }
@@ -340,6 +346,12 @@ impl EngineInner {
     /// single-flight-deduplicated. Returns the value together with the
     /// `CompKey` it was computed under, so the caller can record a
     /// dependency against it without recomputing the key.
+    ///
+    /// The whole call runs inside a `comp.eval` tracing span (fields: `comp`
+    /// = definition name, `param_hash` = short content hash of the
+    /// parameter). Exactly one debug-level completion event is emitted
+    /// before returning, tagged with `outcome` = `cache_hit` | `dedup_join`
+    /// | `executed` (plus `changed` and `elapsed_ms`) | `error`.
     pub(crate) async fn eval<P: CompParam, R: CompResult>(
         self: &Arc<Self>,
         def_id: DefId,
@@ -347,27 +359,43 @@ impl EngineInner {
         chain: Arc<Vec<CompKey>>,
     ) -> Result<(R, CompKey), CompError> {
         let key = CompKey::new(def_id.clone(), &param);
+        let span = tracing::debug_span!(
+            "comp.eval",
+            comp = %def_id.name(),
+            param_hash = %key.param_hash().short_hex()
+        );
 
-        if chain.contains(&key) {
-            return Err(CompError::Cycle(render_chain(&chain, &key)));
+        async move {
+            if chain.contains(&key) {
+                let e = CompError::Cycle(render_chain(&chain, &key));
+                tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                return Err(e);
+            }
+
+            let action = self.prepare::<P, R>(&key, &def_id, &param);
+
+            let value = match action {
+                Action::CacheHit(v) => {
+                    tracing::debug!(outcome = "cache_hit", "comp.eval finished");
+                    downcast_value::<R>(v, &key)?
+                }
+                Action::Join(shared) => match shared.await {
+                    Ok((v, _hash, _elapsed)) => {
+                        tracing::debug!(outcome = "dedup_join", "comp.eval finished");
+                        downcast_value::<R>(v, &key)?
+                    }
+                    Err(e) => {
+                        tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                        return Err(e);
+                    }
+                },
+                Action::Run(snapshot) => self.run::<P, R>(&key, &def_id, param, chain, snapshot).await?,
+            };
+
+            Ok((value, key))
         }
-
-        let action = self.prepare::<P, R>(&key, &def_id, &param);
-
-        let value = match action {
-            Action::CacheHit(v) => {
-                tracing::debug!(comp = ?key, "cache hit");
-                downcast_value::<R>(v, &key)?
-            }
-            Action::Join(shared) => {
-                tracing::debug!(comp = ?key, "dedup join on inflight execution");
-                let (v, _hash) = shared.await?;
-                downcast_value::<R>(v, &key)?
-            }
-            Action::Run(snapshot) => self.run::<P, R>(&key, &def_id, param, chain, snapshot).await?,
-        };
-
-        Ok((value, key))
+        .instrument(span)
+        .await
     }
 
     pub(crate) fn record_call_dep(&self, caller: &CompKey, callee: &CompKey) {

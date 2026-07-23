@@ -37,6 +37,18 @@ impl Hash256 {
         }
         Ok(())
     }
+
+    /// Renders the first 4 bytes (8 hex characters) of this hash, for
+    /// tracing fields and other diagnostics that want a short, stable id
+    /// without the full 64-character digest.
+    pub(crate) fn short_hex(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(8);
+        for byte in &self.0[..4] {
+            let _ = write!(s, "{byte:02x}");
+        }
+        s
+    }
 }
 
 impl fmt::Display for Hash256 {

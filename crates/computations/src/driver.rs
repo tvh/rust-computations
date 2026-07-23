@@ -14,8 +14,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::future::{BoxFuture, join_all, select_all};
+use tracing::Instrument;
 
 use crate::def::Comp;
 use crate::engine::{Engine, EngineInner, NodeState, RerunFn};
@@ -23,6 +25,22 @@ use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId};
+
+/// Summary of one `propagate` round, for the `driver.propagate` span's
+/// round-summary event.
+struct PropagateStats {
+    waves: usize,
+    total_reran: usize,
+}
+
+/// Summary of one `liveness_gc` pass, for its own consolidated event and for
+/// the enclosing round-summary event.
+#[derive(Default)]
+struct GcStats {
+    nodes_collected: usize,
+    outputs_deleted: usize,
+    keys_unregistered: usize,
+}
 
 impl Engine {
     /// Runs the system: an initial evaluation of `comp` applied to `param`,
@@ -36,9 +54,16 @@ impl Engine {
     /// This future never resolves on the happy path: cancel it by aborting
     /// or dropping the task it runs in.
     pub async fn run<P: CompParam, R: CompResult>(&self, comp: &Comp<P, R>, param: P) -> Result<(), CompError> {
+        let start = Instant::now();
         self.eval_root(comp, param).await?;
+        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
-        self.inner.startup_gc().await;
+        let startup_outputs_deleted = self.inner.startup_gc().await;
+        if startup_outputs_deleted > 0 {
+            tracing::info!(outputs_deleted = startup_outputs_deleted, "startup GC complete");
+        } else {
+            tracing::debug!("startup GC complete: nothing to collect");
+        }
 
         loop {
             let changed = self.inner.wait_for_any_change().await;
@@ -49,8 +74,26 @@ impl Engine {
             if dirtied.is_empty() {
                 continue;
             }
-            self.inner.propagate(dirtied).await;
-            self.inner.liveness_gc().await;
+
+            let span = tracing::debug_span!(
+                "driver.propagate",
+                triggering_deps = changed.len(),
+                dirtied = dirtied.len()
+            );
+            async {
+                let prop_stats = self.inner.propagate(dirtied).await;
+                let gc_stats = self.inner.liveness_gc().await;
+                tracing::debug!(
+                    waves = prop_stats.waves,
+                    total_reran = prop_stats.total_reran,
+                    nodes_gcd = gc_stats.nodes_collected,
+                    outputs_deleted = gc_stats.outputs_deleted,
+                    keys_unregistered = gc_stats.keys_unregistered,
+                    "propagation round complete"
+                );
+            }
+            .instrument(span)
+            .await;
         }
     }
 }
@@ -58,10 +101,13 @@ impl Engine {
 impl EngineInner {
     /// Startup GC: for every sink that can list its existing outputs,
     /// deletes whatever it reports that no live node currently produces.
-    async fn startup_gc(&self) {
+    /// Returns the total number of outputs deleted across all sinks, so the
+    /// caller can log a single summary.
+    async fn startup_gc(&self) -> usize {
         let live = self.live_outputs_by_sink();
         let sinks: Vec<Arc<dyn crate::sink::ErasedSink>> = self.registry.sinks().cloned().collect();
 
+        let mut total_deleted = 0usize;
         for sink in sinks {
             let id = sink.instance_id();
             match sink.list_existing_outputs().await {
@@ -77,7 +123,8 @@ impl EngineInner {
                     let count = stale.len();
                     match sink.delete_outputs(stale).await {
                         Ok(()) => {
-                            tracing::debug!(sink = %id, outputs_deleted = count, "startup GC pass");
+                            total_deleted += count;
+                            tracing::debug!(sink = %id, outputs_deleted = count, "startup GC: sink pass complete");
                         }
                         Err(e) => {
                             tracing::warn!(sink = %id, error = %e, "startup GC: failed to delete stale outputs");
@@ -90,6 +137,7 @@ impl EngineInner {
                 }
             }
         }
+        total_deleted
     }
 
     /// The union of every node's currently recorded outputs, grouped by sink.
@@ -161,15 +209,19 @@ impl EngineInner {
     /// skipped; the liveness GC pass that follows the round cleans it up
     /// regardless, so this is a harmless wasted rerun rather than a
     /// correctness issue.
-    async fn propagate(&self, initial: HashSet<CompKey>) {
+    async fn propagate(&self, initial: HashSet<CompKey>) -> PropagateStats {
         let mut frontier = initial;
         let mut done: HashSet<CompKey> = HashSet::new();
+        let mut waves = 0usize;
+        let mut total_reran = 0usize;
 
         while !frontier.is_empty() {
             let batch: Vec<CompKey> = frontier.into_iter().filter(|k| done.insert(k.clone())).collect();
             if batch.is_empty() {
                 break;
             }
+            waves += 1;
+            let dirty_count = batch.len();
 
             let jobs: Vec<(CompKey, RerunFn)> = {
                 let mut nodes = self.nodes.lock().unwrap();
@@ -186,11 +238,14 @@ impl EngineInner {
             let results = join_all(jobs.iter().map(|(_, rerun)| rerun())).await;
 
             let mut next_frontier = HashSet::new();
+            let mut reran = 0usize;
+            let mut cutoffs = 0usize;
             {
                 let nodes = self.nodes.lock().unwrap();
                 for ((key, _), result) in jobs.iter().zip(results.iter()) {
                     match result {
                         Ok(()) => {
+                            reran += 1;
                             let Some(node) = nodes.get(key) else {
                                 continue;
                             };
@@ -200,6 +255,8 @@ impl EngineInner {
                                         next_frontier.insert(rdep.clone());
                                     }
                                 }
+                            } else {
+                                cutoffs += 1;
                             }
                         }
                         Err(e) => {
@@ -212,8 +269,12 @@ impl EngineInner {
                     }
                 }
             }
+            total_reran += reran;
+            tracing::debug!(wave = waves, dirty = dirty_count, reran, cutoffs, "propagation wave complete");
             frontier = next_frontier;
         }
+
+        PropagateStats { waves, total_reran }
     }
 
     /// Liveness GC: mark-sweep from `roots` over `comp_deps`. Any node not
@@ -222,7 +283,7 @@ impl EngineInner {
     /// source *if* no surviving node still depends on that (source, key),
     /// and it is removed from the node table, `source_index`, and every
     /// surviving node's `rdeps`.
-    async fn liveness_gc(&self) {
+    async fn liveness_gc(&self) -> GcStats {
         let (dead_keys, outputs_by_sink, dead_source_deps) = {
             let mut nodes = self.nodes.lock().unwrap();
 
@@ -246,7 +307,7 @@ impl EngineInner {
 
             let dead_keys: Vec<CompKey> = nodes.keys().filter(|k| !reachable.contains(k)).cloned().collect();
             if dead_keys.is_empty() {
-                return;
+                return GcStats::default();
             }
 
             let mut outputs_by_sink: HashMap<SinkId, Vec<OutBytes>> = HashMap::new();
@@ -292,7 +353,9 @@ impl EngineInner {
                 }
             }
         }
+        let mut keys_unregistered = 0usize;
         for (source_id, keys) in to_unregister {
+            keys_unregistered += keys.len();
             if let Some(source) = self.registry.source(&source_id) {
                 source.unregister(&keys);
             }
@@ -308,6 +371,12 @@ impl EngineInner {
             }
         }
 
-        tracing::debug!(nodes_collected = dead_keys.len(), outputs_deleted, "liveness GC pass");
+        let nodes_collected = dead_keys.len();
+        tracing::debug!(nodes_collected, outputs_deleted, keys_unregistered, "liveness GC pass");
+        GcStats {
+            nodes_collected,
+            outputs_deleted,
+            keys_unregistered,
+        }
     }
 }

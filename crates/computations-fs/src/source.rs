@@ -187,6 +187,16 @@ struct Shared {
     watched: Mutex<HashMap<PathBuf, WatchEntry>>,
 }
 
+/// A short, stable label for an [`FsVer`]'s variant, for tracing fields (the
+/// full value, especially `Dir`'s entry hash, is not worth logging).
+fn ver_kind(ver: &FsVer) -> &'static str {
+    match ver {
+        FsVer::Missing => "missing",
+        FsVer::File { .. } => "file",
+        FsVer::Dir { .. } => "dir",
+    }
+}
+
 fn handle_event(shared: &Shared, tx: &mpsc::UnboundedSender<Dep<PathBuf, FsVer>>, event: notify::Event) {
     let mut watched = shared.watched.lock().unwrap();
     for path in &event.paths {
@@ -203,6 +213,7 @@ fn handle_event(shared: &Shared, tx: &mpsc::UnboundedSender<Dep<PathBuf, FsVer>>
             let new_ver = compute_ver(&key, entry.is_dir);
             if new_ver != entry.last_ver {
                 entry.last_ver = new_ver.clone();
+                tracing::debug!(key = %key.display(), ver_kind = ver_kind(&new_ver), "fs source: change notification");
                 let _ = tx.send(Dep {
                     key: key.clone(),
                     ver: new_ver,

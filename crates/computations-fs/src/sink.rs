@@ -131,6 +131,7 @@ impl SinkBase for FsSink {
     }
 
     async fn delete_outputs(&self, outs: HashSet<PathBuf>) -> Result<(), SinkError> {
+        tracing::debug!(sink = %self.id, count = outs.len(), "fs sink: deleting outputs");
         for out in outs {
             validate_rel_path(&out)?;
             let full = self.full_path(&out);
