@@ -391,11 +391,14 @@ impl PendingRecord {
     /// from a concurrent rerun of the same node. `nodes` (the whole live
     /// table, not just `node`) is needed to translate `node.comp_deps`'
     /// `NodeId`s back into the `CompKey`s persistence actually stores (see
-    /// `crate::engine::NodeId`'s docs).
+    /// `crate::engine::NodeId`'s docs), and to read `id`'s `source_deps`/
+    /// `outputs` out of `nodes`'s sparse side tables (see
+    /// `crate::engine::Node`'s docs on why those no longer live directly on
+    /// `Node`).
     ///
     /// Returns `None` for a node with no successful run yet (no
     /// `value`/`result_hash`) — nothing coherent to persist.
-    fn snapshot(nodes: &NodeTable, key: &CompKey, node: &Node) -> Option<PendingRecord> {
+    fn snapshot(nodes: &NodeTable, id: NodeId, key: &CompKey, node: &Node) -> Option<PendingRecord> {
         let value = node.value.clone()?;
         let result_hash = node.result_hash?;
         let comp_deps: Vec<CompKeyRepr> = node
@@ -408,10 +411,10 @@ impl PendingRecord {
             def_name: key.def().name().to_string(),
             param_bytes: node.param_bytes.clone(),
             comp_deps,
-            source_deps: node.source_deps.iter().map(RawDepRepr::from_dep).collect(),
+            source_deps: nodes.source_deps_iter(id).map(RawDepRepr::from_dep).collect(),
             result_hash: result_hash.as_bytes(),
             value,
-            outputs: node.outputs.iter().map(RawOutputRepr::from_output).collect(),
+            outputs: nodes.outputs_iter(id).map(RawOutputRepr::from_output).collect(),
         })
     }
 }
@@ -895,11 +898,13 @@ impl EngineInner {
     /// dependency that itself appears later in the same batch, or not at
     /// all — see the second pass's handling of a dangling `comp_deps`
     /// entry).
-    fn restore_nodes(self: &Arc<Self>, records: Vec<NodeRecord>) -> usize {
+    fn restore_nodes(&self, records: Vec<NodeRecord>) -> usize {
         struct PendingNode {
             key: CompKey,
             node: Node,
             comp_dep_keys: Vec<CompKey>,
+            source_deps: HashSet<RawDep>,
+            outputs: HashSet<RawOutput>,
         }
 
         let mut pending: Vec<PendingNode> = Vec::with_capacity(records.len());
@@ -915,7 +920,7 @@ impl EngineInner {
             let Some(erased_def) = self.erased_defs.get(&def_id) else {
                 continue;
             };
-            let Some((key, rerun)) = erased_def.revive_param(self, &record.param_bytes) else {
+            let Some(key) = erased_def.revive_key(&record.param_bytes) else {
                 tracing::debug!(def = %record.def_name, "persistence: dropping a record whose param bytes failed to decode");
                 continue;
             };
@@ -935,12 +940,9 @@ impl EngineInner {
                     param_bytes: record.param_bytes,
                     value,
                     result_hash: Hash128::from_bytes(record.result_hash),
-                    source_deps,
-                    outputs,
-                    rerun,
                 },
             );
-            pending.push(PendingNode { key, node, comp_dep_keys });
+            pending.push(PendingNode { key, node, comp_dep_keys, source_deps, outputs });
         }
 
         let restored_count = pending.len();
@@ -950,10 +952,15 @@ impl EngineInner {
 
         let mut nodes = self.nodes.lock().unwrap();
 
-        // Pass 1: every restored node gets a `NodeId`.
+        // Pass 1: every restored node gets a `NodeId`, and — now that it has
+        // one — its `source_deps`/`outputs` (kept off `Node` itself; see
+        // `crate::engine::Node`'s docs) land in `NodeTable`'s sparse side
+        // tables directly.
         let mut edge_work: Vec<(NodeId, Vec<CompKey>)> = Vec::with_capacity(pending.len());
         for p in pending {
             let id = nodes.insert_new(p.key, p.node);
+            nodes.extend_source_deps(id, &p.source_deps);
+            nodes.extend_outputs(id, &p.outputs);
             edge_work.push((id, p.comp_dep_keys));
         }
 
@@ -982,7 +989,7 @@ impl EngineInner {
         // incrementally for a live node.
         let source_index_entries: Vec<(SourceId, KeyBytes, NodeId)> = nodes
             .iter()
-            .flat_map(|(id, node)| node.source_deps.iter().map(move |dep| (dep.source.clone(), dep.key.clone(), id)))
+            .flat_map(|(id, _node)| nodes.source_deps_iter(id).map(move |dep| (dep.source.clone(), dep.key.clone(), id)))
             .collect();
         drop(nodes);
 
@@ -1013,7 +1020,7 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
     // rely on and easy to deadlock).
     let deps_by_key: HashMap<CompKey, HashSet<RawDep>> = {
         let nodes = engine.nodes.lock().unwrap();
-        nodes.iter().map(|(_, n)| (n.key.clone(), n.source_deps.clone())).collect()
+        nodes.iter().map(|(id, n)| (n.key.clone(), nodes.source_deps_clone(id))).collect()
     };
 
     let mut by_source: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
@@ -1127,8 +1134,9 @@ impl EngineInner {
 /// entirely outside it (see [`PendingRecord`]'s docs).
 pub(crate) fn enqueue_changed(engine: &EngineInner, nodes: &NodeTable, key: &CompKey) {
     let Some(handle) = engine.persist.lock().unwrap().clone() else { return };
-    let Some(node) = nodes.get(key) else { return };
-    let Some(record) = PendingRecord::snapshot(nodes, key, node) else { return };
+    let Some(id) = nodes.id_of(key) else { return };
+    let Some(node) = nodes.get_by_id(id) else { return };
+    let Some(record) = PendingRecord::snapshot(nodes, id, key, node) else { return };
     handle.enqueue_upsert(key.clone(), record);
 }
 

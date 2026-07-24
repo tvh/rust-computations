@@ -34,7 +34,7 @@ use futures::future::{BoxFuture, FutureExt, join_all, select_all};
 use tracing::Instrument;
 
 use crate::def::Comp;
-use crate::engine::{DirtyPriority, Engine, EngineInner, NodeId, NodeState, RerunFn};
+use crate::engine::{DirtyPriority, Engine, EngineInner, NodeId, NodeState};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
@@ -172,17 +172,21 @@ impl Engine {
     /// anything enqueued since the last flush needs to survive the close
     /// (every call site in this crate's own tests does exactly that).
     ///
-    /// This exists because an `Engine` is not, in general, ever fully
-    /// dropped merely by dropping every handle to it: any node that has
-    /// ever executed carries a `rerun` closure that captures its own
-    /// `Arc<EngineInner>` — a deliberate, permanent self-reference (so a
-    /// node can always be re-evaluated later), which in practice means
-    /// `EngineInner` lives for the process's whole lifetime. A real
-    /// process restart doesn't need this method at all (the whole process,
-    /// self-references included, goes away with it); it matters for a test
-    /// that simulates a restart against the same file within a single
-    /// process, where the previous engine's database must be closed before
-    /// a new one can open the same file (redb allows only one open
+    /// An earlier version of the engine needed this method for a second
+    /// reason beyond promptness: any node that had ever executed carried a
+    /// `rerun` closure with a permanent `Arc<EngineInner>` self-reference,
+    /// so an `Engine` was never, in general, fully dropped merely by
+    /// dropping every handle to it — `EngineInner` effectively lived for the
+    /// process's whole lifetime regardless. That reference cycle no longer
+    /// exists (see `crate::engine::EngineInner::rerun_node`: a rerun now
+    /// decodes `(def, param_bytes)` on demand instead of going through a
+    /// stored closure), so an `Engine` genuinely drops once every handle to
+    /// it — including its still-running `run` task — is gone. This method
+    /// still matters, though: it closes redb's exclusive file lock
+    /// *promptly*, without waiting on that drop to happen on its own, which
+    /// is what a test simulating a restart against the same file within a
+    /// single process needs (the previous engine's database must be closed
+    /// before a new one can open the same file — redb allows only one open
     /// `Database` per file at a time).
     pub fn persist_close(&self) {
         self.inner.persist.lock().unwrap().take();
@@ -272,8 +276,8 @@ impl EngineInner {
     fn live_outputs_by_sink(&self) -> HashMap<SinkId, HashSet<OutBytes>> {
         let nodes = self.nodes.lock().unwrap();
         let mut live: HashMap<SinkId, HashSet<OutBytes>> = HashMap::new();
-        for node in nodes.values() {
-            for out in &node.outputs {
+        for (id, _node) in nodes.iter() {
+            for out in nodes.outputs_iter(id) {
                 live.entry(out.sink.clone()).or_default().insert(out.out.clone());
             }
         }
@@ -316,7 +320,7 @@ impl EngineInner {
             };
             for &id in ids {
                 let Some(node) = nodes.get_by_id(id) else { continue };
-                if node.source_deps.contains(dep) {
+                if nodes.source_deps_contains(id, dep) {
                     continue;
                 }
                 affected.insert(node.key.clone());
@@ -342,11 +346,12 @@ impl EngineInner {
         let mut nodes = self.nodes.lock().unwrap();
         for key in keys {
             if let Some(node) = nodes.get_mut(key) {
-                node.dirty_priority = Some(match node.dirty_priority {
+                let merged = match node.dirty_priority() {
                     Some(existing) => existing.max(priority),
                     None => priority,
-                });
-                node.state = NodeState::Dirty;
+                };
+                node.set_dirty_priority(Some(merged));
+                node.set_state(NodeState::Dirty);
             }
         }
     }
@@ -429,7 +434,7 @@ impl EngineInner {
         let mut input = HashSet::new();
         let mut revalidate = HashSet::new();
         for key in keys {
-            match nodes.get(&key).and_then(|n| n.dirty_priority) {
+            match nodes.get(&key).and_then(|n| n.dirty_priority()) {
                 Some(DirtyPriority::Input) => {
                     input.insert(key);
                 }
@@ -466,7 +471,7 @@ impl EngineInner {
     /// skipped; the liveness GC pass that follows the round (after every
     /// tier has settled) cleans it up regardless, so this is a harmless
     /// wasted rerun rather than a correctness issue.
-    async fn propagate(&self, initial: HashSet<CompKey>) -> PropagateStats {
+    async fn propagate(self: &Arc<Self>, initial: HashSet<CompKey>) -> PropagateStats {
         let mut done: HashSet<CompKey> = HashSet::new();
         let mut waves = 0usize;
         let mut total_reran = 0usize;
@@ -508,7 +513,7 @@ impl EngineInner {
     /// empty), threading the round's `done` set and wave counter through.
     /// Returns the number of nodes that actually reran.
     async fn propagate_tier(
-        &self,
+        self: &Arc<Self>,
         tier: DirtyPriority,
         initial: HashSet<CompKey>,
         done: &mut HashSet<CompKey>,
@@ -536,7 +541,7 @@ impl EngineInner {
     /// priority of the node that changed). Returns the number of nodes that
     /// actually reran.
     async fn run_wave(
-        &self,
+        self: &Arc<Self>,
         tier: DirtyPriority,
         batch: Vec<CompKey>,
         done: &HashSet<CompKey>,
@@ -544,19 +549,19 @@ impl EngineInner {
     ) -> (usize, HashSet<CompKey>) {
         let dirty_count = batch.len();
 
-        let jobs: Vec<(CompKey, RerunFn)> = {
+        let jobs: Vec<(CompKey, Vec<u8>)> = {
             let mut nodes = self.nodes.lock().unwrap();
             batch
                 .iter()
                 .filter_map(|key| {
                     let node = nodes.get_mut(key)?;
-                    node.state = NodeState::Dirty;
-                    Some((key.clone(), node.rerun.clone()))
+                    node.set_state(NodeState::Dirty);
+                    Some((key.clone(), node.param_bytes.clone()))
                 })
                 .collect()
         };
 
-        let results = join_all(jobs.iter().map(|(_, rerun)| rerun())).await;
+        let results = join_all(jobs.iter().map(|(key, param_bytes)| self.rerun_node(key, param_bytes))).await;
 
         let mut next_frontier = HashSet::new();
         let mut reran = 0usize;
@@ -570,7 +575,7 @@ impl EngineInner {
                         let Some(node) = nodes.get(key) else {
                             continue;
                         };
-                        if node.last_changed {
+                        if node.last_changed() {
                             for &rdep_id in &node.rdeps {
                                 let Some(rdep_node) = nodes.get_by_id(rdep_id) else { continue };
                                 if !done.contains(&rdep_node.key) {
@@ -654,12 +659,17 @@ impl EngineInner {
             let mut outputs_by_sink: HashMap<SinkId, Vec<OutBytes>> = HashMap::new();
             let mut dead_source_deps: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
             for &id in &dead_ids {
+                // Captured before `remove_by_id`, which purges every
+                // side-table entry (`source_deps`/`outputs`/`inflight`) for
+                // `id` as part of collecting the node itself — see its docs.
+                let outputs = nodes.outputs_clone(id);
+                let source_deps = nodes.source_deps_clone(id);
                 if let Some(node) = nodes.remove_by_id(id) {
                     dead_keys.push(node.key);
-                    for RawOutput { sink, out } in node.outputs {
+                    for RawOutput { sink, out } in outputs {
                         outputs_by_sink.entry(sink).or_default().push(out);
                     }
-                    for dep in node.source_deps {
+                    for dep in source_deps {
                         dead_source_deps.entry(dep.source).or_default().insert(dep.key);
                     }
                 }
@@ -754,24 +764,24 @@ mod tests {
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
             Some(DirtyPriority::Revalidate)
         );
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().state,
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().state(),
             NodeState::Dirty
         );
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Input);
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
             Some(DirtyPriority::Input),
             "Input must win over a prior Revalidate mark"
         );
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority,
+            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
             Some(DirtyPriority::Input),
             "a later Revalidate mark must not downgrade an already-Input pending priority"
         );
@@ -796,7 +806,7 @@ mod tests {
         engine.inner.mark_all_dirty(DirtyPriority::Revalidate);
 
         let nodes = engine.inner.nodes.lock().unwrap();
-        assert_eq!(nodes.get(&key_a).unwrap().dirty_priority, Some(DirtyPriority::Revalidate));
-        assert_eq!(nodes.get(&key_b).unwrap().dirty_priority, Some(DirtyPriority::Revalidate));
+        assert_eq!(nodes.get(&key_a).unwrap().dirty_priority(), Some(DirtyPriority::Revalidate));
+        assert_eq!(nodes.get(&key_b).unwrap().dirty_priority(), Some(DirtyPriority::Revalidate));
     }
 }

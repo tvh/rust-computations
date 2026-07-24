@@ -22,7 +22,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::ctx::Ctx;
-use crate::engine::{EngineInner, RerunFn};
+use crate::engine::EngineInner;
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult, DefId};
 
@@ -37,9 +37,10 @@ pub struct CompDef<P, R> {
     pub(crate) body: BodyFn<P, R>,
 }
 
-/// Object-safe, byte-erased revival operations for a registered
+/// Object-safe, byte-erased revival/rerun operations for a registered
 /// [`CompDef`], used by `crate::persist` to restore a node from a persisted
-/// record without knowing its concrete `P`/`R` types.
+/// record, and by `crate::engine::EngineInner::rerun_node` to re-run a
+/// dirtied node — both without knowing its concrete `P`/`R` types.
 ///
 /// The def.rs analogue of [`crate::source::ErasedSource`] /
 /// [`crate::source::SourceAdapter`]: [`DefAdapter`] adapts a concrete
@@ -47,17 +48,17 @@ pub struct CompDef<P, R> {
 /// the boundary. Built once per definition, alongside `defs`, by
 /// `EngineBuilder::register`.
 pub(crate) trait ErasedDef: Send + Sync {
-    /// The "param reviver": decodes `param_bytes` as this definition's
-    /// param type and, on success, returns the `CompKey` it identifies
-    /// (recomputed by hashing the decoded param, exactly as a live
-    /// [`CompKey::new`] would) and a `rerun` closure for it (byte-for-byte
-    /// the same closure shape [`EngineInner::make_rerun`] builds for a live
-    /// node).
+    /// Decodes `param_bytes` as this definition's param type and, on
+    /// success, returns the `CompKey` it identifies (recomputed by hashing
+    /// the decoded param, exactly as a live [`CompKey::new`] would). Used
+    /// only at persisted-load time (see `crate::persist::restore_nodes`) to
+    /// recover a restored record's primary key, which the on-disk record
+    /// itself never stores directly.
     ///
     /// Returns `None` if `param_bytes` fails to decode as this definition's
     /// param type — a corrupt or stale record, dropped by the caller rather
     /// than treated as fatal.
-    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn)>;
+    fn revive_key(&self, param_bytes: &[u8]) -> Option<CompKey>;
 
     /// The "value reviver": decodes `value_bytes` as this definition's
     /// result type, erased. Returns `None` if the bytes fail to decode (a
@@ -77,6 +78,20 @@ pub(crate) trait ErasedDef: Send + Sync {
     /// definition's body (see `crate::engine::EngineInner::run`), so the
     /// downcast can only fail from an engine bug, not from untrusted input.
     fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Vec<u8>;
+
+    /// Decodes `param_bytes` as this definition's param type and, on
+    /// success, returns a future that re-runs this definition applied to
+    /// that param via `engine`'s normal `eval` path — the driver's whole
+    /// mechanism for re-executing a dirtied node (see
+    /// [`crate::engine::EngineInner::rerun_node`]), decoding the param
+    /// fresh on every call rather than through any closure a node keeps
+    /// around.
+    ///
+    /// Returns `None` if `param_bytes` fails to decode — a corrupt node
+    /// (should not happen for a live node's own `param_bytes`, which this
+    /// engine itself serialized when the node was created, but handled the
+    /// same defensive way as every other decode failure in this trait).
+    fn rerun(&self, engine: Arc<EngineInner>, param_bytes: &[u8]) -> Option<BoxFuture<'static, Result<(), CompError>>>;
 }
 
 /// Adapts a concrete `CompDef<P, R>` to the erased [`ErasedDef`] interface.
@@ -85,11 +100,9 @@ pub(crate) trait ErasedDef: Send + Sync {
 pub(crate) struct DefAdapter<P, R>(pub Arc<CompDef<P, R>>);
 
 impl<P: CompParam, R: CompResult> ErasedDef for DefAdapter<P, R> {
-    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn)> {
+    fn revive_key(&self, param_bytes: &[u8]) -> Option<CompKey> {
         let param: P = postcard::from_bytes(param_bytes).ok()?;
-        let key = CompKey::new(self.0.id, &param);
-        let rerun = engine.make_rerun::<P, R>(self.0.id, param);
-        Some((key, rerun))
+        Some(CompKey::new(self.0.id, &param))
     }
 
     fn revive_value(&self, value_bytes: &[u8]) -> Option<Arc<dyn Any + Send + Sync>> {
@@ -102,6 +115,12 @@ impl<P: CompParam, R: CompResult> ErasedDef for DefAdapter<P, R> {
             .downcast_ref::<R>()
             .expect("serialize_value: value's concrete type must match this definition's result type");
         postcard::to_stdvec(typed).expect("postcard serialization of a well-formed value should not fail")
+    }
+
+    fn rerun(&self, engine: Arc<EngineInner>, param_bytes: &[u8]) -> Option<BoxFuture<'static, Result<(), CompError>>> {
+        let param: P = postcard::from_bytes(param_bytes).ok()?;
+        let def_id = self.0.id;
+        Some(Box::pin(async move { engine.eval::<P, R>(def_id, param, Arc::new(Vec::new())).await.map(|_| ()) }))
     }
 }
 

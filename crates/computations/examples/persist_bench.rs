@@ -45,18 +45,22 @@
 //!
 //! ## Process-per-phase architecture
 //!
-//! Every node ever created by this crate's engine holds a permanent, by-
-//! design self-reference back to its own `EngineInner` (its `rerun`
-//! closure captures an `Arc<EngineInner>` — see `crate::engine::Node` and
-//! `crate::driver::Engine::persist_close`'s doc comment): an `Engine` is,
-//! in practice, never fully freed once any of its nodes has run, for the
-//! rest of the process's life. That is a correct and intentional property
-//! of the real system (which only ever runs *one* long-lived engine per
-//! process), but this benchmark builds *ten* separate ~1,000,000-node
-//! graphs in sequence to exercise every phase — if that all happened in a
-//! single process, as it did at the original ~96,000-instance scale, the
-//! leaked graphs would accumulate without bound and could plausibly exceed
-//! available memory well before the run finished.
+//! An earlier version of the engine gave every node a permanent, by-design
+//! self-reference back to its own `EngineInner` (a `rerun` closure
+//! capturing `Arc<EngineInner>` — see `crate::engine::Node`'s old `rerun`
+//! field and `crate::driver::Engine::persist_close`'s doc comment): an
+//! `Engine` was, in practice, never fully freed once any of its nodes had
+//! run, for the rest of the process's life. The Tier-1 memory redesign
+//! (see `crate::engine::EngineInner::rerun_node`) removed that cycle — an
+//! `Engine` now genuinely drops once every handle to it is gone (see
+//! `crate::engine::tests::engine_is_droppable_after_a_rerun`) — but this
+//! benchmark still runs each phase in its own child process rather than
+//! restructuring around that: it builds *ten* separate ~1,000,000-node
+//! graphs in sequence, and process-per-phase keeps each phase's reported
+//! peak RSS a meaningful "how much does *one* phase cost" figure,
+//! comparable across every stage of this benchmark's history, rather than
+//! an artifact of how many earlier phases happened to run first in the
+//! same process.
 //!
 //! So each timed phase (or, for phase 3/4/5's paired trials, each trial)
 //! runs in its own child process: [`main`] with no `PERSIST_BENCH_PHASE`

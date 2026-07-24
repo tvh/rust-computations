@@ -735,13 +735,15 @@ async fn successive_live_changes_to_the_same_key_each_trigger_a_rerun() {
 }
 
 /// A node with its own *direct* source dependency (so a source change
-/// dirties it directly, and it is re-run via its own `rerun` closure rather
-/// than only ever being reached through a parent's `ctx.eval`) must still
-/// be collected by liveness GC once it becomes unreachable.
+/// dirties it directly, and it is re-run via the driver's own rerun path —
+/// `EngineInner::rerun_node` — rather than only ever being reached through a
+/// parent's `ctx.eval`) must still be collected by liveness GC once it
+/// becomes unreachable.
 ///
-/// Regression test: `EngineInner::make_rerun`'s closure used to re-evaluate
-/// a dirtied node via `Engine::eval_root`, whose outer `Ctx { caller: None
-/// }` unconditionally marks its argument a GC root as a side effect. Since
+/// Regression test: the driver's rerun path used to re-evaluate a dirtied
+/// node via `Engine::eval_root` (nowadays it calls `EngineInner::eval`
+/// directly, through `ErasedDef::rerun`), whose outer `Ctx { caller: None }`
+/// unconditionally marks its argument a GC root as a side effect. Since
 /// `roots` only ever grows, the first time change propagation ever
 /// re-ran *any* node directly (which is the ordinary case for a node that
 /// reads a source itself, not only via a parent), that node became a

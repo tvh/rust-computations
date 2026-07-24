@@ -17,7 +17,10 @@
 //!
 //! Change propagation itself (deciding *which* dirty nodes to re-run, and
 //! in what order) lives in [`crate::driver`]; this module only provides the
-//! primitive it drives: re-evaluating one node.
+//! primitive it drives: re-evaluating one node — see
+//! [`EngineInner::rerun_node`], which decodes `(def, param_bytes)` and
+//! re-runs the computation on demand rather than through any closure a node
+//! keeps around (see [`Node`]'s docs for why there is no such closure).
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -52,11 +55,6 @@ use crate::source::{KeyBytes, RawDep, SourceBase, SourceId};
 type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Hash128, Duration), CompError>;
 /// The shared, joinable handle to an in-flight execution.
 type SharedExec = Shared<BoxFuture<'static, ExecResult>>;
-/// A closure that re-executes a node's computation via the normal eval path.
-///
-/// Captures the node's typed `Comp<P, R>` handle, its param, and the engine.
-/// Called by the driver's change propagation on dirtied nodes.
-pub(crate) type RerunFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), CompError>> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeState {
@@ -101,32 +99,146 @@ pub enum DirtyPriority {
 /// across restarts, and is only valid until the node it names is collected
 /// by [`crate::driver`]'s liveness GC — at which point its slot may be
 /// reused for a completely unrelated node. Every long-lived reference to a
-/// computation (a [`RerunFn`] closure, a persisted record, `roots`) is keyed
-/// by `CompKey` instead, precisely so it can never be invalidated by GC
-/// reusing a `NodeId`; `NodeId` is used purely as an edge (`comp_deps`,
-/// `rdeps`, `source_index`) representation inside a single process's live
-/// node table, translated back to a `CompKey` (via [`Node::key`]) whenever
-/// an edge needs to leave that table (persistence, driver-level dirty
-/// bookkeeping).
+/// computation (a persisted record, `roots`) is keyed by `CompKey` instead,
+/// precisely so it can never be invalidated by GC reusing a `NodeId`;
+/// `NodeId` is used purely as an edge (`comp_deps`, `rdeps`, `source_index`)
+/// representation, and as the key of the node table's sparse side tables
+/// (`source_deps`/`outputs`/`inflight` — see [`NodeTable`]), inside a single
+/// process's live node table, translated back to a `CompKey` (via
+/// [`Node::key`]) whenever an edge needs to leave that table (persistence,
+/// driver-level dirty bookkeeping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NodeId(u32);
 
+/// A compact index into the engine's def table (see [`NodeTable`]),
+/// assigned in registration order by [`EngineBuilder::build`].
+///
+/// This exists purely to shrink [`NodeTable`]'s `CompKey`-keyed index: a
+/// `(DefIndex, Hash128)` pair is 18 bytes versus a full [`CompKey`]'s 32
+/// (a `DefId` is a 16-byte fat pointer; a `DefIndex` is 2). It never
+/// replaces `CompKey`/`DefId` anywhere in the public API, on disk, or on
+/// [`Node`] itself (which still keeps its own full `CompKey` — see
+/// [`Node::key`] — so comp names stay trivially loggable everywhere without
+/// needing to thread a def-table lookup through call sites that only ever
+/// had a `Node` in hand); it is strictly an internal detail of how
+/// [`NodeTable`] indexes its slab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DefIndex(u16);
+
+/// The small set of mutually-exclusive/boolean bits that used to be three
+/// separate [`Node`] fields (`state`, `dirty_priority`, `last_changed`),
+/// packed into one byte.
+///
+/// `state` takes 2 bits (3 values), `dirty_priority` takes 2 bits (`None`
+/// plus 2 values), `last_changed` takes 1 bit — 5 bits total, comfortably
+/// inside a `u8`. Accessed only through [`Node`]'s own `state`/`set_state`/
+/// `dirty_priority`/`set_dirty_priority`/`last_changed`/`set_last_changed`
+/// methods, which read exactly like the plain fields they replaced at every
+/// call site.
+#[derive(Debug, Clone, Copy, Default)]
+struct NodeFlags(u8);
+
+const STATE_MASK: u8 = 0b0000_0011;
+const STATE_CLEAN: u8 = 0;
+const STATE_DIRTY: u8 = 1;
+const STATE_RUNNING: u8 = 2;
+
+const PRIORITY_MASK: u8 = 0b0000_1100;
+const PRIORITY_SHIFT: u8 = 2;
+const PRIORITY_NONE: u8 = 0;
+const PRIORITY_REVALIDATE: u8 = 1;
+const PRIORITY_INPUT: u8 = 2;
+
+const LAST_CHANGED_BIT: u8 = 0b0001_0000;
+
+impl NodeFlags {
+    fn new(state: NodeState) -> Self {
+        let mut flags = NodeFlags::default();
+        flags.set_state(state);
+        flags
+    }
+
+    fn state(self) -> NodeState {
+        match self.0 & STATE_MASK {
+            STATE_CLEAN => NodeState::Clean,
+            STATE_DIRTY => NodeState::Dirty,
+            STATE_RUNNING => NodeState::Running,
+            other => unreachable!("NodeFlags: invalid packed state bits {other}"),
+        }
+    }
+
+    fn set_state(&mut self, state: NodeState) {
+        let bits = match state {
+            NodeState::Clean => STATE_CLEAN,
+            NodeState::Dirty => STATE_DIRTY,
+            NodeState::Running => STATE_RUNNING,
+        };
+        self.0 = (self.0 & !STATE_MASK) | bits;
+    }
+
+    fn dirty_priority(self) -> Option<DirtyPriority> {
+        match (self.0 & PRIORITY_MASK) >> PRIORITY_SHIFT {
+            PRIORITY_NONE => None,
+            PRIORITY_REVALIDATE => Some(DirtyPriority::Revalidate),
+            PRIORITY_INPUT => Some(DirtyPriority::Input),
+            other => unreachable!("NodeFlags: invalid packed dirty_priority bits {other}"),
+        }
+    }
+
+    fn set_dirty_priority(&mut self, priority: Option<DirtyPriority>) {
+        let bits = match priority {
+            None => PRIORITY_NONE,
+            Some(DirtyPriority::Revalidate) => PRIORITY_REVALIDATE,
+            Some(DirtyPriority::Input) => PRIORITY_INPUT,
+        };
+        self.0 = (self.0 & !PRIORITY_MASK) | (bits << PRIORITY_SHIFT);
+    }
+
+    fn last_changed(self) -> bool {
+        self.0 & LAST_CHANGED_BIT != 0
+    }
+
+    fn set_last_changed(&mut self, changed: bool) {
+        if changed {
+            self.0 |= LAST_CHANGED_BIT;
+        } else {
+            self.0 &= !LAST_CHANGED_BIT;
+        }
+    }
+}
+
 /// One computation application's memoized state.
+///
+/// Deliberately holds no closure of any kind (see [`EngineInner::rerun_node`]
+/// for how the driver re-runs a dirtied node instead): an earlier design
+/// gave every node a boxed `rerun: RerunFn` closure capturing a permanent
+/// `Arc<EngineInner>` plus its typed, owned parameter, which meant an
+/// `Engine` was never actually freed even once every external handle to it
+/// was dropped (any node that had ever executed kept the whole engine alive
+/// via that closure's self-reference). Re-deriving the execution future on
+/// demand from `(def, param_bytes)` — the same mechanism persistence's
+/// revival path already used — removes that cycle entirely, at the cost of
+/// one postcard param decode per rerun (see `EngineInner::rerun_node`),
+/// negligible next to a node's actual body cost.
+///
+/// Two other collections that used to live directly on every `Node` —
+/// `source_deps`/`outputs` (a `HashSet` each, reserved even for the many
+/// nodes that have none) and `inflight` (relevant only to a node currently
+/// running) — now live in sparse side tables on [`NodeTable`], keyed by
+/// [`NodeId`], present only for nodes that actually have an entry.
 pub(crate) struct Node {
-    pub(crate) state: NodeState,
-    /// The priority of this node's pending dirty work; `None` exactly when
-    /// `state == Clean` (cleared on every successful run, left untouched on
-    /// a failed one so the node stays dirty at the priority it was being
-    /// processed at). Set — and merged via max, "max priority wins" — by
-    /// [`crate::driver`]'s dirtying paths; see [`DirtyPriority`].
-    pub(crate) dirty_priority: Option<DirtyPriority>,
-    /// This node's own stable identity — the `NodeTable`'s `CompKey` index
-    /// entry, duplicated here so a `NodeId` can be translated back to its
+    flags: NodeFlags,
+    /// This node's own stable identity — the `NodeTable`'s index entry,
+    /// duplicated here so a `NodeId` can be translated back to its
     /// `CompKey` in O(1) (needed by GC, persistence snapshotting, and the
     /// driver's rdeps-to-dirty-keys translation) without a second, reverse
-    /// index.
+    /// index. Deliberately kept as a full `CompKey` (not the compact
+    /// `(DefIndex, Hash128)` pair `NodeTable`'s own index uses internally —
+    /// see [`DefIndex`]'s docs) so every one of those call sites keeps
+    /// working, and comp names stay trivially loggable, with no def-table
+    /// lookup required.
     pub(crate) key: CompKey,
-    /// The cached result, erased. `Some` even when `state == Dirty` (a
+    /// The cached result, erased. `Some` even when `state() == Dirty` (a
     /// stale-but-not-yet-superseded value), `None` only before the first
     /// successful execution.
     ///
@@ -141,7 +253,9 @@ pub(crate) struct Node {
     /// Postcard-encoded bytes of this node's parameter, computed once when
     /// the node is first created (a `CompKey`'s param never changes across
     /// reruns of that same key). Read by `crate::persist` to save a node
-    /// without needing to know its concrete parameter type.
+    /// without needing to know its concrete parameter type, and by
+    /// `EngineInner::rerun_node` to decode the typed param again on every
+    /// rerun (see [`Node`]'s docs on why there is no cached rerun closure).
     ///
     /// Kept eagerly serialized (unlike `value`) rather than lazily derived
     /// from a stored erased param: a param is written exactly once per node
@@ -162,47 +276,36 @@ pub(crate) struct Node {
     /// overhead at this size — a deliberate small-set tradeoff, not an
     /// oversight.
     pub(crate) comp_deps: SmallVec<[NodeId; 4]>,
-    /// Source reads this node made during its last execution.
-    ///
-    /// Deliberately still a `HashSet`, unlike `comp_deps`/`rdeps`: measured
-    /// on the 1M-node persistence benchmark, switching this to a small
-    /// inline `SmallVec` was a net *loss*, not a win — most nodes in that
-    /// benchmark (and, more importantly, in general: any node that doesn't
-    /// read a source at all, e.g. one whose only job is combining other
-    /// computations) have *zero* source deps, and a `SmallVec`'s inline
-    /// capacity is reserved unconditionally even when empty. With
-    /// `RawDep`'s size (source id + two byte buffers), reserving even a
-    /// 1-2 element inline array on every node costs more than a never-
-    /// touched `HashSet` (no allocation at all until the first insert) —
-    /// the opposite of `comp_deps`/`rdeps`, whose `NodeId` elements are
-    /// small enough, and whose typical count is non-zero often enough, for
-    /// the inline reservation to pay for itself.
-    pub(crate) source_deps: HashSet<RawDep>,
     /// Computations that called this node during their last execution, by
     /// [`NodeId`] (see `comp_deps`'s docs for why `SmallVec` and why by id).
     pub(crate) rdeps: SmallVec<[NodeId; 4]>,
-    /// Sink outputs this node produced during its last execution. Still a
-    /// `HashSet`, for the same reason as `source_deps`.
-    pub(crate) outputs: HashSet<RawOutput>,
-    /// Whether the last successful execution's result hash differed from
-    /// the one before it (early cutoff signal).
-    ///
-    /// Read by the driver to decide whether a clean recomputation should
-    /// propagate further to this node's rdeps, or stop here (early cutoff).
-    pub(crate) last_changed: bool,
-    inflight: Option<SharedExec>,
-    /// Called by the driver during change propagation to re-execute a
-    /// dirtied node through the normal eval path. Captures only `DefId`
-    /// (`Copy`) and the typed, owned parameter — never a `CompKey` or
-    /// `NodeId` — recomputing the current `CompKey` itself on every call
-    /// (see `EngineInner::make_rerun`); this is what makes it safe for a
-    /// `rerun` closure to long-outlive the `NodeId` (never `Copy`-captured
-    /// here in the first place) of whatever node currently holds it, across
-    /// any number of GC slot-reuse cycles.
-    pub(crate) rerun: RerunFn,
 }
 
 impl Node {
+    pub(crate) fn state(&self) -> NodeState {
+        self.flags.state()
+    }
+
+    pub(crate) fn set_state(&mut self, state: NodeState) {
+        self.flags.set_state(state);
+    }
+
+    pub(crate) fn dirty_priority(&self) -> Option<DirtyPriority> {
+        self.flags.dirty_priority()
+    }
+
+    pub(crate) fn set_dirty_priority(&mut self, priority: Option<DirtyPriority>) {
+        self.flags.set_dirty_priority(priority);
+    }
+
+    pub(crate) fn last_changed(&self) -> bool {
+        self.flags.last_changed()
+    }
+
+    pub(crate) fn set_last_changed(&mut self, changed: bool) {
+        self.flags.set_last_changed(changed);
+    }
+
     /// Constructs a `Node` directly in the `Clean` state from a persisted
     /// record's revived pieces (see `crate::persist`), without ever having
     /// executed the computation in this process.
@@ -212,22 +315,18 @@ impl Node {
     /// [`NodeId`] (a dependency edge can only be expressed once both of its
     /// endpoints are already in the table), mirroring how a live node's
     /// edges are built incrementally by `EngineInner::record_call_dep` as it
-    /// actually runs.
+    /// actually runs. Likewise, this node's `source_deps`/`outputs` are not
+    /// set here: `crate::persist::restore_nodes` populates `NodeTable`'s
+    /// side tables for them directly, once this node has a [`NodeId`].
     pub(crate) fn from_persisted(key: CompKey, revived: RevivedNode) -> Node {
         Node {
-            state: NodeState::Clean,
-            dirty_priority: None,
+            flags: NodeFlags::new(NodeState::Clean),
             key,
             value: Some(revived.value),
             result_hash: Some(revived.result_hash),
             param_bytes: revived.param_bytes,
             comp_deps: SmallVec::new(),
-            source_deps: revived.source_deps,
             rdeps: SmallVec::new(),
-            outputs: revived.outputs,
-            last_changed: false,
-            inflight: None,
-            rerun: revived.rerun,
         }
     }
 }
@@ -237,16 +336,17 @@ impl Node {
 /// constructor's argument list manageable (see `crate::persist`, which
 /// builds one of these per decodable, still-registered record). Excludes
 /// `comp_deps` (and the node's own `CompKey`, passed to `from_persisted`
-/// separately): both need every record in the batch to already have a
-/// [`NodeId`] before they can be resolved, which `crate::persist::restore_nodes`
-/// therefore does itself, after every record has been turned into a `Node`.
+/// separately) for the same reason `crate::persist::restore_nodes` also
+/// keeps `source_deps`/`outputs` out of this struct: all three need either
+/// every record in the batch to already have a [`NodeId`] (`comp_deps`) or
+/// this node's own not-yet-assigned [`NodeId`] (`source_deps`/`outputs`,
+/// which land in `NodeTable`'s side tables, not on `Node` itself) before
+/// they can be resolved — `restore_nodes` handles all of that itself, after
+/// every record has been turned into a `Node`.
 pub(crate) struct RevivedNode {
     pub(crate) param_bytes: Vec<u8>,
     pub(crate) value: Arc<dyn Any + Send + Sync>,
     pub(crate) result_hash: Hash128,
-    pub(crate) source_deps: HashSet<RawDep>,
-    pub(crate) outputs: HashSet<RawOutput>,
-    pub(crate) rerun: RerunFn,
 }
 
 /// The engine's node table: a slab (`Vec<Option<Node>>` plus a free list) of
@@ -254,36 +354,73 @@ pub(crate) struct RevivedNode {
 /// index) or by its process-local [`NodeId`] (a direct slab slot).
 ///
 /// This is the in-memory analogue of what used to be a plain
-/// `HashMap<CompKey, Node>`: every method that existed on that map
-/// (`get`/`get_mut`/`keys`/`values`/`values_mut`) is preserved here with the
-/// same `CompKey`-keyed signature, so most call sites needed no changes at
-/// all when this replaced it — only code that stores or walks *edges*
+/// `HashMap<CompKey, Node>`: most of the methods that existed on that map
+/// (`get`/`get_mut`/`keys`/`values_mut`) are preserved here with the same
+/// `CompKey`-keyed signature, so most call sites needed no changes at all
+/// when this replaced it — only code that stores or walks *edges*
 /// (`comp_deps`/`rdeps`/`source_index`) needed to switch to the `NodeId`-based
 /// methods (`get_by_id`/`get_mut_by_id`/`id_of`) to get the point of this
 /// type: an edge only needs 4 bytes (`NodeId`), not 32 (`CompKey`).
-#[derive(Default)]
+///
+/// Two independent memory-diet moves live here rather than on `Node` itself:
+///
+/// - The `CompKey`-keyed lookup index is keyed on `(DefIndex, Hash128)`
+///   internally (18 bytes) rather than the full `CompKey` (32 bytes) — see
+///   [`DefIndex`]'s docs. `def_index` is this table's own private copy of
+///   "`DefId` -> `DefIndex`", built once (from registration order) by
+///   [`EngineBuilder::build`] and never mutated afterward.
+/// - `source_deps`/`outputs`/`inflight` — fields that used to live directly
+///   on every `Node` even though most nodes have zero source deps/outputs
+///   and are essentially never `inflight` at rest — are sparse side maps
+///   here instead, keyed by [`NodeId`], with an entry only for a node that
+///   actually has one. [`Self::remove_by_id`] purges all three whenever a
+///   node is collected, so a GC'd node never leaves an orphaned side-table
+///   entry behind.
 pub(crate) struct NodeTable {
     slots: Vec<Option<Node>>,
     free: Vec<u32>,
-    index: HashMap<CompKey, NodeId>,
+    index: HashMap<(DefIndex, Hash128), NodeId>,
+    def_index: HashMap<DefId, DefIndex>,
+    source_deps: HashMap<NodeId, HashSet<RawDep>>,
+    outputs: HashMap<NodeId, HashSet<RawOutput>>,
+    inflight: HashMap<NodeId, SharedExec>,
 }
 
 impl NodeTable {
-    fn new() -> Self {
-        NodeTable::default()
+    fn new(def_index: HashMap<DefId, DefIndex>) -> Self {
+        NodeTable {
+            slots: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+            def_index,
+            source_deps: HashMap::new(),
+            outputs: HashMap::new(),
+            inflight: HashMap::new(),
+        }
+    }
+
+    /// Translates a `CompKey` into this table's compact internal index key,
+    /// `None` if `key`'s definition isn't registered on this engine (can't
+    /// happen for any `CompKey` that legitimately reached this table, since
+    /// every one is built from a registered `DefId` — see [`DefIndex`]'s
+    /// docs — but returning `Option` here rather than panicking keeps every
+    /// caller's existing "no node for this key" handling exactly as it was).
+    fn index_key(&self, key: &CompKey) -> Option<(DefIndex, Hash128)> {
+        Some((*self.def_index.get(key.def())?, key.param_hash()))
     }
 
     pub(crate) fn id_of(&self, key: &CompKey) -> Option<NodeId> {
-        self.index.get(key).copied()
+        let ik = self.index_key(key)?;
+        self.index.get(&ik).copied()
     }
 
     pub(crate) fn get(&self, key: &CompKey) -> Option<&Node> {
-        let id = *self.index.get(key)?;
+        let id = self.id_of(key)?;
         self.slots[id.0 as usize].as_ref()
     }
 
     pub(crate) fn get_mut(&mut self, key: &CompKey) -> Option<&mut Node> {
-        let id = *self.index.get(key)?;
+        let id = self.id_of(key)?;
         self.slots[id.0 as usize].as_mut()
     }
 
@@ -318,7 +455,10 @@ impl NodeTable {
                 NodeId(idx)
             }
         };
-        self.index.insert(key, id);
+        let ik = self
+            .index_key(&key)
+            .expect("insert_new: key's definition must be registered in this engine's def table");
+        self.index.insert(ik, id);
         id
     }
 
@@ -327,7 +467,7 @@ impl NodeTable {
     /// result's `key` field is overwritten with `key` regardless of what it
     /// sets, so callers may leave it at any placeholder value.
     pub(crate) fn get_or_insert_with(&mut self, key: &CompKey, make: impl FnOnce() -> Node) -> (NodeId, &mut Node) {
-        if let Some(&id) = self.index.get(key) {
+        if let Some(id) = self.id_of(key) {
             (id, self.slots[id.0 as usize].as_mut().expect("slab slot present for an indexed key"))
         } else {
             let id = self.insert_new(key.clone(), make());
@@ -341,19 +481,25 @@ impl NodeTable {
     /// stable across a GC pass (see [`NodeId`]'s docs): the slot this
     /// returns can be handed out again, for an entirely unrelated `CompKey`,
     /// the very next time a node is created.
+    ///
+    /// Also purges every sparse side-table entry (`source_deps`/`outputs`/
+    /// `inflight`) for `id`, if any, so a collected node never leaves one
+    /// behind — the single place that guarantees this regardless of which
+    /// caller triggered the removal.
     pub(crate) fn remove_by_id(&mut self, id: NodeId) -> Option<Node> {
         let node = self.slots.get_mut(id.0 as usize)?.take()?;
-        self.index.remove(&node.key);
+        if let Some(ik) = self.index_key(&node.key) {
+            self.index.remove(&ik);
+        }
+        self.source_deps.remove(&id);
+        self.outputs.remove(&id);
+        self.inflight.remove(&id);
         self.free.push(id.0);
         Some(node)
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &CompKey> {
-        self.index.keys()
-    }
-
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Node> {
-        self.slots.iter().filter_map(|s| s.as_ref())
+        self.slots.iter().filter_map(|s| s.as_ref().map(|n| &n.key))
     }
 
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Node> {
@@ -362,6 +508,71 @@ impl NodeTable {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
         self.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|n| (NodeId(i as u32), n)))
+    }
+
+    // -- sparse side tables (`source_deps`/`outputs`/`inflight`) --
+
+    pub(crate) fn source_deps_iter(&self, id: NodeId) -> impl Iterator<Item = &RawDep> {
+        self.source_deps.get(&id).into_iter().flatten()
+    }
+
+    pub(crate) fn source_deps_contains(&self, id: NodeId, dep: &RawDep) -> bool {
+        self.source_deps.get(&id).is_some_and(|deps| deps.contains(dep))
+    }
+
+    pub(crate) fn source_deps_clone(&self, id: NodeId) -> HashSet<RawDep> {
+        self.source_deps.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Removes and returns `id`'s source deps (empty if it had none),
+    /// leaving no entry behind — the side-table equivalent of clearing a
+    /// plain field.
+    pub(crate) fn take_source_deps(&mut self, id: NodeId) -> HashSet<RawDep> {
+        self.source_deps.remove(&id).unwrap_or_default()
+    }
+
+    /// Merges `raw` into `id`'s source-dep set, creating the entry if this
+    /// is its first one. A no-op for an empty `raw`, so a node that never
+    /// reads any source never gets an entry at all.
+    pub(crate) fn extend_source_deps(&mut self, id: NodeId, raw: &HashSet<RawDep>) {
+        if raw.is_empty() {
+            return;
+        }
+        self.source_deps.entry(id).or_default().extend(raw.iter().cloned());
+    }
+
+    pub(crate) fn outputs_iter(&self, id: NodeId) -> impl Iterator<Item = &RawOutput> {
+        self.outputs.get(&id).into_iter().flatten()
+    }
+
+    pub(crate) fn outputs_clone(&self, id: NodeId) -> HashSet<RawOutput> {
+        self.outputs.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Removes and returns `id`'s outputs (empty if it had none) — see
+    /// [`Self::take_source_deps`].
+    pub(crate) fn take_outputs(&mut self, id: NodeId) -> HashSet<RawOutput> {
+        self.outputs.remove(&id).unwrap_or_default()
+    }
+
+    /// Merges `raw` into `id`'s output set — see [`Self::extend_source_deps`].
+    pub(crate) fn extend_outputs(&mut self, id: NodeId, raw: &HashSet<RawOutput>) {
+        if raw.is_empty() {
+            return;
+        }
+        self.outputs.entry(id).or_default().extend(raw.iter().cloned());
+    }
+
+    pub(crate) fn inflight_get(&self, id: NodeId) -> Option<SharedExec> {
+        self.inflight.get(&id).cloned()
+    }
+
+    pub(crate) fn inflight_set(&mut self, id: NodeId, shared: SharedExec) {
+        self.inflight.insert(id, shared);
+    }
+
+    pub(crate) fn inflight_clear(&mut self, id: NodeId) {
+        self.inflight.remove(&id);
     }
 }
 
@@ -407,9 +618,10 @@ pub(crate) struct EngineInner {
     /// `crate::persist`), so it never needs this channel.
     pub(crate) dirty_tx: mpsc::UnboundedSender<CompKey>,
     pub(crate) dirty_rx: AsyncMutex<mpsc::UnboundedReceiver<CompKey>>,
-    /// Type-erased revival operations (see `crate::persist`) for every
-    /// registered definition, keyed by `DefId`. Built once, alongside
-    /// `defs`, at registration time; never mutated afterward.
+    /// Type-erased revival/rerun operations (see `crate::persist` and
+    /// [`EngineInner::rerun_node`]) for every registered definition, keyed
+    /// by `DefId`. Built once, alongside `defs`, at registration time; never
+    /// mutated afterward.
     pub(crate) erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
     /// Maps a definition's name back to its (real, `'static`) `DefId`, so
     /// `crate::persist` can turn a persisted record's owned `String` name
@@ -445,89 +657,79 @@ impl EngineInner {
         })
     }
 
-    /// Builds the `rerun` closure for `def_id` applied to `param`:
-    /// re-evaluates it via the normal `eval_root` path when called.
+    /// Re-runs `key`'s computation via the normal `eval` path, decoding its
+    /// typed parameter from `param_bytes` fresh on every call rather than
+    /// through any closure a node keeps around — see [`Node`]'s docs for why
+    /// there is no such closure anymore, and [`crate::def::ErasedDef::rerun`]
+    /// for the object-safe dispatch this needs (the driver, working only
+    /// from a `Node`'s `CompKey`/`param_bytes`, has no static `P`/`R` to
+    /// call `eval::<P, R>` with directly). This is exactly what persisted
+    /// revival's `ErasedDef::revive_key` decodes at load time, applied on
+    /// demand instead of once into a permanent closure — the two paths
+    /// collapse into this one function precisely because neither needs a
+    /// stored closure anymore.
     ///
-    /// Shared by [`Self::prepare`] (building a brand-new live node) and
-    /// [`crate::def::DefAdapter::revive_param`] (reviving a node restored
-    /// from a persisted record — see `crate::persist`), so a restored
-    /// node's `rerun` is exactly the same closure shape a live one gets,
-    /// with no separate revival-only code path to drift out of sync.
-    pub(crate) fn make_rerun<P: CompParam, R: CompResult>(self: &Arc<Self>, def_id: DefId, param: P) -> RerunFn {
-        let engine_for_rerun = self.clone();
-        Arc::new(move || {
-            let engine = engine_for_rerun.clone();
-            let param = param.clone();
-            // Deliberately calls `Self::eval` directly rather than going
-            // through `Engine::eval_root` (which this used to do): the
-            // computation body itself gets exactly the same `Ctx` either
-            // way (`Self::run` always builds it fresh with
-            // `caller: Some(key)`, regardless of how the evaluation was
-            // reached), but `eval_root` additionally marks its argument a
-            // GC root as a side effect of its own outer, `caller: None`
-            // `Ctx::eval` call — appropriate for a *genuine* root
-            // evaluation (the one `crate::driver::Engine::run` performs
-            // once, up front), but wrong here: this closure re-evaluates
-            // an *existing* node, dirtied for any reason (its own source
-            // input changed, a revalidation sweep, ...), not a fresh root.
-            // Routing it through `eval_root` would permanently mark every
-            // node that ever directly serves a propagation wave as a root
-            // — since `roots` only ever grows — which would make liveness
-            // GC never collect it again even after every real caller stops
-            // referencing it.
-            Box::pin(async move { engine.eval::<P, R>(def_id, param, Arc::new(Vec::new())).await.map(|_| ()) })
-        })
+    /// Always returns a future (never `None`/panics): a lookup or decode
+    /// failure resolves to `Err(CompError::Failed(..))` inside the returned
+    /// future rather than being reported synchronously, so every caller
+    /// (in practice, only [`crate::driver`]'s wave propagation, joining many
+    /// of these concurrently via `join_all`) can treat every job uniformly.
+    pub(crate) fn rerun_node(self: &Arc<Self>, key: &CompKey, param_bytes: &[u8]) -> BoxFuture<'static, Result<(), CompError>> {
+        let Some(erased_def) = self.erased_defs.get(key.def()) else {
+            let key = key.clone();
+            return Box::pin(async move { Err(CompError::Failed(format!("no computation registered named `{}`", key.def()))) });
+        };
+        match erased_def.rerun(self.clone(), param_bytes) {
+            Some(fut) => fut,
+            None => {
+                let key = key.clone();
+                Box::pin(async move {
+                    Err(CompError::Failed(format!(
+                        "computation `{}`: param bytes failed to decode during rerun",
+                        key.def()
+                    )))
+                })
+            }
+        }
     }
 
     /// Decides whether `key` is a cache hit, an in-flight join, or needs a
-    /// fresh run, creating its `Node` (with a `rerun` closure) on first
-    /// sight. On the `Run` path this also resets the node's dynamic
-    /// dependency/output collections and marks it `Running`, so the caller
-    /// must actually run the computation after this returns.
-    fn prepare<P: CompParam, R: CompResult>(
-        self: &Arc<Self>,
-        key: &CompKey,
-        def_id: &DefId,
-        param: &P,
-    ) -> Action {
+    /// fresh run, creating its `Node` on first sight. On the `Run` path this
+    /// also resets the node's dynamic dependency/output collections and
+    /// marks it `Running`, so the caller must actually run the computation
+    /// after this returns.
+    fn prepare<P: CompParam>(self: &Arc<Self>, key: &CompKey, param: &P) -> Action {
         let mut nodes = self.nodes.lock().unwrap();
 
-        if let Some(node) = nodes.get(key) {
-            if node.state == NodeState::Clean
+        if let Some(id) = nodes.id_of(key) {
+            if let Some(node) = nodes.get_by_id(id)
+                && node.state() == NodeState::Clean
                 && let Some(v) = &node.value
             {
                 return Action::CacheHit(v.clone());
             }
-            if let Some(shared) = &node.inflight {
-                return Action::Join(shared.clone());
+            if let Some(shared) = nodes.inflight_get(id) {
+                return Action::Join(shared);
             }
         }
 
-        let rerun: RerunFn = self.make_rerun::<P, R>(*def_id, param.clone());
-        let (_id, node) = nodes.get_or_insert_with(key, || Node {
-            state: NodeState::Dirty,
-            dirty_priority: None,
+        let (id, node) = nodes.get_or_insert_with(key, || Node {
+            flags: NodeFlags::new(NodeState::Dirty),
             key: key.clone(),
             value: None,
             result_hash: None,
             param_bytes: postcard::to_stdvec(param)
                 .expect("postcard serialization of a well-formed value should not fail"),
             comp_deps: SmallVec::new(),
-            source_deps: HashSet::new(),
             rdeps: SmallVec::new(),
-            outputs: HashSet::new(),
-            last_changed: false,
-            inflight: None,
-            rerun,
         });
 
         let old_hash = node.result_hash;
-        let old_outputs = node.outputs.clone();
-        let old_source_deps = node.source_deps.clone();
-        node.state = NodeState::Running;
+        node.set_state(NodeState::Running);
         node.comp_deps.clear();
-        node.source_deps.clear();
-        node.outputs.clear();
+
+        let old_outputs = nodes.take_outputs(id);
+        let old_source_deps = nodes.take_source_deps(id);
 
         Action::Run(PreRunSnapshot {
             old_hash,
@@ -560,7 +762,7 @@ impl EngineInner {
                 // retries cleanly.
                 let mut nodes = self.nodes.lock().unwrap();
                 if let Some(node) = nodes.get_mut(key) {
-                    node.state = NodeState::Dirty;
+                    node.set_state(NodeState::Dirty);
                 }
                 tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 return Err(e);
@@ -602,8 +804,8 @@ impl EngineInner {
 
         {
             let mut nodes = self.nodes.lock().unwrap();
-            if let Some(node) = nodes.get_mut(key) {
-                node.inflight = Some(shared.clone());
+            if let Some(id) = nodes.id_of(key) {
+                nodes.inflight_set(id, shared.clone());
             }
         }
 
@@ -614,17 +816,16 @@ impl EngineInner {
                 let changed = old_hash != Some(hash);
                 let (id, new_source_deps, new_outputs) = {
                     let mut nodes = self.nodes.lock().unwrap();
+                    let id = nodes.id_of(key).expect("node present: created by prepare() before run() is called");
                     {
-                        let node = nodes
-                            .get_mut(key)
-                            .expect("node present: created by prepare() before run() is called");
-                        node.state = NodeState::Clean;
-                        node.dirty_priority = None;
+                        let node = nodes.get_mut_by_id(id).expect("node present: just looked up its id above");
+                        node.set_state(NodeState::Clean);
+                        node.set_dirty_priority(None);
                         node.value = Some(value_any.clone());
                         node.result_hash = Some(hash);
-                        node.last_changed = changed;
-                        node.inflight = None;
+                        node.set_last_changed(changed);
                     }
+                    nodes.inflight_clear(id);
 
                     // Only a genuinely changed result needs a fresh save: a
                     // recomputation that hit early cutoff already has its
@@ -646,9 +847,9 @@ impl EngineInner {
                         crate::persist::enqueue_changed(self, &nodes, key);
                     }
 
-                    let node = nodes.get(key).expect("node present: just updated above");
-                    let id = nodes.id_of(key).expect("id present: just looked up its node above");
-                    (id, node.source_deps.clone(), node.outputs.clone())
+                    let new_source_deps = nodes.source_deps_clone(id);
+                    let new_outputs = nodes.outputs_clone(id);
+                    (id, new_source_deps, new_outputs)
                 };
 
                 self.remove_stale_source_index(id, &old_source_deps, &new_source_deps);
@@ -675,9 +876,11 @@ impl EngineInner {
                 // `Clean`) so the next eval retries instead of reusing the
                 // stale (or absent) value.
                 let mut nodes = self.nodes.lock().unwrap();
-                if let Some(node) = nodes.get_mut(key) {
-                    node.state = NodeState::Dirty;
-                    node.inflight = None;
+                if let Some(id) = nodes.id_of(key) {
+                    if let Some(node) = nodes.get_mut_by_id(id) {
+                        node.set_state(NodeState::Dirty);
+                    }
+                    nodes.inflight_clear(id);
                 }
                 tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 Err(e)
@@ -773,7 +976,7 @@ impl EngineInner {
                 return Err(e);
             }
 
-            let action = self.prepare::<P, R>(&key, &def_id, &param);
+            let action = self.prepare::<P>(&key, &param);
 
             let value = match action {
                 Action::CacheHit(v) => {
@@ -831,8 +1034,8 @@ impl EngineInner {
         let caller_id = {
             let mut nodes = self.nodes.lock().unwrap();
             let id = nodes.id_of(caller);
-            if let Some(node) = nodes.get_mut(caller) {
-                node.source_deps.extend(raw.iter().cloned());
+            if let Some(id) = id {
+                nodes.extend_source_deps(id, &raw);
             }
             id
         };
@@ -848,8 +1051,8 @@ impl EngineInner {
             return;
         }
         let mut nodes = self.nodes.lock().unwrap();
-        if let Some(node) = nodes.get_mut(caller) {
-            node.outputs.extend(raw);
+        if let Some(id) = nodes.id_of(caller) {
+            nodes.extend_outputs(id, &raw);
         }
     }
 }
@@ -895,6 +1098,7 @@ impl Engine {
             defs: HashMap::new(),
             erased_defs: HashMap::new(),
             def_names: HashMap::new(),
+            def_order: Vec::new(),
             registry: Registry::default(),
             persist_opts: None,
         }
@@ -929,7 +1133,7 @@ impl Engine {
     pub(crate) fn mark_dirty_for_test(&self, key: &CompKey) {
         let mut nodes = self.inner.nodes.lock().unwrap();
         if let Some(node) = nodes.get_mut(key) {
-            node.state = NodeState::Dirty;
+            node.set_state(NodeState::Dirty);
         }
     }
 }
@@ -940,6 +1144,10 @@ pub struct EngineBuilder {
     defs: HashMap<DefId, Arc<dyn Any + Send + Sync>>,
     erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
     def_names: HashMap<String, DefId>,
+    /// Every registered `DefId`, in registration order — the source of
+    /// truth [`Engine::build`] uses to assign each definition its
+    /// [`DefIndex`] (simply its position here). See [`DefIndex`]'s docs.
+    def_order: Vec<DefId>,
     registry: Registry,
     persist_opts: Option<PersistOptions>,
 }
@@ -957,6 +1165,7 @@ impl EngineBuilder {
         assert!(prev.is_none(), "duplicate computation name: {id}");
         self.erased_defs.insert(id, Arc::new(DefAdapter(def)) as Arc<dyn ErasedDef>);
         self.def_names.insert(id.name().to_string(), id);
+        self.def_order.push(id);
         Comp::from_def_id(id)
     }
 
@@ -1003,19 +1212,19 @@ impl EngineBuilder {
         self.register(define_comp_rec(name, body))
     }
 
-    /// Defines and registers a computation named `name` in one step,
-    /// threading a shared environment `env` into the body on every
-    /// invocation.
+    /// Defines and registers a computation named `name` whose body is
+    /// threaded a shared environment `env` on every invocation, in addition
+    /// to the usual `Ctx` and parameter.
     ///
-    /// This is exactly [`crate::def::define_comp_with`] followed by
-    /// [`EngineBuilder::register`], collapsed into a single call — the
-    /// environment-passing counterpart to [`EngineBuilder::define`]. Where
-    /// `define`'s body is `Fn(Ctx, P) -> Fut`, `define_with`'s body is `Fn(E,
-    /// Ctx, P) -> Fut`: it receives an owned clone of `env`, freshly made for
-    /// every invocation, so there is no need to hand-write the two-layer
-    /// clone dance (clone into the outer closure, clone again into the inner
-    /// `async move`) that capturing `Arc` handles directly would otherwise
-    /// require.
+    /// This is [`crate::def::define_comp_with`] followed by
+    /// [`EngineBuilder::register`] — the environment-passing counterpart to
+    /// [`EngineBuilder::define`]. Where `define`'s body is `Fn(Ctx, P) ->
+    /// Fut`, `define_with`'s body is `Fn(E, Ctx, P) -> Fut`: it receives an
+    /// owned clone of `env`, freshly made for every invocation, so there is
+    /// no need to hand-write the two-layer clone dance (clone captured
+    /// handles into the outer closure, then clone them again into the inner
+    /// `async move` block for every call) that capturing `Arc` handles
+    /// directly would otherwise require.
     ///
     /// `env` is typically a tuple of cheaply-cloneable handles (`Arc<...>`
     /// sources/sinks, config values, `PathBuf` roots, ...); destructure it
@@ -1050,17 +1259,12 @@ impl EngineBuilder {
     }
 
     /// Defines and registers a self-recursive computation named `name` in
-    /// one step, threading a shared environment `env` into the body on every
-    /// invocation.
+    /// one step, threading a shared environment `env` on every invocation
+    /// (see [`Self::define_rec`] and [`Self::define_with`]).
     ///
-    /// This is exactly [`crate::def::define_comp_rec_with`] followed by
-    /// [`EngineBuilder::register`] — the environment-passing counterpart to
-    /// [`EngineBuilder::define_rec`]. The body's signature is `Fn(E,
-    /// Comp<P, R>, Ctx, P) -> Fut`: an owned clone of `env`, then the working
-    /// handle to the computation's own definition (`this`), then the usual
-    /// `Ctx`/param pair. See [`EngineBuilder::define_with`] for the two
-    /// `&env` call styles (shared-across-definitions vs. single-use inline)
-    /// and why `env` is cloned once per invocation.
+    /// The body's signature is `Fn(E, Comp<P, R>, Ctx, P) -> Fut`: an owned clone
+    /// of `env`, then the working handle to the computation's own definition,
+    /// then the usual `Ctx`/param pair.
     ///
     /// # Panics
     /// Panics if a computation with the same name is already registered.
@@ -1135,12 +1339,25 @@ impl EngineBuilder {
     }
 
     /// Finishes building the `Engine`.
+    ///
+    /// # Panics
+    /// Panics if more than `u16::MAX + 1` computations were registered — the
+    /// capacity of the internal [`DefIndex`] the node table's lookup index
+    /// uses (see [`DefIndex`]'s docs). Not a realistic limit for any
+    /// hand-registered graph of definitions.
     pub fn build(self) -> Engine {
         let (dirty_tx, dirty_rx) = mpsc::unbounded_channel();
+        assert!(
+            self.def_order.len() <= u16::MAX as usize + 1,
+            "engine has {} registered computations, exceeding the u16::MAX+1 DefIndex capacity",
+            self.def_order.len()
+        );
+        let def_index: HashMap<DefId, DefIndex> =
+            self.def_order.iter().enumerate().map(|(i, &id)| (id, DefIndex(i as u16))).collect();
         Engine {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
-                nodes: Mutex::new(NodeTable::new()),
+                nodes: Mutex::new(NodeTable::new(def_index)),
                 source_index: Mutex::new(HashMap::new()),
                 roots: Mutex::new(HashSet::new()),
                 registry: self.registry,
@@ -1164,17 +1381,111 @@ mod tests {
 
     /// Guards the point of the "node memory diet": a regression that
     /// accidentally reintroduces a wide field (a full `CompKey` per edge, a
-    /// pre-serialized `value_bytes`/`param_debug`, a 256-bit hash) should
-    /// fail loudly here rather than only show up as a surprise in the
-    /// 1M-instance `persist_bench` benchmark's RSS figure. The bound is
-    /// deliberately generous (comfortably above the measured size on the
-    /// platform this was tuned on) — this is a coarse tripwire, not a
-    /// precise layout contract; exact field layout is not part of any
-    /// public API.
+    /// pre-serialized `value_bytes`/`param_debug`, a 256-bit hash, a
+    /// per-node rerun closure, or an always-allocated `source_deps`/
+    /// `outputs`/`inflight` field) should fail loudly here rather than only
+    /// show up as a surprise in the 1M-instance `persist_bench` benchmark's
+    /// RSS figure. The bound is deliberately generous (comfortably above
+    /// the measured size on the platform this was tuned on) — this is a
+    /// coarse tripwire, not a precise layout contract; exact field layout is
+    /// not part of any public API.
+    ///
+    /// Measured at 296 bytes before the Tier-1 memory redesign (closure-kill
+    /// plus `u16` `DefIndex` plus sparse side tables plus the
+    /// `state`/`dirty_priority`/`last_changed` bitfield packing), 160 bytes
+    /// after — the tripwire bound below is set with headroom above that
+    /// 160, not tight to it.
     #[test]
     fn node_stays_small() {
         let size = std::mem::size_of::<Node>();
-        assert!(size <= 320, "Node grew to {size} bytes — see this test's doc comment");
+        assert!(size <= 192, "Node grew to {size} bytes — see this test's doc comment");
+    }
+
+    /// Regression test for the `rerun`-closure -> `Arc<EngineInner>`
+    /// reference cycle this Tier-1 memory redesign removes (see [`Node`]'s
+    /// docs): before this change, any node that had ever executed via the
+    /// driver's rerun path permanently captured `Arc<EngineInner>` inside
+    /// its own closure, so an `Engine` was never actually freed even once
+    /// every external handle to it was dropped. Exercises a source-driven
+    /// rerun (the exact path that used to capture the cycle) before
+    /// dropping every handle, including the driver task, then asserts a
+    /// `Weak` reference taken up front can no longer be upgraded — proof
+    /// that nothing still holds a hidden strong `Arc<EngineInner>`.
+    #[tokio::test]
+    async fn engine_is_droppable_after_a_rerun() {
+        let kv = MemKvSource::new("kv");
+        kv.set("a", "v0").await;
+        let sink = VecSink::new("docs");
+
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+        registry.register_sink(sink.clone());
+
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+        let comp: Comp<(), ()> = builder.define("droppable_probe", {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                let sink = sink.clone();
+                async move {
+                    let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                    ctx.sink_req(
+                        &sink,
+                        WriteDoc {
+                            name: "doc_a".to_string(),
+                            content: val,
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        });
+        let engine = builder.build();
+        let weak = Arc::downgrade(&engine.inner);
+
+        let handle = {
+            let e = engine.clone();
+            tokio::spawn(async move { e.run(comp, ()).await })
+        };
+
+        wait_for(|| sink.get("doc_a").as_deref() == Some("v0")).await;
+
+        // Trigger a genuine source-driven rerun: this is the exact path
+        // that used to permanently mark a node's `rerun` closure (and thus
+        // this whole engine) unreclaimable.
+        kv.set("a", "v1").await;
+        wait_for(|| sink.get("doc_a").as_deref() == Some("v1")).await;
+
+        handle.abort();
+        let _ = handle.await;
+        drop(engine);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "EngineInner should be fully dropped once every handle (including the driver task) is \
+             gone -- a surviving Weak upgrade means something still holds a hidden Arc<EngineInner>, \
+             e.g. a reintroduced rerun-closure cycle"
+        );
+    }
+
+    /// Polls `f` every 10ms until it returns `true`, panicking if 5s pass
+    /// first — mirrors `tests/driver.rs`'s own `wait_until` helper (not
+    /// reused directly since that lives in a separate integration-test
+    /// crate this unit test can't depend on).
+    async fn wait_for(f: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if f() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition did not become true within 5s");
     }
 
     /// A body's second execution can produce fewer sink outputs than its
