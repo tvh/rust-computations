@@ -146,9 +146,10 @@ an existential).
 First and most important: **the Haskell reference has no persistence.** All
 state is one `SifState` in a `TVar` (`CompEngine/Run.hs:119`); `grep -il
 persist src/` hits only a doc comment. So the comparable Rust number is the
-stage-3 **engine-only ~700 MB ≈ 0.7 KB/node**, not the 1.78 GB
-with-persistence figure. The whole stage 0→3 story (restart, load-anyway
-priority tiers, debounced flush, 269 MB on disk) has no counterpart.
+**engine-only** RSS, not the with-persistence figure — stage-3 ~700 MB
+(≈0.7 KB/node), stage-4 **427–430 MB (≈0.43 KB/node)**. The whole stage 0→3
+story (restart, load-anyway priority tiers, debounced flush, 269 MB on disk)
+has no counterpart at all.
 
 State layout (`CompEngine/SimpleStateIf.hs:69`): five global containers keyed by
 the same `AnyCompAp` — `sifs_cache` (`Data.Map`), `sifs_vermap` (`Data.Map`),
@@ -176,7 +177,8 @@ RSS is the bigger story: GHC's default copying collector sizes the old gen at
 ~2× live (`-F 2`) and needs to-space alongside from-space during a major GC.
 **Realistic RSS ~2.7–4 GB** for a 1.35 GB live set. So:
 
-- vs stage-3 Rust engine-only (700 MB): **~2× on live heap, ~4–6× on RSS**.
+- vs stage-3 Rust engine-only (0.7 KB/node): **~2× on live heap, ~4–6× on RSS**.
+- vs stage-4 Rust engine-only (0.43 KB/node): **~3× live, ~6–9× RSS**.
 - vs stage-1 Rust *pre-diet* (2.7 KB/node): Haskell would have looked *better*.
   The node diet is what flipped it.
 
@@ -343,6 +345,209 @@ Surprises:
   "public API / on-disk format unchanged" constraint held in practice, not
   just in intent.
 
+## Interlude 2 — could the same diet be applied to the Haskell reference?
+
+Follow-on to Interlude 1. Same caveat: static reading, nothing built or run.
+Call sites below were checked against `skogsbaer/computations` @ `e0bec07`.
+
+| Rust change | Haskell analogue | Verdict | B/cap |
+|---|---|---|---|
+| 3(a) drop `param_debug` | `ccm_logrepr :: T.Text` | port it | −56 |
+| 3(a′) — | `ccm_approxCachedSize = length (show x)` | port it; also kills a `show` per rerun | −32 |
+| 3(b) drop duplicate `value_bytes` | `sifs_vermap` duplicates `ccm_largeHash` | **delete outright** | −64 |
+| 3(c) `Hash256 → Hash128` | already MD5-128 | **already done; unpacking would backfire** | 0 |
+| 3(d) intern edges to `NodeId(u32)` | intern to `Int` + unboxed edge vectors | only half the win is reachable | −424 |
+| 4(a) kill per-node rerun closures | never had them | already fine | 0 |
+| 4(b) `u16 DefIndex` | `CompId` reached via the shared `Comp` ptr | already fine | 0 |
+| 4(c) sparse side tables | `om_forward` entry inserted for *every* cap | drop the empty inserts | −56 |
+| 4(d) bitfield-pack node flags | no per-node flags exist (see below) | n/a | 0 |
+| — | 5 dictionary words in `CompApIntern` | move them to the per-def `Comp` | −24 |
+
+**~1,350 → ~720 B/cap** (≈720 MB live). Note what that does *not* do: it lands
+near stage-3 Rust (0.7 KB/node) and is still **~1.7× stage-4 Rust** (0.43
+KB/node). Stage 4 moved the goalposts faster than the Haskell diet can follow.
+
+### The three worth doing first (~a day, −232 B, low risk)
+
+1. **Delete `sifs_vermap`.** Written at `SimpleStateIf.hs:512`, read at exactly
+   one site — `SimpleStateIf.hs:568`, the "did a dep change version behind my
+   back" check. `capResultToVer` (`Core.hs:145`) already derives that same
+   `CompDepVer` from a cache lookup, and `s3` updates cache and vermap in
+   lockstep (`:508-516`) so they cannot disagree. A whole 1M-entry `Data.Map`
+   plus an O(log n) insert per recomputation, for a value living one container
+   over. Closest analogue in the codebase to the duplicate `value_bytes`
+   stage 3(b) deleted.
+2. **Move `ccm_logrepr` into `CompCacheBehavior`** as `ccb_logrepr :: a -> T.Text`.
+   That record is per-*definition* — 50 objects, not 1M — and is reachable at
+   every log site through the key's `capI_comp`. Same shape as stage 3(b)'s
+   per-def erased serializer. Strictly better than re-lazifying the field
+   (`~T.Text` under `StrictData`): a thunk still costs 3 words and retains the
+   String. `ccm_approxCachedSize` goes the same way, or dies with
+   `sifc_compToSize`; the `FIXME: what is needed from the size stuff?`
+   (`Types.hs:206`) reads like an invitation.
+3. **Drop the `OM.insert key mempty`** at `SimpleStateIf.hs:182` — this is
+   stage 4(c) for outputs, exactly. ~999k output-less caps each get a HashMap
+   entry whose value is the shared empty `Map`. Both readers
+   (`SimpleStateIf.hs:369`, `:393`) already do `fromMaybe mempty` /
+   `maybe mempty`; the only thing observing the difference is
+   `isJust mOldOutputs` at `:410`, picking `pureInfo` over `pureDebug`. Run
+   `TestOutputs` over it — the `GenDel` comment at `Impl.hs:51-59` warns about
+   precisely this area.
+
+### Already fine, or would backfire
+
+- **3(c) is done.** `largeHash128 = LH.largeHash md5HashAlgorithm`
+  (`Utils/Hash.hs:34`); `Word128` = two `{-# UNPACK #-}`'d `Word64` = 24 B.
+  Do **not** go further and `{-# UNPACK #-}` `Hash128` into `CompCacheMeta`:
+  today one `Word128` object is shared by the cache entry, the vermap entry,
+  and the `dep_ver` of every rdep record. Unpacking gives ~4 sites their own
+  16 B inline copy instead of ~4 pointers to one 24 B object — net loss.
+  Haskell already gets the inlining benefit *and* dedup, via sharing. Inverse
+  of the Rust conclusion, for a real reason.
+- **4(a)**: no analogue. Haskell never carried a per-node closure — re-eval
+  goes through `initCompAp` from the typed `capI_param` + shared `Comp`
+  (`Impl.hs:148-158`). This is the design stage 4(a) *converged on*, arrived at
+  from the other direction.
+- **4(b)**: no analogue. `CompId` is reached through the shared `Comp` pointer;
+  no per-node def identifier is stored at all, and `capI_hash` already folds
+  the def name in the way `CompKey` does.
+- **4(d)**: no analogue, and the reason is expensive. Haskell has no
+  `state`/`dirty_priority`/`last_changed` fields to pack: dirtiness is
+  "present in the PAQ", priority lives in `CompId`, and `last_changed` doesn't
+  exist — the `VerList` version level (`Utils/VerList.hs`) does that job by
+  keying reverse deps on *(key, version)* so `DepMap.stale`
+  (`Utils/DepMap.hs:152`) can answer "who depends on a now-superseded version
+  of X". **Haskell pays ~360 B/cap for what stage 4(d) packs into one bit.**
+
+### 3(d) is the big one and only half-works
+
+The 424 B is real: intern `AnyCompAp` to `Int`, make fwd deps
+`IntMap (U.Vector (Int, Word128))` — ~24 B/edge flat vs 56 B boxed `Dep` + 48 B
+HAMT leaf today — and the same inside `VerList`'s dependents sets.
+
+But stage 3(d)'s win was *two* things: 32 B → 4 B per edge, **and** edges living
+inline in the node's own allocation. Haskell can only have the first, because
+**there is no node** — state is five independent persistent containers keyed by
+the same key, so there is nothing to be inline *in*. Getting the second half
+means restructuring `SifState` into `IntMap Node` with one strict record per
+cap, which fights the idiom: today updating deps touches one container; then,
+every dep update copies the whole record.
+
+Two hazards transfer verbatim:
+
+- **Id recycling.** Interning creates a table the GC can't reclaim, so `runGc`
+  (`SimpleStateIf.hs:326`) must release ids explicitly — the free list, by
+  hand. Laziness sharpens it: a retained thunk can hold a stale id. Our rule
+  (long-lived references keyed by `CompKey`, never `NodeId`) applies unchanged.
+- **It breaks the sharing trick.** `SifCache.lookup` returns the map's own key
+  on purpose (`SifCache.hs:146-152` — hence `lookupLE`+eq rather than plain
+  `lookup`), and `validateSifState` (`SimpleStateIf.hs:82`) asserts it with
+  `reallyUnsafePtrEquality#`. Interning makes that machinery moot. Net win, but
+  a validator and a deliberate lookup idiom exist to serve the strategy being
+  replaced.
+
+Optional extra: drop the `VerList` version level entirely and adopt our flat
+rdeps + `last_changed` model (another ~−80 B). That's a semantics change, not
+an encoding one.
+
+### Addendum — second scan: newtypes, Typeable dicts, and the box towers
+
+A second pass over the state layer (`Types.hs`, `SimpleStateIf.hs`,
+`SifCache.hs`, `CompFlow.hs`, `Core.hs`; `Run.hs` confirms the entire state is
+one `TVar SifState`, `Run.hs:119`) finds another **~130–155 B/cap** beyond the
+table above.
+
+**Newtype audit: all clean.** Every newtype on the state path is zero-cost —
+`CompDep`, `CompDepKey`, `CompDepVer`, `SomeCompSrcDep/Key/Ver`, `Hash128`,
+`TypeId`, `CompSrcInstanceId`, `DataSize`, `VerList`, `AnyCompSinkOutsMap`.
+The costs hide *under* them, in three kinds of `data`: the `Dep` pair box
+(3 words), `Option`'s `Some` box (2 words — `StrictData` doesn't remove it, a
+strict field still points to a box), and the existentials below. Wrapping
+discipline: free. Boxing discipline: not.
+
+**Typeable audit: an existential constraint is one stored dictionary pointer
+per *allocation*** (the `TypeRep` is shared; the word isn't). By constructor
+context:
+
+- `CompApIntern` (`Types.hs:442`): 5 dicts — already in the table above.
+- `AnyCompAp` (`Types.hs:554`): 2 more dicts, **redundant** — the inner
+  `CompApIntern` already carries the same `IsCompResult r`. Drop the wrapper's
+  constraint; every use site (`Eq`/`Ord`'s `eqT`, `showAnyCompApDetails`)
+  recovers the dicts by matching one level deeper (`AnyCompAp l@CompApIntern{}`
+  — the pattern synonym is `COMPLETE`, so this is mechanical). −16 B/cap at
+  ~1 shared wrapper per cap.
+- `AnyCompCacheValue` (`Types.hs:186`): 1 dict per cached value, powering
+  `castCompCacheValue`'s `cast` on every parent cache read. Absorbed by the
+  flatten below, or by the per-def `Dict`-in-`Comp` move — justified by the
+  codebase's own documented axiom (`CompFlow.hs`: "equality of the identities
+  implies the types are equal").
+- `ForAnyCompFlow` (`CompFlow.hs:32`): the worst per-allocation offender —
+  **6 dicts** (`Typeable s`, `c s`, `IsCompFlowData (k s)` = Show+Eq+Typeable+
+  Hashable) plus `CompSrcId` plus a zero-information `Proxy s` field ≈ 10
+  words = **80 B per stored source dep**; and `depKey`/`depVer`
+  (`CompSrc.hs:158-159`) allocate a fresh one on every call. Fix: one shared
+  per-source-instance tag object (id + proxy + dicts, allocated once),
+  `data AnyCompSrcDep = ASD !SrcTag !k` → 3 words per value. −56 B per stored
+  source dep; amortized over this benchmark's topology (~205k of 1M caps have
+  one) ≈ −11 B/cap, more in source-heavy graphs.
+
+**New items, ranked:**
+
+1. **Flatten the cache-value box tower (~70–90 B/cap)** — the biggest single
+   remaining item. A cached success is five boxes deep before the payload:
+   `Map` value → `CapSuccess` (2 w) → `AnyCompCacheValue` (3 w, incl. dict) →
+   `CompCacheValue` (3 w) → `Some` payload (2 w) → `CompCacheMeta` (5 w,
+   → 3 w after the logrepr/size moves above) — ~13 words of chrome per cap
+   *after* the already-planned cuts. One flattened existential —
+   `data Cached = forall a. CachedOk !a !Hash128 | CachedHashOnly !Hash128 |
+   CachedFail` — is 4 words. The `CachedOk`/`CachedHashOnly` split *is* the
+   `fullCaching`/`hashCaching` distinction, so the sum was already there
+   semantically; one `cast` replaces four pointer chases per parent read.
+   Casualties: the `Eq`-by-hash instance and `SifCache`'s `HasSizes`
+   plumbing, both trivially rebuilt on the flat type.
+2. **`AnyCompAp` dict dedup (−16 B/cap)** — smallest diff of the lot.
+3. **`ForAnyCompFlow` tag hoisting (−11 B/cap amortized)** — as above.
+4. **`Data.Map` → dense structure for `SifCache` (−~40 B/cap, only after
+   interning).** `Map.Bin` is 6 words/entry, and every key comparison pays an
+   `eqT` fingerprint check (`Ord AnyCompAp`, `Types.hs:574`). Pre-interning
+   this is load-bearing (`lookupLE` + returned-key sharing *is* the dedup
+   mechanism), but interning already makes that moot — then dense-`Int`-keyed
+   entries (slab/array) cost ~1–2 words. A dependent of 3(d), not an
+   independent win.
+
+Revised ceiling: ~720 → **~565–600 B/cap** with items 1–4. Still ~1.3–1.4×
+stage-4 Rust engine-only, and the residue is architectural: five containers'
+per-entry overheads plus the `VerList` version index (the ~360 B/cap that
+stage 4(d) packs into one bit).
+
+Throughput footnote (churn, not residency): `mkCompAp` MD5-hashes
+`(name, param)` and allocates a fresh `CompAp` + `AnyCompAp` on **every**
+parent eval call — the sharing trick dedups what's retained, not what's
+allocated. Same shape as the Rust port's `make_rerun` recomputing `CompKey`
+per call: both implementations independently chose "hash at the call site,
+every time" on the hot path.
+
+### What no diet fixes
+
+Live heap 1,350 → ~720 B/cap (→ ~565–600 with the addendum's items).
+**RSS ~2.7–4 GB → maybe 1.5–2 GB, and stops.**
+The remaining gap is not data layout, it's GHC's copying collector holding ~2×
+live (`-F 2`) plus to-space during major GCs — an RTS-flag question
+(`--nonmoving-gc`, or `-c` compacting, both trading throughput), not a
+data-structure one.
+
+Amusing symmetry with stage 4's "surprises": our residual ~428 MB is dominated
+by ~1M small individual heap allocations (`param_bytes` `Vec`, `Arc<dyn Any>`
+value) that the Tier 1 cuts never touched. Haskell has the identical problem,
+and *more* of those objects — but GHC's bump-allocating nursery handles small
+short-lived allocation better than malloc does. It just charges for it at the
+other end, in copying-GC headroom. Neither runtime escapes "1M nodes means
+millions of tiny objects"; they only choose where to pay.
+
+No Haskell analogue of the `size_of::<Node>() <= 192` tripwire exists — closest
+is a `weigh`/`ghc-datasize` assertion, or a CI check on max residency from
+`+RTS -s` at a fixed graph size.
+
 ## Tried and rejected (with reasons)
 
 - `SmallVec` for `source_deps`/`outputs`: measured a *regression* at 1M — most
@@ -412,3 +617,6 @@ Surprises:
 - Port vs. reference, byte for byte: the same architecture in Haskell and Rust,
   where each language's memory actually goes, and the two independent times we
   each paid for a `show`-rendered debug string on every node.
+- "What does a bit cost you?" — stage 4(d) packs `last_changed` into one bit;
+  the Haskell reference answers the same question with a version-keyed reverse
+  index costing ~360 B/node. Same semantics, three orders of magnitude apart.
