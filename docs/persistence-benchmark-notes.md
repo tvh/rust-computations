@@ -232,6 +232,53 @@ scaled to 1M caps would settle it; the two figures most likely to move are the
 HAMT per-entry constant (4.5–7 words is the usual range) and the existential
 dictionary count.
 
+## Research — how similar systems store their graphs (between Stages 3 and 4)
+
+Trigger: 0.7 KB/node engine-only felt too big; question was what a redesign
+should look like, with "complete redesign is fine" as the mandate. Systems
+surveyed:
+
+- **[Salsa](https://github.com/salsa-rs/salsa)** (rust-analyzer / rustc query
+  system): everything is an interned **u32 id** ("raw-id is basically a
+  newtype'd u32"); storage is **per-query-type "ingredient" tables** — typed,
+  columnar, one table per query kind rather than one generic node struct.
+  Memos store typed values directly (no `Arc<dyn Any>`). Cutoff uses compact
+  u64 revision counters (`changed_at`/`verified_at`) in the hot path rather
+  than content hashes. This became the Tier 2 blueprint.
+  ([interning](https://github.com/salsa-rs/salsa/blob/master/src/interned.rs),
+  [struct kinds](https://salsa-rs.github.io/salsa/tutorial/ir.html),
+  [algorithm](https://medium.com/@eliah.lakhin/salsa-algorithm-explained-c5d6df1dd291))
+- **[turbo-tasks / Turbopack](https://nextjs.org/blog/turbopack-incremental-computation)**:
+  fine-grained task graph, persisted to disk (stable in Next 16.1). Their own
+  retrospective: memory "at a premium since launch", fixed by compressing data
+  structures and — their words — the **biggest win was evicting much of the
+  in-memory cache**, possible only *because* the disk copy exists. This is the
+  Tier 3 blueprint (not yet implemented here).
+  ([persistent caching talk](https://gitnation.com/contents/turbopack-persistent-caching))
+- **Bazel Skyframe / Shake**: same interning story — int keys, compact dep
+  arrays (Skyframe's GroupedList). Nothing new beyond confirmation.
+- **Differential/timely dataflow**: the genuinely different model — *no
+  per-instance nodes at all*; data flows through a fixed ~50-operator graph,
+  state lives in shared indexed arrangements. Rejected as a target: it gives
+  up the arbitrary-recursion / dynamic-dependency model this engine is built
+  on (a `sync_dir` that recursively discovers its own dependency structure has
+  no natural home there). Kept as inspiration for the columnar-per-def idea —
+  50 defs is the "operator graph", instances are rows.
+
+Resulting plan, as tiers (user green-lit 1+2 with a benchmark checkpoint
+between; 3 deferred):
+
+1. **Tier 1** — mechanical cuts: kill per-node rerun closures (revive from
+   `(def, param_bytes)` on demand — the persistence-revival path already
+   proved it works), u16 def indices, sparse side tables for the
+   mostly-empty fields, bitfield flags. → Stage 4.
+2. **Tier 2** — Salsa-style columnar per-def tables with typed value columns
+   and param arenas. → Stage 5.
+3. **Tier 3** — turbo-tasks-style eviction: with persistence on, in-memory
+   state is *also* a cache; evict cold nodes' values/edges to redb, revive on
+   access; floor ≈ index entry + hashes (~40 B/node). **Not implemented** —
+   see open items.
+
 ## Stage 4 — Tier 1 memory redesign (closure-kill, u16 defs, sparse side tables)
 
 Four structural cuts to the in-memory `Node`/`NodeTable`, format unchanged
@@ -567,8 +614,31 @@ is a `weigh`/`ghc-datasize` assertion, or a CI check on max residency from
 - zstd compression: records are small; deferred behind the format-version byte
   (can add without migration machinery).
 
+## The memory arc — end-to-end summary (1M instances, engine-only)
+
+| | bytes/node | engine RSS | live update (no persist) | warm restart | commit |
+|---|---|---|---|---|---|
+| Stage 1-2 (pre-diet) | ~2,700 B | ~2.6 GB peak | 1.3–1.5 s | 3.3 s | `c17efdb` |
+| Stage 3 (first diet) | ~700 B | ~700 MB | 574 ms | 1.6 s | `cc5dd5e` |
+| Stage 4 (Tier 1) | ~430 B | 427–430 MB | 616 ms | 1.7 s | `55b5094` |
+| Stage 5 (Tier 2) | **~330 B** | **328–354 MB** | **502–527 ms** | **1.36–1.44 s** | `9b740ba` |
+
+8× total; Tier 2 made everything faster as well (columnar locality), erasing
+Tier 1's small decode/side-table regression. Projected Tier 3 floor: ~40 B/node
+for evicted nodes (memory becomes a knob, not a linear function of graph size).
+
 ## Not tried yet / open items
 
+- **Tier 3 eviction** (the turbo-tasks move, their self-reported biggest
+  memory win): with persistence on, evict cold nodes' values/edges to the
+  already-existing redb copy, revive on access; in-memory floor ≈ index entry
+  + hashes (~40 B/node). Costs: revival latency on cold hits, an eviction
+  policy to tune, and interplay with the async flush window (an evicted node
+  must be flushed first). Deferred by explicit decision at the Tier-1/2
+  green-light; the natural next stage.
+- Packed-u32 `NodeRef` (u8 def | u24 row) and/or same-def-local u32 edges:
+  recovers most of the `NodeRef` 8-B tax Stage 5's surprises identified, at
+  the cost of a 256-def or per-def-row ceiling (or a two-variant edge enum).
 - `--body-cost <µs>` busy-spin flag to demonstrate the realistic win (warm
   restart flat while cold scales linearly with body cost).
 - ~~`Weak` backrefs for the rerun-closure → `EngineInner` `Arc` cycle~~ —
