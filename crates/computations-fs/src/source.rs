@@ -82,7 +82,7 @@ pub enum FsVer {
     /// content), sufficiently precise.
     File { mtime_nanos: u128, size: u64 },
     /// A directory, identified by a stable hash of its sorted entry list.
-    Dir { entries_hash: [u8; 32] },
+    Dir { entries_hash: [u8; 16] },
 }
 
 /// Canonicalizes `path` into a stable source key, even if `path` does not

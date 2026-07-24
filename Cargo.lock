@@ -99,6 +99,7 @@ dependencies = [
  "postcard",
  "redb",
  "serde",
+ "smallvec",
  "tempfile",
  "thiserror",
  "tokio",

@@ -60,6 +60,7 @@
 //!   whatever a lost flush would have recorded, `probe_versions` still
 //!   sees the real, current source state on the next load.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,8 +71,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
-use crate::engine::{DirtyPriority, EngineInner, Node, RevivedNode};
-use crate::key::{CompKey, DefId, Hash256};
+use crate::def::ErasedDef;
+use crate::engine::{DirtyPriority, EngineInner, Node, NodeId, NodeTable, RevivedNode};
+use crate::key::{CompKey, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
 
@@ -83,7 +85,7 @@ use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
 /// [`Fingerprint`], which is about the *code that produced the values*, not
 /// the *encoding of the store*: a format bump always wipes, a fingerprint
 /// mismatch only ever revalidates in the background.
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
@@ -267,7 +269,7 @@ struct MetaRecord {
 #[derive(Serialize, Deserialize, Clone)]
 struct CompKeyRepr {
     def_name: String,
-    param_hash: [u8; 32],
+    param_hash: [u8; 16],
 }
 
 impl CompKeyRepr {
@@ -286,7 +288,7 @@ impl CompKeyRepr {
     /// unregistered definition.
     fn to_key(&self, def_names: &HashMap<String, DefId>) -> Option<CompKey> {
         let def_id = *def_names.get(&self.def_name)?;
-        Some(CompKey::from_parts(def_id, Hash256::from_bytes(self.param_hash)))
+        Some(CompKey::from_parts(def_id, Hash128::from_bytes(self.param_hash)))
     }
 }
 
@@ -342,37 +344,73 @@ impl RawOutputRepr {
 }
 
 /// One `nodes` table row: everything needed to revive a `Clean` [`Node`]
-/// without ever re-executing its computation.
+/// without ever re-executing its computation. The on-disk shape — always
+/// carries fully-serialized `value_bytes`, satisfying the standing
+/// requirement that the *database* keep every byte of information it always
+/// has, even though the in-memory [`Node`] this is built from no longer
+/// keeps a permanent serialized copy of its own value (see [`PendingRecord`],
+/// which is what actually gets built at enqueue time; `value_bytes` is only
+/// ever filled in lazily, at flush time, from [`PendingRecord::value`]).
 #[derive(Serialize, Deserialize)]
 struct NodeRecord {
     def_name: String,
     param_bytes: Vec<u8>,
     comp_deps: Vec<CompKeyRepr>,
     source_deps: Vec<RawDepRepr>,
-    result_hash: [u8; 32],
+    result_hash: [u8; 16],
     value_bytes: Vec<u8>,
     outputs: Vec<RawOutputRepr>,
 }
 
-impl NodeRecord {
-    /// Snapshots everything needed to persist `key`'s node, cloning its
-    /// param/value/deps/hash bytes. Callers hold `EngineInner::nodes`'s
-    /// lock while calling this (see [`enqueue_changed`]) so the snapshot
-    /// can never observe a torn write from a concurrent rerun of the same
-    /// node.
+/// The in-memory, not-yet-written counterpart of [`NodeRecord`]: everything
+/// a changed node's [`PendingMap`] entry needs, except `value_bytes` — which
+/// is deliberately *not* computed yet. `enqueue_changed` builds one of these
+/// while `EngineInner::nodes` is locked, cloning `value` (an `Arc`, so this
+/// is a cheap refcount bump, not a deep copy); the actual postcard encoding
+/// of that value happens later, in [`PersistHandle::flush`], entirely
+/// outside that lock — see this module's docs for why that split matters
+/// (a value can be arbitrarily larger than the rest of a node's metadata,
+/// so serializing it is the one part of "record a change" worth deferring
+/// off the hot path, and worth skipping entirely for an entry that gets
+/// coalesced by a fresher enqueue before the next flush ever happens).
+struct PendingRecord {
+    def_name: String,
+    param_bytes: Vec<u8>,
+    comp_deps: Vec<CompKeyRepr>,
+    source_deps: Vec<RawDepRepr>,
+    result_hash: [u8; 16],
+    value: Arc<dyn Any + Send + Sync>,
+    outputs: Vec<RawOutputRepr>,
+}
+
+impl PendingRecord {
+    /// Snapshots everything needed to persist `key`'s node, minus its
+    /// serialized value bytes (see [`PendingRecord`]'s docs). Callers hold
+    /// `EngineInner::nodes`'s lock while calling this (see
+    /// [`enqueue_changed`]) so the snapshot can never observe a torn write
+    /// from a concurrent rerun of the same node. `nodes` (the whole live
+    /// table, not just `node`) is needed to translate `node.comp_deps`'
+    /// `NodeId`s back into the `CompKey`s persistence actually stores (see
+    /// `crate::engine::NodeId`'s docs).
     ///
     /// Returns `None` for a node with no successful run yet (no
-    /// `value_bytes`/`result_hash`) — nothing coherent to persist.
-    fn snapshot(key: &CompKey, node: &Node) -> Option<NodeRecord> {
-        let value_bytes = node.value_bytes.clone()?;
+    /// `value`/`result_hash`) — nothing coherent to persist.
+    fn snapshot(nodes: &NodeTable, key: &CompKey, node: &Node) -> Option<PendingRecord> {
+        let value = node.value.clone()?;
         let result_hash = node.result_hash?;
-        Some(NodeRecord {
+        let comp_deps: Vec<CompKeyRepr> = node
+            .comp_deps
+            .iter()
+            .filter_map(|&id| nodes.get_by_id(id))
+            .map(|dep_node| CompKeyRepr::from_key(&dep_node.key))
+            .collect();
+        Some(PendingRecord {
             def_name: key.def().name().to_string(),
             param_bytes: node.param_bytes.clone(),
-            comp_deps: node.comp_deps.iter().map(CompKeyRepr::from_key).collect(),
+            comp_deps,
             source_deps: node.source_deps.iter().map(RawDepRepr::from_dep).collect(),
             result_hash: result_hash.as_bytes(),
-            value_bytes,
+            value,
             outputs: node.outputs.iter().map(RawOutputRepr::from_output).collect(),
         })
     }
@@ -395,7 +433,7 @@ fn encode_key(key: &CompKey) -> Vec<u8> {
 /// present in "both" an update and a removal set, unlike a two-collection
 /// design would risk).
 enum EntryKind {
-    Upsert(NodeRecord),
+    Upsert(PendingRecord),
     Remove,
 }
 
@@ -407,10 +445,12 @@ struct PendingEntry {
 }
 
 /// Keys changed or removed since the last successful flush, accumulated as
-/// the engine runs and drained by [`PersistHandle::flush`]. Record bytes
-/// are snapshotted at enqueue time (see [`NodeRecord::snapshot`]), so the
-/// background persister task that eventually flushes this never needs to
-/// touch live nodes, and a round can never race an in-progress flush.
+/// the engine runs and drained by [`PersistHandle::flush`]. Every field
+/// except the eventual value bytes is snapshotted at enqueue time (see
+/// [`PendingRecord::snapshot`]), so the background persister task that
+/// eventually flushes this never needs to touch live nodes, and a round can
+/// never race an in-progress flush; the value itself is serialized lazily,
+/// at flush time (see [`PendingRecord`]'s docs).
 #[derive(Default)]
 struct PendingMap {
     entries: HashMap<CompKey, PendingEntry>,
@@ -422,7 +462,7 @@ struct PendingMap {
 }
 
 impl PendingMap {
-    fn upsert(&mut self, key: CompKey, record: NodeRecord) {
+    fn upsert(&mut self, key: CompKey, record: PendingRecord) {
         self.insert(key, PendingEntry { kind: EntryKind::Upsert(record), attempts: 0 });
     }
 
@@ -448,6 +488,16 @@ impl PendingMap {
 pub(crate) struct PersistHandle {
     db: Database,
     fingerprint: Fingerprint,
+    /// A snapshot of `EngineInner::erased_defs`, cloned once at construction
+    /// (cheap: it's a map of `Arc`s, and the set of registered definitions
+    /// never changes after an engine is built). Lets [`Self::flush`] encode
+    /// each pending entry's erased value into bytes (see
+    /// [`crate::def::ErasedDef::serialize_value`]) without needing a live
+    /// reference back to `EngineInner` — keeping the persister task's
+    /// footprint limited to exactly what flushing needs (see
+    /// [`persister_loop`]'s docs on why it only ever holds a `Weak`
+    /// reference to this handle, let alone the whole engine).
+    erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
     pending: Mutex<PendingMap>,
     /// Wakes the persister task when something new is enqueued, so it can
     /// restart its debounce clock (or notice the pending map went from
@@ -481,10 +531,17 @@ pub(crate) struct PersistHandle {
 }
 
 impl PersistHandle {
-    fn new(db: Database, fingerprint: Fingerprint, opts: &PersistOptions, notify: Arc<Notify>) -> Self {
+    fn new(
+        db: Database,
+        fingerprint: Fingerprint,
+        opts: &PersistOptions,
+        notify: Arc<Notify>,
+        erased_defs: HashMap<DefId, Arc<dyn ErasedDef>>,
+    ) -> Self {
         PersistHandle {
             db,
             fingerprint,
+            erased_defs,
             pending: Mutex::new(PendingMap::default()),
             notify,
             flushing: AsyncMutex::new(()),
@@ -499,8 +556,8 @@ impl PersistHandle {
     /// Records that `key`'s node just produced a genuinely new result and
     /// should be (re-)saved at the next flush. `record` must already
     /// reflect that node's state at the moment of the call (see
-    /// [`NodeRecord::snapshot`]).
-    fn enqueue_upsert(&self, key: CompKey, record: NodeRecord) {
+    /// [`PendingRecord::snapshot`]).
+    fn enqueue_upsert(&self, key: CompKey, record: PendingRecord) {
         self.pending.lock().unwrap().upsert(key, record);
         self.notify.notify_one();
     }
@@ -532,8 +589,34 @@ impl PersistHandle {
         let mut deletes: Vec<Vec<u8>> = Vec::new();
         for (key, entry) in &taken.entries {
             match &entry.kind {
-                EntryKind::Upsert(record) => {
-                    let bytes = postcard::to_stdvec(record)
+                // `value_bytes` is derived here, not at enqueue time: this
+                // is the "serialize outside the lock" step (see
+                // `PendingRecord`'s docs) — `EngineInner::nodes` was never
+                // held while any of this ran, and an entry coalesced away by
+                // a fresher enqueue before reaching this point (see
+                // `PendingMap::upsert`) never pays this cost at all.
+                EntryKind::Upsert(pending) => {
+                    let Some(erased_def) = self.erased_defs.get(key.def()) else {
+                        // Can't happen for an entry this handle itself
+                        // enqueued (its def was registered when the owning
+                        // node was created) — defensive, not a real path.
+                        tracing::debug!(
+                            def = %key.def().name(),
+                            "persistence: flush: no erased def for a pending upsert's definition; dropping this entry"
+                        );
+                        continue;
+                    };
+                    let value_bytes = erased_def.serialize_value(&pending.value);
+                    let record = NodeRecord {
+                        def_name: pending.def_name.clone(),
+                        param_bytes: pending.param_bytes.clone(),
+                        comp_deps: pending.comp_deps.clone(),
+                        source_deps: pending.source_deps.clone(),
+                        result_hash: pending.result_hash,
+                        value_bytes,
+                        outputs: pending.outputs.clone(),
+                    };
+                    let bytes = postcard::to_stdvec(&record)
                         .expect("postcard serialization of a well-formed value should not fail");
                     upserts.push((encode_key(key), bytes));
                 }
@@ -788,17 +871,38 @@ impl EngineInner {
         tracing::info!(nodes_restored = restored_count, "persistence: load complete");
 
         let notify = Arc::new(Notify::new());
-        let handle = Arc::new(PersistHandle::new(db, opts.fingerprint, &opts, notify.clone()));
+        let handle = Arc::new(PersistHandle::new(
+            db,
+            opts.fingerprint,
+            &opts,
+            notify.clone(),
+            self.erased_defs.clone(),
+        ));
         *self.persist.lock().unwrap() = Some(handle.clone());
         tokio::spawn(persister_loop(Arc::downgrade(&handle), notify));
     }
 
     /// Turns every decodable, still-registered record into a `Clean`
-    /// [`Node`], inserts it into `self.nodes`, then rebuilds `rdeps` and
-    /// `source_index` from the whole restored batch. Returns the number of
-    /// nodes actually restored.
+    /// [`Node`], inserts every one of them into `self.nodes` (assigning each
+    /// a fresh [`NodeId`]), then — now that every restored node has an id —
+    /// wires up `comp_deps`/`rdeps` and rebuilds `source_index` from the
+    /// whole restored batch. Returns the number of nodes actually restored.
+    ///
+    /// The two-pass shape (decode-and-insert, then wire up edges) is
+    /// required by [`NodeId`]-based edges: a dependency edge can only be
+    /// expressed once *both* of its endpoints already have an id, which
+    /// isn't true of any single record in isolation (it may name a
+    /// dependency that itself appears later in the same batch, or not at
+    /// all — see the second pass's handling of a dangling `comp_deps`
+    /// entry).
     fn restore_nodes(self: &Arc<Self>, records: Vec<NodeRecord>) -> usize {
-        let mut restored: HashMap<CompKey, Node> = HashMap::new();
+        struct PendingNode {
+            key: CompKey,
+            node: Node,
+            comp_dep_keys: Vec<CompKey>,
+        }
+
+        let mut pending: Vec<PendingNode> = Vec::with_capacity(records.len());
 
         for record in records {
             let Some(&def_id) = self.def_names.get(&record.def_name) else {
@@ -811,7 +915,7 @@ impl EngineInner {
             let Some(erased_def) = self.erased_defs.get(&def_id) else {
                 continue;
             };
-            let Some((key, rerun, param_debug)) = erased_def.revive_param(self, &record.param_bytes) else {
+            let Some((key, rerun)) = erased_def.revive_param(self, &record.param_bytes) else {
                 tracing::debug!(def = %record.def_name, "persistence: dropping a record whose param bytes failed to decode");
                 continue;
             };
@@ -820,58 +924,75 @@ impl EngineInner {
                 continue;
             };
 
-            let comp_deps: HashSet<CompKey> =
+            let comp_dep_keys: Vec<CompKey> =
                 record.comp_deps.iter().filter_map(|dep| dep.to_key(&self.def_names)).collect();
             let source_deps: HashSet<RawDep> = record.source_deps.iter().map(RawDepRepr::to_dep).collect();
             let outputs: HashSet<RawOutput> = record.outputs.iter().map(RawOutputRepr::to_output).collect();
 
-            let node = Node::from_persisted(RevivedNode {
-                param_bytes: record.param_bytes,
-                param_debug,
-                value,
-                value_bytes: record.value_bytes,
-                result_hash: Hash256::from_bytes(record.result_hash),
-                comp_deps,
-                source_deps,
-                outputs,
-                rerun,
-            });
-            restored.insert(key, node);
+            let node = Node::from_persisted(
+                key.clone(),
+                RevivedNode {
+                    param_bytes: record.param_bytes,
+                    value,
+                    result_hash: Hash128::from_bytes(record.result_hash),
+                    source_deps,
+                    outputs,
+                    rerun,
+                },
+            );
+            pending.push(PendingNode { key, node, comp_dep_keys });
         }
 
-        let restored_count = restored.len();
+        let restored_count = pending.len();
         if restored_count == 0 {
             return 0;
         }
 
-        // Rebuild `rdeps`: every restored node's `comp_deps` implies a
-        // reverse edge on the callee, mirroring what `record_call_dep`
-        // builds incrementally as a live node actually runs.
-        let rdep_edges: Vec<(CompKey, CompKey)> = restored
-            .iter()
-            .flat_map(|(caller, node)| node.comp_deps.iter().map(|callee| (callee.clone(), caller.clone())))
-            .collect();
-        for (callee, caller) in rdep_edges {
-            if let Some(node) = restored.get_mut(&callee) {
-                node.rdeps.insert(caller);
-            }
+        let mut nodes = self.nodes.lock().unwrap();
+
+        // Pass 1: every restored node gets a `NodeId`.
+        let mut edge_work: Vec<(NodeId, Vec<CompKey>)> = Vec::with_capacity(pending.len());
+        for p in pending {
+            let id = nodes.insert_new(p.key, p.node);
+            edge_work.push((id, p.comp_dep_keys));
         }
 
-        // Rebuild `source_index` the same way `record_source_deps` builds
-        // it incrementally for a live node.
-        {
-            let mut source_index = self.source_index.lock().unwrap();
-            for (key, node) in &restored {
-                for dep in &node.source_deps {
-                    source_index
-                        .entry((dep.source.clone(), dep.key.clone()))
-                        .or_default()
-                        .insert(key.clone());
+        // Pass 2: wire up `comp_deps`/`rdeps` now that every id exists. A
+        // dependency key with no matching id (its own record failed to
+        // decode, or named an unregistered definition) is simply dropped —
+        // exactly as silently as `crate::driver`'s liveness GC already
+        // tolerates a `comp_deps` entry pointing nowhere.
+        for (caller_id, dep_keys) in edge_work {
+            for dep_key in dep_keys {
+                let Some(callee_id) = nodes.id_of(&dep_key) else { continue };
+                if let Some(caller_node) = nodes.get_mut_by_id(caller_id)
+                    && !caller_node.comp_deps.contains(&callee_id)
+                {
+                    caller_node.comp_deps.push(callee_id);
+                }
+                if let Some(callee_node) = nodes.get_mut_by_id(callee_id)
+                    && !callee_node.rdeps.contains(&caller_id)
+                {
+                    callee_node.rdeps.push(caller_id);
                 }
             }
         }
 
-        self.nodes.lock().unwrap().extend(restored);
+        // Rebuild `source_index` the same way `record_source_deps` builds it
+        // incrementally for a live node.
+        let source_index_entries: Vec<(SourceId, KeyBytes, NodeId)> = nodes
+            .iter()
+            .flat_map(|(id, node)| node.source_deps.iter().map(move |dep| (dep.source.clone(), dep.key.clone(), id)))
+            .collect();
+        drop(nodes);
+
+        {
+            let mut source_index = self.source_index.lock().unwrap();
+            for (source, key_bytes, id) in source_index_entries {
+                source_index.entry((source, key_bytes)).or_default().insert(id);
+            }
+        }
+
         restored_count
     }
 }
@@ -892,7 +1013,7 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
     // rely on and easy to deadlock).
     let deps_by_key: HashMap<CompKey, HashSet<RawDep>> = {
         let nodes = engine.nodes.lock().unwrap();
-        nodes.iter().map(|(k, n)| (k.clone(), n.source_deps.clone())).collect()
+        nodes.iter().map(|(_, n)| (n.key.clone(), n.source_deps.clone())).collect()
     };
 
     let mut by_source: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
@@ -950,9 +1071,10 @@ fn mark_dirty_transitive(engine: &EngineInner, initial: HashSet<CompKey>, priori
         let mut next = HashSet::new();
         for key in &frontier {
             if let Some(node) = nodes.get(key) {
-                for rdep in &node.rdeps {
-                    if !seen.contains(rdep) {
-                        next.insert(rdep.clone());
+                for &rdep_id in &node.rdeps {
+                    let Some(rdep_node) = nodes.get_by_id(rdep_id) else { continue };
+                    if !seen.contains(&rdep_node.key) {
+                        next.insert(rdep_node.key.clone());
                     }
                 }
             }
@@ -995,15 +1117,18 @@ impl EngineInner {
     }
 }
 
-/// Snapshots `key`'s node (see [`NodeRecord::snapshot`]) and enqueues it for
-/// the next flush, if persistence is configured. Called by
+/// Snapshots `key`'s node (see [`PendingRecord::snapshot`]) and enqueues it
+/// for the next flush, if persistence is configured. Called by
 /// `EngineInner::run` right after a successful execution whose result hash
-/// actually changed, while `node`'s entry in `EngineInner::nodes` is still
-/// locked — so the snapshot can never race a subsequent rerun of the same
-/// node starting before this enqueue completes.
-pub(crate) fn enqueue_changed(engine: &EngineInner, key: &CompKey, node: &Node) {
+/// actually changed, while `EngineInner::nodes` is still locked — so the
+/// snapshot can never race a subsequent rerun of the same node starting
+/// before this enqueue completes. Only the node's value `Arc` is cloned
+/// under that lock; its postcard bytes are derived later, at flush time,
+/// entirely outside it (see [`PendingRecord`]'s docs).
+pub(crate) fn enqueue_changed(engine: &EngineInner, nodes: &NodeTable, key: &CompKey) {
     let Some(handle) = engine.persist.lock().unwrap().clone() else { return };
-    let Some(record) = NodeRecord::snapshot(key, node) else { return };
+    let Some(node) = nodes.get(key) else { return };
+    let Some(record) = PendingRecord::snapshot(nodes, key, node) else { return };
     handle.enqueue_upsert(key.clone(), record);
 }
 

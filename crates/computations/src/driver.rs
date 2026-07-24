@@ -34,7 +34,7 @@ use futures::future::{BoxFuture, FutureExt, join_all, select_all};
 use tracing::Instrument;
 
 use crate::def::Comp;
-use crate::engine::{DirtyPriority, Engine, EngineInner, NodeState, RerunFn};
+use crate::engine::{DirtyPriority, Engine, EngineInner, NodeId, NodeState, RerunFn};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
@@ -311,16 +311,15 @@ impl EngineInner {
         let nodes = self.nodes.lock().unwrap();
         let mut affected = HashSet::new();
         for dep in changed {
-            let Some(keys) = index.get(&(dep.source.clone(), dep.key.clone())) else {
+            let Some(ids) = index.get(&(dep.source.clone(), dep.key.clone())) else {
                 continue;
             };
-            for key in keys {
-                if let Some(node) = nodes.get(key)
-                    && node.source_deps.contains(dep)
-                {
+            for &id in ids {
+                let Some(node) = nodes.get_by_id(id) else { continue };
+                if node.source_deps.contains(dep) {
                     continue;
                 }
-                affected.insert(key.clone());
+                affected.insert(node.key.clone());
             }
         }
         affected
@@ -572,9 +571,10 @@ impl EngineInner {
                             continue;
                         };
                         if node.last_changed {
-                            for rdep in &node.rdeps {
-                                if !done.contains(rdep) {
-                                    next_frontier.insert(rdep.clone());
+                            for &rdep_id in &node.rdeps {
+                                let Some(rdep_node) = nodes.get_by_id(rdep_id) else { continue };
+                                if !done.contains(&rdep_node.key) {
+                                    next_frontier.insert(rdep_node.key.clone());
                                 }
                             }
                         } else {
@@ -626,33 +626,36 @@ impl EngineInner {
         let (dead_keys, outputs_by_sink, dead_source_deps) = {
             let mut nodes = self.nodes.lock().unwrap();
 
-            let mut reachable: HashSet<CompKey> = HashSet::new();
-            let mut stack: Vec<CompKey> = {
+            let mut reachable: HashSet<NodeId> = HashSet::new();
+            let mut stack: Vec<NodeId> = {
                 let roots = self.roots.lock().unwrap();
-                roots.iter().cloned().collect()
+                roots.iter().filter_map(|key| nodes.id_of(key)).collect()
             };
-            while let Some(key) = stack.pop() {
-                if !reachable.insert(key.clone()) {
+            while let Some(id) = stack.pop() {
+                if !reachable.insert(id) {
                     continue;
                 }
-                if let Some(node) = nodes.get(&key) {
-                    for dep in &node.comp_deps {
-                        if !reachable.contains(dep) {
-                            stack.push(dep.clone());
+                if let Some(node) = nodes.get_by_id(id) {
+                    for &dep in &node.comp_deps {
+                        if !reachable.contains(&dep) {
+                            stack.push(dep);
                         }
                     }
                 }
             }
 
-            let dead_keys: Vec<CompKey> = nodes.keys().filter(|k| !reachable.contains(k)).cloned().collect();
-            if dead_keys.is_empty() {
+            let dead_ids: HashSet<NodeId> =
+                nodes.iter().map(|(id, _)| id).filter(|id| !reachable.contains(id)).collect();
+            if dead_ids.is_empty() {
                 return GcStats::default();
             }
 
+            let mut dead_keys: Vec<CompKey> = Vec::with_capacity(dead_ids.len());
             let mut outputs_by_sink: HashMap<SinkId, Vec<OutBytes>> = HashMap::new();
             let mut dead_source_deps: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
-            for key in &dead_keys {
-                if let Some(node) = nodes.remove(key) {
+            for &id in &dead_ids {
+                if let Some(node) = nodes.remove_by_id(id) {
+                    dead_keys.push(node.key);
                     for RawOutput { sink, out } in node.outputs {
                         outputs_by_sink.entry(sink).or_default().push(out);
                     }
@@ -665,16 +668,14 @@ impl EngineInner {
             {
                 let mut index = self.source_index.lock().unwrap();
                 index.retain(|_, callers| {
-                    for key in &dead_keys {
-                        callers.remove(key);
+                    for id in &dead_ids {
+                        callers.remove(id);
                     }
                     !callers.is_empty()
                 });
             }
             for node in nodes.values_mut() {
-                for key in &dead_keys {
-                    node.rdeps.remove(key);
-                }
+                node.rdeps.retain(|id| !dead_ids.contains(id));
             }
 
             (dead_keys, outputs_by_sink, dead_source_deps)

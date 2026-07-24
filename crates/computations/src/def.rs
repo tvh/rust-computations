@@ -50,20 +50,33 @@ pub(crate) trait ErasedDef: Send + Sync {
     /// The "param reviver": decodes `param_bytes` as this definition's
     /// param type and, on success, returns the `CompKey` it identifies
     /// (recomputed by hashing the decoded param, exactly as a live
-    /// [`CompKey::new`] would), a `rerun` closure for it (byte-for-byte the
-    /// same closure shape [`EngineInner::make_rerun`] builds for a live
-    /// node), and its `Debug`-rendered param string (mirroring the
-    /// `param_debug` a live node's `prepare()` computes).
+    /// [`CompKey::new`] would) and a `rerun` closure for it (byte-for-byte
+    /// the same closure shape [`EngineInner::make_rerun`] builds for a live
+    /// node).
     ///
     /// Returns `None` if `param_bytes` fails to decode as this definition's
     /// param type — a corrupt or stale record, dropped by the caller rather
     /// than treated as fatal.
-    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn, String)>;
+    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn)>;
 
     /// The "value reviver": decodes `value_bytes` as this definition's
     /// result type, erased. Returns `None` if the bytes fail to decode (a
     /// corrupt or stale record).
     fn revive_value(&self, value_bytes: &[u8]) -> Option<Arc<dyn Any + Send + Sync>>;
+
+    /// The "value serializer": postcard-encodes an erased value as this
+    /// definition's result type — the counterpart of [`Self::revive_value`],
+    /// used by `crate::persist` to encode a node's cached value for the
+    /// `nodes` table without `Node` itself needing to keep a pre-serialized
+    /// copy around (see `crate::engine::Node`).
+    ///
+    /// # Panics
+    /// Panics if `value`'s concrete type doesn't match this definition's
+    /// result type `R`. This is never a data-integrity concern in practice:
+    /// every `value` this is called with was itself produced by this same
+    /// definition's body (see `crate::engine::EngineInner::run`), so the
+    /// downcast can only fail from an engine bug, not from untrusted input.
+    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Vec<u8>;
 }
 
 /// Adapts a concrete `CompDef<P, R>` to the erased [`ErasedDef`] interface.
@@ -72,17 +85,23 @@ pub(crate) trait ErasedDef: Send + Sync {
 pub(crate) struct DefAdapter<P, R>(pub Arc<CompDef<P, R>>);
 
 impl<P: CompParam, R: CompResult> ErasedDef for DefAdapter<P, R> {
-    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn, String)> {
+    fn revive_param(&self, engine: &Arc<EngineInner>, param_bytes: &[u8]) -> Option<(CompKey, RerunFn)> {
         let param: P = postcard::from_bytes(param_bytes).ok()?;
         let key = CompKey::new(self.0.id, &param);
-        let param_debug = format!("{param:?}");
         let rerun = engine.make_rerun::<P, R>(self.0.id, param);
-        Some((key, rerun, param_debug))
+        Some((key, rerun))
     }
 
     fn revive_value(&self, value_bytes: &[u8]) -> Option<Arc<dyn Any + Send + Sync>> {
         let value: R = postcard::from_bytes(value_bytes).ok()?;
         Some(Arc::new(value) as Arc<dyn Any + Send + Sync>)
+    }
+
+    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Vec<u8> {
+        let typed: &R = value
+            .downcast_ref::<R>()
+            .expect("serialize_value: value's concrete type must match this definition's result type");
+        postcard::to_stdvec(typed).expect("postcard serialization of a well-formed value should not fail")
     }
 }
 

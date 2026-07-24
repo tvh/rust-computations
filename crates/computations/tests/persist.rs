@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use computations::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
-use computations::{Comp, Engine, Fingerprint, PersistOptions, Registry};
+use computations::{Comp, CompKey, DirtyPriority, Engine, Fingerprint, PersistOptions, Registry};
 
 /// Polls `f` every 10ms until it returns `true`, panicking if 5s pass first.
 async fn wait_until(f: impl Fn() -> bool) {
@@ -1088,6 +1088,136 @@ async fn crash_after_known_flush_point_loses_only_unflushed_tail() {
         sink.get("doc_a"),
         Some("after".to_string()),
         "the recompute must reproduce the current, correct value"
+    );
+
+    handle2.abort();
+}
+
+/// A restarted engine's persisted records must carry enough to rebuild the
+/// full dependency graph, not merely enough for the root itself to be a
+/// cache hit (which alone proves nothing about `comp_deps`: a `Clean` root
+/// short-circuits `prepare()` without ever visiting its dependencies at
+/// all). This test specifically exercises `comp_deps`/`rdeps` restoration
+/// (in-memory, keyed by `NodeId` — see `crate::engine::NodeId`) by forcing a
+/// liveness GC pass after restart and confirming a dependency reachable
+/// only via `root`'s restored `comp_deps` survives it, rather than being
+/// incorrectly collected as unreachable — which is exactly what would
+/// happen if a record's persisted `def_name` + `param_hash` pairs failed to
+/// resolve back into a live edge on restart.
+#[tokio::test]
+async fn restart_restores_comp_deps_sufficient_for_liveness_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("graph.redb");
+
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("a", "1").await;
+
+    fn build(
+        kv: &Arc<MemKvSource>,
+        sink: &Arc<VecSink>,
+        db_path: &std::path::Path,
+        counter: &Arc<AtomicUsize>,
+    ) -> (Engine, Comp<(), ()>) {
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+        registry.register_sink(sink.clone());
+
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+        builder.persistence(persist_opts(db_path, "fp-v1"));
+
+        let leaf: Comp<(), ()> = builder.define("gc_leaf", {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                let sink = sink.clone();
+                async move {
+                    let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                    ctx.sink_req(
+                        &sink,
+                        WriteDoc {
+                            name: "doc_leaf".to_string(),
+                            content: val,
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        });
+
+        let root: Comp<(), ()> = builder.define("gc_root", {
+            let counter = counter.clone();
+            move |ctx, _: ()| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    ctx.eval(leaf, ()).await?;
+                    Ok(())
+                }
+            }
+        });
+
+        (builder.build(), root)
+    }
+
+    let counter1 = Arc::new(AtomicUsize::new(0));
+    let (engine1, root1) = build(&kv, &sink, &db_path, &counter1);
+    let handle1 = {
+        let engine1 = engine1.clone();
+        tokio::spawn(async move { engine1.run(root1, ()).await })
+    };
+    wait_until(|| sink.get("doc_leaf") == Some("1".to_string())).await;
+    engine1.persist_now().await;
+    engine1.persist_close();
+    handle1.abort();
+    let _ = handle1.await;
+    drop(engine1);
+
+    let counter2 = Arc::new(AtomicUsize::new(0));
+    let (engine2, root2) = build(&kv, &sink, &db_path, &counter2);
+    let handle2 = {
+        let engine2 = engine2.clone();
+        tokio::spawn(async move { engine2.run(root2, ()).await })
+    };
+
+    // Give the restart's initial evaluation + startup GC a moment to settle
+    // as a pure cache hit (proves nothing about `comp_deps` on its own —
+    // see this test's doc comment — but establishes the baseline).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(counter2.load(Ordering::SeqCst), 0, "root must be a pure cache hit after restart");
+    assert_eq!(sink.get("doc_leaf"), Some("1".to_string()), "restored output must survive startup GC");
+
+    // Now force a real propagation round (and the liveness GC pass that
+    // unconditionally follows it, even an empty round — see
+    // `crate::driver::Engine::run`) *without* touching `root` or `leaf`:
+    // mark a bogus key with no corresponding node dirty. `mark_dirty` wakes
+    // the driver loop regardless of whether a node exists for the key (see
+    // `EngineInner::mark_dirty`), so this triggers `propagate` (a no-op:
+    // `split_by_tier` drops a key with no node) immediately followed by
+    // `liveness_gc` — whose mark-sweep walks `root`'s *restored* `comp_deps`
+    // (never re-established live, since `root` itself never reran) to
+    // decide what's still reachable. If those edges hadn't been correctly
+    // rebuilt from the persisted `def_name`/`param_hash` pairs on restore,
+    // `leaf` would look unreachable and get collected: its sink output
+    // deleted.
+    let bogus_key = CompKey::new(computations::DefId::new("no_such_computation"), &());
+    let mut keys = std::collections::HashSet::new();
+    keys.insert(bogus_key);
+    engine2.mark_dirty(&keys, DirtyPriority::Input);
+
+    // No observable "round complete" signal is exposed publicly; a fixed
+    // settle window is the same pattern this file already uses elsewhere
+    // (e.g. the plain cache-hit check above).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(counter2.load(Ordering::SeqCst), 0, "root must still never have rerun");
+    assert_eq!(
+        sink.get("doc_leaf"),
+        Some("1".to_string()),
+        "leaf's output must survive liveness GC: it is only reachable via root's restored comp_deps edge"
     );
 
     handle2.abort();

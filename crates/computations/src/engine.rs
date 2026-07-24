@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, FutureExt, Shared};
+use smallvec::SmallVec;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::Instrument;
 
@@ -34,16 +35,21 @@ use crate::def::{
     Comp, CompDef, DefAdapter, ErasedDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with,
 };
 use crate::error::CompError;
-use crate::key::{CompKey, CompParam, CompResult, DefId, Hash256};
+use crate::key::{CompKey, CompParam, CompResult, DefId, Hash128};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
 use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceBase, SourceId};
 
-/// The result of one execution: the (erased) value, its postcard-encoded
-/// bytes (persisted verbatim by `crate::persist`), its content hash, and how
-/// long the body itself took to run (for the `comp.eval` tracing event).
-type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Vec<u8>, Hash256, Duration), CompError>;
+/// The result of one execution: the (erased) value, its content hash, and
+/// how long the body itself took to run (for the `comp.eval` tracing
+/// event). The postcard-encoded bytes needed to compute the hash are a
+/// local of the execution future itself (see `EngineInner::run`) — never
+/// carried any further, since neither `Node` nor this result type keeps a
+/// serialized copy around; `crate::persist` re-serializes lazily, from the
+/// erased value, only for a node that is actually about to be persisted
+/// (see `crate::def::ErasedDef::serialize_value`).
+type ExecResult = Result<(Arc<dyn Any + Send + Sync>, Hash128, Duration), CompError>;
 /// The shared, joinable handle to an in-flight execution.
 type SharedExec = Shared<BoxFuture<'static, ExecResult>>;
 /// A closure that re-executes a node's computation via the normal eval path.
@@ -87,6 +93,24 @@ pub enum DirtyPriority {
     Input = 2,
 }
 
+/// The identity of a node's slot in [`EngineInner`]'s slab (`NodeTable`).
+///
+/// Unlike [`CompKey`] (a computation's stable, content-addressed identity),
+/// a `NodeId` is only a cheap (4-byte) local handle into the *current*
+/// process's in-memory node table: it is never persisted, never compared
+/// across restarts, and is only valid until the node it names is collected
+/// by [`crate::driver`]'s liveness GC — at which point its slot may be
+/// reused for a completely unrelated node. Every long-lived reference to a
+/// computation (a [`RerunFn`] closure, a persisted record, `roots`) is keyed
+/// by `CompKey` instead, precisely so it can never be invalidated by GC
+/// reusing a `NodeId`; `NodeId` is used purely as an edge (`comp_deps`,
+/// `rdeps`, `source_index`) representation inside a single process's live
+/// node table, translated back to a `CompKey` (via [`Node::key`]) whenever
+/// an edge needs to leave that table (persistence, driver-level dirty
+/// bookkeeping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NodeId(u32);
+
 /// One computation application's memoized state.
 pub(crate) struct Node {
     pub(crate) state: NodeState,
@@ -96,27 +120,69 @@ pub(crate) struct Node {
     /// processed at). Set — and merged via max, "max priority wins" — by
     /// [`crate::driver`]'s dirtying paths; see [`DirtyPriority`].
     pub(crate) dirty_priority: Option<DirtyPriority>,
+    /// This node's own stable identity — the `NodeTable`'s `CompKey` index
+    /// entry, duplicated here so a `NodeId` can be translated back to its
+    /// `CompKey` in O(1) (needed by GC, persistence snapshotting, and the
+    /// driver's rdeps-to-dirty-keys translation) without a second, reverse
+    /// index.
+    pub(crate) key: CompKey,
     /// The cached result, erased. `Some` even when `state == Dirty` (a
     /// stale-but-not-yet-superseded value), `None` only before the first
     /// successful execution.
-    value: Option<Arc<dyn Any + Send + Sync>>,
-    /// Postcard-encoded bytes of `value`, kept alongside it so
-    /// `crate::persist` can save a node's cached result without needing to
-    /// know its concrete result type. `Some` exactly when `value` is.
-    pub(crate) value_bytes: Option<Vec<u8>>,
-    pub(crate) result_hash: Option<Hash256>,
+    ///
+    /// Deliberately *not* accompanied by a pre-serialized `value_bytes`
+    /// field: `crate::persist` re-derives postcard bytes lazily, from this
+    /// `Arc`, only for a node actually about to be flushed (see
+    /// `crate::def::ErasedDef::serialize_value`), rather than every node
+    /// permanently carrying a redundant serialized copy of its own value in
+    /// memory.
+    pub(crate) value: Option<Arc<dyn Any + Send + Sync>>,
+    pub(crate) result_hash: Option<Hash128>,
     /// Postcard-encoded bytes of this node's parameter, computed once when
     /// the node is first created (a `CompKey`'s param never changes across
     /// reruns of that same key). Read by `crate::persist` to save a node
     /// without needing to know its concrete parameter type.
+    ///
+    /// Kept eagerly serialized (unlike `value`) rather than lazily derived
+    /// from a stored erased param: a param is written exactly once per node
+    /// (never re-serialized on rerun, so it never duplicates work the way an
+    /// eager `value_bytes` used to on every changed rerun) and is typically
+    /// far smaller than a result value (a single hashable lookup key vs. a
+    /// potentially large aggregated/computed value) — storing it erased
+    /// (`Arc<dyn Any>` plus a deferred serializer call) would cost at least
+    /// as much memory as the bytes themselves, for no reruns-avoided upside.
     pub(crate) param_bytes: Vec<u8>,
-    /// Computations this node called during its last execution.
-    pub(crate) comp_deps: HashSet<CompKey>,
+    /// Computations this node called during its last execution, by
+    /// [`NodeId`] rather than the full [`CompKey`] each edge would otherwise
+    /// have to repeat.
+    ///
+    /// A `SmallVec` rather than a `HashSet`: fan-out is small in practice, so
+    /// a linear dedup-on-insert scan (see `EngineInner::record_call_dep`) is
+    /// cheaper in both time and space than a hash table's per-entry
+    /// overhead at this size — a deliberate small-set tradeoff, not an
+    /// oversight.
+    pub(crate) comp_deps: SmallVec<[NodeId; 4]>,
     /// Source reads this node made during its last execution.
+    ///
+    /// Deliberately still a `HashSet`, unlike `comp_deps`/`rdeps`: measured
+    /// on the 1M-node persistence benchmark, switching this to a small
+    /// inline `SmallVec` was a net *loss*, not a win — most nodes in that
+    /// benchmark (and, more importantly, in general: any node that doesn't
+    /// read a source at all, e.g. one whose only job is combining other
+    /// computations) have *zero* source deps, and a `SmallVec`'s inline
+    /// capacity is reserved unconditionally even when empty. With
+    /// `RawDep`'s size (source id + two byte buffers), reserving even a
+    /// 1-2 element inline array on every node costs more than a never-
+    /// touched `HashSet` (no allocation at all until the first insert) —
+    /// the opposite of `comp_deps`/`rdeps`, whose `NodeId` elements are
+    /// small enough, and whose typical count is non-zero often enough, for
+    /// the inline reservation to pay for itself.
     pub(crate) source_deps: HashSet<RawDep>,
-    /// Computations that called this node during their last execution.
-    pub(crate) rdeps: HashSet<CompKey>,
-    /// Sink outputs this node produced during its last execution.
+    /// Computations that called this node during their last execution, by
+    /// [`NodeId`] (see `comp_deps`'s docs for why `SmallVec` and why by id).
+    pub(crate) rdeps: SmallVec<[NodeId; 4]>,
+    /// Sink outputs this node produced during its last execution. Still a
+    /// `HashSet`, for the same reason as `source_deps`.
     pub(crate) outputs: HashSet<RawOutput>,
     /// Whether the last successful execution's result hash differed from
     /// the one before it (early cutoff signal).
@@ -126,11 +192,14 @@ pub(crate) struct Node {
     pub(crate) last_changed: bool,
     inflight: Option<SharedExec>,
     /// Called by the driver during change propagation to re-execute a
-    /// dirtied node through the normal eval path.
+    /// dirtied node through the normal eval path. Captures only `DefId`
+    /// (`Copy`) and the typed, owned parameter — never a `CompKey` or
+    /// `NodeId` — recomputing the current `CompKey` itself on every call
+    /// (see `EngineInner::make_rerun`); this is what makes it safe for a
+    /// `rerun` closure to long-outlive the `NodeId` (never `Copy`-captured
+    /// here in the first place) of whatever node currently holds it, across
+    /// any number of GC slot-reuse cycles.
     pub(crate) rerun: RerunFn,
-    /// `Debug`-rendered param, for diagnostics (tracing, panic messages)
-    /// without needing `Node` itself to be generic over `P`.
-    param_debug: String,
 }
 
 impl Node {
@@ -138,27 +207,27 @@ impl Node {
     /// record's revived pieces (see `crate::persist`), without ever having
     /// executed the computation in this process.
     ///
-    /// `rdeps` starts empty: `crate::persist`'s loader rebuilds it
-    /// afterward, once every record has been turned into a `Node` this way,
-    /// by walking every loaded node's `comp_deps` (mirroring how a live
-    /// node's `rdeps` are built incrementally by `EngineInner::record_call_dep`
-    /// as it actually runs).
-    pub(crate) fn from_persisted(revived: RevivedNode) -> Node {
+    /// `comp_deps`/`rdeps` both start empty: `crate::persist`'s loader wires
+    /// them up itself afterward, once every record in the batch has a
+    /// [`NodeId`] (a dependency edge can only be expressed once both of its
+    /// endpoints are already in the table), mirroring how a live node's
+    /// edges are built incrementally by `EngineInner::record_call_dep` as it
+    /// actually runs.
+    pub(crate) fn from_persisted(key: CompKey, revived: RevivedNode) -> Node {
         Node {
             state: NodeState::Clean,
             dirty_priority: None,
+            key,
             value: Some(revived.value),
-            value_bytes: Some(revived.value_bytes),
             result_hash: Some(revived.result_hash),
             param_bytes: revived.param_bytes,
-            comp_deps: revived.comp_deps,
+            comp_deps: SmallVec::new(),
             source_deps: revived.source_deps,
-            rdeps: HashSet::new(),
+            rdeps: SmallVec::new(),
             outputs: revived.outputs,
             last_changed: false,
             inflight: None,
             rerun: revived.rerun,
-            param_debug: revived.param_debug,
         }
     }
 }
@@ -166,24 +235,141 @@ impl Node {
 /// Every piece [`Node::from_persisted`] needs to revive a `Clean` node from
 /// a persisted record, bundled into one struct purely to keep that
 /// constructor's argument list manageable (see `crate::persist`, which
-/// builds one of these per decodable, still-registered record).
+/// builds one of these per decodable, still-registered record). Excludes
+/// `comp_deps` (and the node's own `CompKey`, passed to `from_persisted`
+/// separately): both need every record in the batch to already have a
+/// [`NodeId`] before they can be resolved, which `crate::persist::restore_nodes`
+/// therefore does itself, after every record has been turned into a `Node`.
 pub(crate) struct RevivedNode {
     pub(crate) param_bytes: Vec<u8>,
-    pub(crate) param_debug: String,
     pub(crate) value: Arc<dyn Any + Send + Sync>,
-    pub(crate) value_bytes: Vec<u8>,
-    pub(crate) result_hash: Hash256,
-    pub(crate) comp_deps: HashSet<CompKey>,
+    pub(crate) result_hash: Hash128,
     pub(crate) source_deps: HashSet<RawDep>,
     pub(crate) outputs: HashSet<RawOutput>,
     pub(crate) rerun: RerunFn,
+}
+
+/// The engine's node table: a slab (`Vec<Option<Node>>` plus a free list) of
+/// every live node, addressable either by its stable [`CompKey`] (via an
+/// index) or by its process-local [`NodeId`] (a direct slab slot).
+///
+/// This is the in-memory analogue of what used to be a plain
+/// `HashMap<CompKey, Node>`: every method that existed on that map
+/// (`get`/`get_mut`/`keys`/`values`/`values_mut`) is preserved here with the
+/// same `CompKey`-keyed signature, so most call sites needed no changes at
+/// all when this replaced it — only code that stores or walks *edges*
+/// (`comp_deps`/`rdeps`/`source_index`) needed to switch to the `NodeId`-based
+/// methods (`get_by_id`/`get_mut_by_id`/`id_of`) to get the point of this
+/// type: an edge only needs 4 bytes (`NodeId`), not 32 (`CompKey`).
+#[derive(Default)]
+pub(crate) struct NodeTable {
+    slots: Vec<Option<Node>>,
+    free: Vec<u32>,
+    index: HashMap<CompKey, NodeId>,
+}
+
+impl NodeTable {
+    fn new() -> Self {
+        NodeTable::default()
+    }
+
+    pub(crate) fn id_of(&self, key: &CompKey) -> Option<NodeId> {
+        self.index.get(key).copied()
+    }
+
+    pub(crate) fn get(&self, key: &CompKey) -> Option<&Node> {
+        let id = *self.index.get(key)?;
+        self.slots[id.0 as usize].as_ref()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &CompKey) -> Option<&mut Node> {
+        let id = *self.index.get(key)?;
+        self.slots[id.0 as usize].as_mut()
+    }
+
+    pub(crate) fn get_by_id(&self, id: NodeId) -> Option<&Node> {
+        self.slots.get(id.0 as usize)?.as_ref()
+    }
+
+    pub(crate) fn get_mut_by_id(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.slots.get_mut(id.0 as usize)?.as_mut()
+    }
+
+    /// Inserts a brand-new node under `key` (which must equal `node.key`;
+    /// enforced here rather than trusted, since a caller mismatch would
+    /// otherwise silently corrupt the id<->key mapping), returning its
+    /// freshly assigned `NodeId`. Reuses a GC-freed slab slot if one is
+    /// available (see `Self::remove_by_id`), otherwise grows the slab.
+    ///
+    /// Callers must ensure `key` is not already present — [`Self::get_or_insert_with`]
+    /// is the coalescing variant used by the ordinary "cache miss, create a
+    /// node" path.
+    pub(crate) fn insert_new(&mut self, key: CompKey, mut node: Node) -> NodeId {
+        debug_assert_eq!(node.key, key, "Node::key must match the key it is inserted under");
+        node.key = key.clone();
+        let id = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot as usize] = Some(node);
+                NodeId(slot)
+            }
+            None => {
+                let idx = self.slots.len() as u32;
+                self.slots.push(Some(node));
+                NodeId(idx)
+            }
+        };
+        self.index.insert(key, id);
+        id
+    }
+
+    /// Returns the existing node for `key` if present, otherwise builds one
+    /// via `make` and inserts it — the id/node pair either way. `make`'s
+    /// result's `key` field is overwritten with `key` regardless of what it
+    /// sets, so callers may leave it at any placeholder value.
+    pub(crate) fn get_or_insert_with(&mut self, key: &CompKey, make: impl FnOnce() -> Node) -> (NodeId, &mut Node) {
+        if let Some(&id) = self.index.get(key) {
+            (id, self.slots[id.0 as usize].as_mut().expect("slab slot present for an indexed key"))
+        } else {
+            let id = self.insert_new(key.clone(), make());
+            (id, self.slots[id.0 as usize].as_mut().expect("just inserted"))
+        }
+    }
+
+    /// Removes and returns the node at `id` (if any), freeing its slab slot
+    /// for reuse by a future [`Self::insert_new`]/[`Self::get_or_insert_with`]
+    /// call — which is exactly why a [`NodeId`] must never be treated as
+    /// stable across a GC pass (see [`NodeId`]'s docs): the slot this
+    /// returns can be handed out again, for an entirely unrelated `CompKey`,
+    /// the very next time a node is created.
+    pub(crate) fn remove_by_id(&mut self, id: NodeId) -> Option<Node> {
+        let node = self.slots.get_mut(id.0 as usize)?.take()?;
+        self.index.remove(&node.key);
+        self.free.push(id.0);
+        Some(node)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &CompKey> {
+        self.index.keys()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Node> {
+        self.slots.iter().filter_map(|s| s.as_ref())
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.slots.iter_mut().filter_map(|s| s.as_mut())
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|n| (NodeId(i as u32), n)))
+    }
 }
 
 /// The node's state just before a fresh run, snapshotted so the run can
 /// diff against it afterwards (early cutoff, dropped outputs, stale source
 /// index entries).
 struct PreRunSnapshot {
-    old_hash: Option<Hash256>,
+    old_hash: Option<Hash128>,
     old_outputs: HashSet<RawOutput>,
     old_source_deps: HashSet<RawDep>,
 }
@@ -200,11 +386,13 @@ enum Action {
 /// never held locked across an `.await`.
 pub(crate) struct EngineInner {
     defs: Mutex<HashMap<DefId, Arc<dyn Any + Send + Sync>>>,
-    pub(crate) nodes: Mutex<HashMap<CompKey, Node>>,
+    pub(crate) nodes: Mutex<NodeTable>,
     /// Maintained on every dependency (re-)collection so the driver can map
     /// a changed (source, key) pair back to the computations that read it,
-    /// without scanning the whole node table.
-    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<CompKey>>>,
+    /// without scanning the whole node table. Stores [`NodeId`]s rather than
+    /// full [`CompKey`]s for the same reason `Node::comp_deps`/`rdeps` do —
+    /// see [`NodeId`]'s docs.
+    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<NodeId>>>,
     /// Root applications (evaluated via `Engine::eval_root`), so the
     /// driver's liveness GC knows which nodes are reachable from outside the
     /// graph and must not be collected even with no `rdeps`.
@@ -316,22 +504,21 @@ impl EngineInner {
         }
 
         let rerun: RerunFn = self.make_rerun::<P, R>(*def_id, param.clone());
-        let node = nodes.entry(key.clone()).or_insert_with(|| Node {
+        let (_id, node) = nodes.get_or_insert_with(key, || Node {
             state: NodeState::Dirty,
             dirty_priority: None,
+            key: key.clone(),
             value: None,
-            value_bytes: None,
             result_hash: None,
             param_bytes: postcard::to_stdvec(param)
                 .expect("postcard serialization of a well-formed value should not fail"),
-            comp_deps: HashSet::new(),
+            comp_deps: SmallVec::new(),
             source_deps: HashSet::new(),
-            rdeps: HashSet::new(),
+            rdeps: SmallVec::new(),
             outputs: HashSet::new(),
             last_changed: false,
             inflight: None,
             rerun,
-            param_debug: format!("{param:?}"),
         });
 
         let old_hash = node.result_hash;
@@ -388,19 +575,28 @@ impl EngineInner {
             chain: Arc::new(child_chain),
         };
 
+        // `param` is about to be moved into the execution future below, but
+        // the "executed" completion event further down wants to render it
+        // for diagnostics — never stored on `Node` (see its docs), so this
+        // is the one place left with the typed param in scope. Guarding the
+        // clone itself behind `tracing::enabled!` means a disabled DEBUG
+        // level pays neither the clone nor the eventual `format!`.
+        let param_for_trace = if tracing::enabled!(tracing::Level::DEBUG) { Some(param.clone()) } else { None };
+
         let fut: BoxFuture<'static, ExecResult> = Box::pin(async move {
             let start = Instant::now();
             let result = (def.body)(ctx, param).await?;
             let elapsed = start.elapsed();
-            // Hashed directly from `value_bytes` (rather than via
-            // `StableHash::stable_hash`) so the postcard encoding needed for
-            // early cutoff and the one `crate::persist` saves are the same
-            // bytes, computed once.
+            // `value_bytes` here is purely a local scratch encoding for the
+            // content hash below (early cutoff) — it is never returned or
+            // stored on the node (see `Node::value`'s docs); `crate::persist`
+            // re-derives its own copy, lazily, only for a node that actually
+            // needs to be flushed.
             let value_bytes = postcard::to_stdvec(&result)
                 .expect("postcard serialization of a well-formed value should not fail");
-            let hash = Hash256::from_bytes(*blake3::hash(&value_bytes).as_bytes());
+            let hash = Hash128::from_blake3(blake3::hash(&value_bytes));
             let value: Arc<dyn Any + Send + Sync> = Arc::new(result);
-            Ok((value, value_bytes, hash, elapsed))
+            Ok((value, hash, elapsed))
         });
         let shared: SharedExec = fut.shared();
 
@@ -414,20 +610,21 @@ impl EngineInner {
         let outcome = shared.await;
 
         match outcome {
-            Ok((value_any, value_bytes, hash, elapsed)) => {
+            Ok((value_any, hash, elapsed)) => {
                 let changed = old_hash != Some(hash);
-                let (new_source_deps, new_outputs, param_debug) = {
+                let (id, new_source_deps, new_outputs) = {
                     let mut nodes = self.nodes.lock().unwrap();
-                    let node = nodes
-                        .get_mut(key)
-                        .expect("node present: created by prepare() before run() is called");
-                    node.state = NodeState::Clean;
-                    node.dirty_priority = None;
-                    node.value = Some(value_any.clone());
-                    node.value_bytes = Some(value_bytes);
-                    node.result_hash = Some(hash);
-                    node.last_changed = changed;
-                    node.inflight = None;
+                    {
+                        let node = nodes
+                            .get_mut(key)
+                            .expect("node present: created by prepare() before run() is called");
+                        node.state = NodeState::Clean;
+                        node.dirty_priority = None;
+                        node.value = Some(value_any.clone());
+                        node.result_hash = Some(hash);
+                        node.last_changed = changed;
+                        node.inflight = None;
+                    }
 
                     // Only a genuinely changed result needs a fresh save: a
                     // recomputation that hit early cutoff already has its
@@ -439,29 +636,38 @@ impl EngineInner {
                     // `crate::persist`'s background flush race-free: the
                     // record it eventually writes is exactly this node's
                     // state at this instant, never a state some later
-                    // (possibly concurrent) rerun has since overwritten.
+                    // (possibly concurrent) rerun has since overwritten. Only
+                    // the node's *value* `Arc` is cloned under this lock
+                    // (cheap, a refcount bump); the postcard bytes
+                    // `crate::persist` actually writes are serialized later,
+                    // outside this lock entirely (see
+                    // `crate::persist::enqueue_changed`).
                     if changed {
-                        crate::persist::enqueue_changed(self, key, node);
+                        crate::persist::enqueue_changed(self, &nodes, key);
                     }
 
-                    (node.source_deps.clone(), node.outputs.clone(), node.param_debug.clone())
+                    let node = nodes.get(key).expect("node present: just updated above");
+                    let id = nodes.id_of(key).expect("id present: just looked up its node above");
+                    (id, node.source_deps.clone(), node.outputs.clone())
                 };
 
-                self.remove_stale_source_index(key, &old_source_deps, &new_source_deps);
+                self.remove_stale_source_index(id, &old_source_deps, &new_source_deps);
 
                 let dropped_outputs: HashSet<RawOutput> =
-                    old_outputs.difference(&new_outputs).cloned().collect();
+                    old_outputs.iter().filter(|o| !new_outputs.contains(o)).cloned().collect();
                 if !dropped_outputs.is_empty() {
                     self.delete_dropped_outputs(dropped_outputs).await;
                 }
 
-                tracing::debug!(
-                    outcome = "executed",
-                    changed,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    param = %param_debug,
-                    "comp.eval finished"
-                );
+                if let Some(param) = param_for_trace {
+                    tracing::debug!(
+                        outcome = "executed",
+                        changed,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        param = format!("{param:?}"),
+                        "comp.eval finished"
+                    );
+                }
                 downcast_value::<R>(value_any, key)
             }
             Err(e) => {
@@ -496,7 +702,7 @@ impl EngineInner {
     /// registration for that identical pair one statement later,
     /// orphaning it: the very next change to that key would then map to no
     /// node at all in `affected_keys`, permanently.
-    fn remove_stale_source_index(&self, key: &CompKey, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
+    fn remove_stale_source_index(&self, id: NodeId, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
         if old == new {
             return;
         }
@@ -509,7 +715,7 @@ impl EngineInner {
                 continue;
             }
             if let Some(set) = index.get_mut(&idx_key) {
-                set.remove(key);
+                set.remove(&id);
                 if set.is_empty() {
                     index.remove(&idx_key);
                 }
@@ -575,7 +781,7 @@ impl EngineInner {
                     downcast_value::<R>(v, &key)?
                 }
                 Action::Join(shared) => match shared.await {
-                    Ok((v, _value_bytes, _hash, _elapsed)) => {
+                    Ok((v, _hash, _elapsed)) => {
                         tracing::debug!(outcome = "dedup_join", "comp.eval finished");
                         downcast_value::<R>(v, &key)?
                     }
@@ -593,13 +799,24 @@ impl EngineInner {
         .await
     }
 
+    /// Records a `caller -> callee` call edge, deduping on insert: both
+    /// `comp_deps`/`rdeps` are small `SmallVec`s (see [`Node`]'s docs), so a
+    /// linear "already present?" scan before pushing is the deliberately
+    /// cheap choice here, not an oversight — fan-in/fan-out stays small in
+    /// practice, and a `SmallVec` has no hash table to check in O(1) anyway.
     pub(crate) fn record_call_dep(&self, caller: &CompKey, callee: &CompKey) {
         let mut nodes = self.nodes.lock().unwrap();
-        if let Some(node) = nodes.get_mut(caller) {
-            node.comp_deps.insert(callee.clone());
+        let callee_id = nodes.id_of(callee);
+        if let (Some(callee_id), Some(node)) = (callee_id, nodes.get_mut(caller))
+            && !node.comp_deps.contains(&callee_id)
+        {
+            node.comp_deps.push(callee_id);
         }
-        if let Some(node) = nodes.get_mut(callee) {
-            node.rdeps.insert(caller.clone());
+        let caller_id = nodes.id_of(caller);
+        if let (Some(caller_id), Some(node)) = (caller_id, nodes.get_mut(callee))
+            && !node.rdeps.contains(&caller_id)
+        {
+            node.rdeps.push(caller_id);
         }
     }
 
@@ -611,18 +828,18 @@ impl EngineInner {
         if raw.is_empty() {
             return;
         }
-        {
+        let caller_id = {
             let mut nodes = self.nodes.lock().unwrap();
+            let id = nodes.id_of(caller);
             if let Some(node) = nodes.get_mut(caller) {
                 node.source_deps.extend(raw.iter().cloned());
             }
-        }
+            id
+        };
+        let Some(caller_id) = caller_id else { return };
         let mut index = self.source_index.lock().unwrap();
         for dep in raw {
-            index
-                .entry((dep.source, dep.key))
-                .or_default()
-                .insert(caller.clone());
+            index.entry((dep.source, dep.key)).or_default().insert(caller_id);
         }
     }
 
@@ -923,7 +1140,7 @@ impl EngineBuilder {
         Engine {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
-                nodes: Mutex::new(HashMap::new()),
+                nodes: Mutex::new(NodeTable::new()),
                 source_index: Mutex::new(HashMap::new()),
                 roots: Mutex::new(HashSet::new()),
                 registry: self.registry,
@@ -944,6 +1161,21 @@ mod tests {
     use crate::def::define_comp;
     use crate::registry::Registry;
     use crate::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
+
+    /// Guards the point of the "node memory diet": a regression that
+    /// accidentally reintroduces a wide field (a full `CompKey` per edge, a
+    /// pre-serialized `value_bytes`/`param_debug`, a 256-bit hash) should
+    /// fail loudly here rather than only show up as a surprise in the
+    /// 1M-instance `persist_bench` benchmark's RSS figure. The bound is
+    /// deliberately generous (comfortably above the measured size on the
+    /// platform this was tuned on) — this is a coarse tripwire, not a
+    /// precise layout contract; exact field layout is not part of any
+    /// public API.
+    #[test]
+    fn node_stays_small() {
+        let size = std::mem::size_of::<Node>();
+        assert!(size <= 320, "Node grew to {size} bytes — see this test's doc comment");
+    }
 
     /// A body's second execution can produce fewer sink outputs than its
     /// first; the ones it stopped producing must be deleted from the sink.

@@ -22,7 +22,7 @@ pub mod testutil;
 pub use ctx::Ctx;
 pub use def::{Comp, CompDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with};
 pub use engine::{DirtyPriority, Engine, EngineBuilder};
-pub use key::{CompKey, CompParam, CompResult, DefId, Hash256, StableHash};
+pub use key::{CompKey, CompParam, CompResult, DefId, Hash128, StableHash};
 pub use persist::{Fingerprint, PersistOptions};
 pub use registry::Registry;
 pub use sink::{OutBytes, RawOutput, Sink, SinkBase, SinkId};

@@ -3,7 +3,7 @@
 //! A computation application `c p` (in the terminology of the self-adjusting
 //! computation literature) is identified by the name of its definition
 //! together with a content hash of its parameter. This module provides that
-//! identity: [`Hash256`] is the content hash primitive (the analogue of
+//! identity: [`Hash128`] is the content hash primitive (the analogue of
 //! `LargeHashable`), [`DefId`] names a definition, and [`CompKey`] names a
 //! specific application of a definition to a parameter (the analogue of
 //! `CompKey` / `c p`).
@@ -12,22 +12,42 @@ use std::fmt;
 
 use serde::de::DeserializeOwned;
 
-/// A 256-bit content hash (a blake3 digest of a canonical byte encoding).
+/// A 128-bit content hash: the first 16 bytes of a blake3 digest of a
+/// canonical byte encoding.
 ///
-/// `Hash256` is a plain value type: cheap to copy, comparable, hashable, and
+/// 128 bits (rather than the full 256-bit blake3 output) is a deliberate
+/// size/collision-risk tradeoff: at even billions of distinct computation
+/// applications, the birthday-bound collision probability of a 128-bit hash
+/// is still astronomically negligible, and 128 bits is what the original
+/// self-adjusting-computation paper's own `LargeHashable` used. Truncating a
+/// blake3 digest to its first 16 bytes is a safe, standard use of blake3's
+/// extensible output (any prefix of a longer blake3 output is itself a
+/// valid, independently-secure shorter output).
+///
+/// `Hash128` is a plain value type: cheap to copy, comparable, hashable, and
 /// totally ordered so it can be used as a map/set key or sorted for stable
 /// output.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Hash256([u8; 32]);
+pub struct Hash128([u8; 16]);
 
-impl Hash256 {
-    /// Builds a `Hash256` from raw bytes (typically a blake3 digest).
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Hash256(bytes)
+impl Hash128 {
+    /// Builds a `Hash128` from raw bytes (typically a truncated blake3
+    /// digest; see [`Self::from_blake3`]).
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Hash128(bytes)
+    }
+
+    /// Builds a `Hash128` by truncating a full 256-bit blake3 digest to its
+    /// first 16 bytes. See the type-level docs for why this truncation is
+    /// safe.
+    pub fn from_blake3(hash: blake3::Hash) -> Self {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash.as_bytes()[..16]);
+        Hash128(bytes)
     }
 
     /// Returns the raw bytes of this hash.
-    pub const fn as_bytes(&self) -> [u8; 32] {
+    pub const fn as_bytes(&self) -> [u8; 16] {
         self.0
     }
 
@@ -41,7 +61,7 @@ impl Hash256 {
 
     /// Renders the first 4 bytes (8 hex characters) of this hash, for
     /// tracing fields and other diagnostics that want a short, stable id
-    /// without the full 64-character digest.
+    /// without the full digest.
     pub(crate) fn short_hex(&self) -> String {
         use std::fmt::Write;
         let mut s = String::with_capacity(8);
@@ -52,23 +72,23 @@ impl Hash256 {
     }
 }
 
-impl fmt::Display for Hash256 {
-    /// Prints the full hash as 64 lowercase hex characters.
+impl fmt::Display for Hash128 {
+    /// Prints the full hash as 32 lowercase hex characters.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_hex(f, self.0.len())
     }
 }
 
-impl fmt::Debug for Hash256 {
+impl fmt::Debug for Hash128 {
     /// Prints a short, human-scannable form: the first 8 hex characters.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Hash256(")?;
+        write!(f, "Hash128(")?;
         self.write_hex(f, 4)?;
         write!(f, ")")
     }
 }
 
-/// A type that can be deterministically hashed to a stable [`Hash256`].
+/// A type that can be deterministically hashed to a stable [`Hash128`].
 ///
 /// The hash is derived from a canonical (postcard) serialization of the
 /// value, so it is stable across process runs and platforms as long as the
@@ -76,14 +96,14 @@ impl fmt::Debug for Hash256 {
 /// depend on hash-map iteration order).
 pub trait StableHash {
     /// Computes the stable content hash of `self`.
-    fn stable_hash(&self) -> Hash256;
+    fn stable_hash(&self) -> Hash128;
 }
 
 impl<T: serde::Serialize + ?Sized> StableHash for T {
-    fn stable_hash(&self) -> Hash256 {
+    fn stable_hash(&self) -> Hash128 {
         let bytes = postcard::to_stdvec(self)
             .expect("postcard serialization of a well-formed value should not fail");
-        Hash256::from_bytes(*blake3::hash(&bytes).as_bytes())
+        Hash128::from_blake3(blake3::hash(&bytes))
     }
 }
 
@@ -130,7 +150,7 @@ impl fmt::Display for DefId {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CompKey {
     def: DefId,
-    param_hash: Hash256,
+    param_hash: Hash128,
 }
 
 impl CompKey {
@@ -147,7 +167,7 @@ impl CompKey {
     }
 
     /// Returns the content hash of the parameter.
-    pub fn param_hash(&self) -> Hash256 {
+    pub fn param_hash(&self) -> Hash128 {
         self.param_hash
     }
 
@@ -158,7 +178,7 @@ impl CompKey {
     /// from its persisted `(def name, param hash)` pair, where the
     /// dependency's own parameter value was never stored (only ever the
     /// identity of the dependency, which is exactly `def` + `param_hash`).
-    pub(crate) fn from_parts(def: DefId, param_hash: Hash256) -> Self {
+    pub(crate) fn from_parts(def: DefId, param_hash: Hash128) -> Self {
         CompKey { def, param_hash }
     }
 }
@@ -247,11 +267,11 @@ mod tests {
 
         let hash = 5i32.stable_hash();
         let hash_debug = format!("{hash:?}");
-        assert!(hash_debug.starts_with("Hash256("));
+        assert!(hash_debug.starts_with("Hash128("));
         assert!(hash_debug.ends_with(')'));
 
         let hash_display = format!("{hash}");
-        assert_eq!(hash_display.len(), 64);
+        assert_eq!(hash_display.len(), 32);
 
         let def_debug = format!("{def:?}");
         assert_eq!(def_debug, "DefId(square)");

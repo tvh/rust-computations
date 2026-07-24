@@ -12,6 +12,7 @@ tracing = "0.1"
 thiserror = "2"
 notify = "8"
 redb = "4"
+smallvec = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 tempfile = "3"
