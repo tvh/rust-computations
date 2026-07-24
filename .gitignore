@@ -1,1 +1,7 @@
 /target
+# samply/xctrace profiling artifacts (see docs/persistence-benchmark-notes.md, Stage 6)
+*.samply.json
+profile.json
+profile.json.gz
+*.syms.json
+*.trace

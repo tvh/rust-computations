@@ -2,6 +2,10 @@
 resolver = "3"
 members = ["crates/computations", "crates/computations-fs", "crates/computations-time"]
 
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 futures = "0.3"

@@ -1068,3 +1068,343 @@ projection (the residue is dictionary/box overhead). Of everything in this
 doc, this is the one item where the Haskell side is *ahead*: the paper's
 "verifying traces" design left the door open on purpose.
 
+## Stage 6 — profiling the run
+
+Everything above is wall-clock/RSS accounting; this stage asks *where inside
+the process* the µs/node floor actually goes. CPU-profiled three phases of
+`persist_bench` at full 1M scale on the same Apple-silicon Mac, symbolized
+down to individual Rust functions.
+
+### Tooling
+
+- **Cargo profile added** (`Cargo.toml`, workspace root):
+  `[profile.profiling] inherits = "release"; debug = true` — release
+  codegen with DWARF debug info so stacks symbolize to real function names
+  instead of addresses. Built with
+  `cargo build -p computations --profile profiling --example persist_bench --features testutil`;
+  binary lands at `target/profiling/examples/persist_bench`.
+- **Profiler: [samply](https://github.com/mstange/samply)** (`cargo install samply`,
+  no sudo needed on macOS — it uses the same user-space task-info APIs
+  Instruments does, not dtrace). `dtrace`-based tools were ruled out up
+  front per this box's no-sudo constraint (macOS gates dtrace behind SIP +
+  root); `xctrace` (ships with Xcode, confirmed present at `/usr/bin/xctrace`)
+  was the planned fallback but never needed.
+- **Dead end: symbolication needs `--unstable-presymbolicate`.**
+  `samply record --save-only -o profile.json` alone leaves every native
+  frame as a raw hex address (`0x1fdff`) in `profile.json` — normal
+  symbolication happens lazily in the browser-based profiler UI, which
+  talks to a local symbol server samply spins up on `record`/`load`; there
+  is no such UI in this headless environment. Adding
+  `--unstable-presymbolicate` emits a `<name>.syms.json` sidecar (per
+  loaded library: `symbol_table` + the exact `known_addresses` seen in this
+  recording, resolved to demangled names already — Rust's own demangling,
+  no `rustfilt` step needed) that can be mined offline. Verified this
+  worked with a `PERSIST_BENCH_SCALE=0.02` sanity run before committing to
+  full-scale recordings (per the task's own instruction) — confirmed real
+  function names (`computations::engine::EngineInner::record_call_dep`,
+  `blake3::portable::compress_in_place`, ...) came out, not garbage.
+- **Analysis script**: `analyze_profile.py` (kept in the scratchpad, not
+  committed — see "artifacts kept out of git" below) parses the Firefox
+  Profiler JSON schema samply emits directly: for every sample, resolves
+  the leaf (topmost) stack frame's function via `frameTable.address` +
+  `funcTable.resource` → library → the sidecar's per-library
+  `known_addresses` map, and counts self-time as raw sample counts (1 kHz
+  default rate, so "N samples" ≈ "N ms of wall time on some thread"). Two
+  extra features earned their keep:
+  - **`--from-ms`/`--to-ms`/`--tail-ms` time-windowing.** A worker process
+    covers more than the phase you care about (see phase-c methodology
+    below); slicing by the samples' own `time` field isolates a sub-window
+    without needing to touch the benchmark's code.
+  - **`--hide-idle`**: walks each sample's *full* stack (not just the leaf)
+    and buckets it as `IDLE` if any frame is under
+    `tokio::runtime::park` — separated out as one summary line instead of
+    polluting the ranked list with `__psynch_cvwait`. Necessary because a
+    naive leaf-only ranking put `__psynch_cvwait` at #1 with 30–44% in
+    every phase, which turned out to be two different (both benign) things
+    conflated: the outer `Runtime::block_on` caller's own park loop (the
+    `persist_bench` main thread, waiting for the async task to make
+    progress) and idle default-sized (`num_cpus` = 14) tokio worker
+    threads finding no work to steal. Checked directly: in the phase-b
+    (warm restart) recording, of 15 threads only 2 tokio workers
+    (`23905099`: 3002/3008 samples on-CPU, `23905110`: 1513/1515 on-CPU)
+    ever did real work; the other 11 worker threads logged 2 samples each
+    (started, found nothing, parked for the rest of the run) — a real,
+    if minor, finding in its own right (see optimization candidates).
+
+### Methodology per phase
+
+- **(a) cold eval, no persistence** = phase `5-1`
+  (`run_no_persist_phase`, label `"5. cold restart, no persistence"`).
+  Self-contained — no state prerequisite — profiled directly:
+  `PERSIST_BENCH_PHASE=5-1 samply record --save-only --unstable-presymbolicate -o a.json -- persist_bench`.
+  Whole-process profile *is* the phase; no slicing needed.
+- **(b) warm restart, with persistence** = phase `3-1`
+  (`run_restart_phase`, label `"3. warm restart, no changes"`). Needs an
+  existing on-disk db, so first ran phase `1` **unprofiled** (plain
+  `PERSIST_BENCH_PHASE=1`, ~8 s, populates `persist_bench.redb`) against a
+  fixed `PERSIST_BENCH_DIR` (the orchestrator normally uses a
+  `tempfile::tempdir()` that's deleted at exit; ran the phases by hand
+  instead so the directory persists between the setup and profiled runs),
+  then profiled phase `3-1` against that same directory. Whole-process
+  profile again *is* the phase.
+- **(c) live incremental, with persistence** = phase `8`
+  (`run_live_incremental_phase` with `persist_opts = Some(...)`). This one
+  is *not* self-contained the same way: the worker builds its own fresh
+  1M-node graph and lets it settle **before** the timed
+  mutate-one-key-and-wait-for-round measurement even starts — so the raw
+  process recording is dominated by an unrelated, unreported initial
+  build+settle prefix (same shape as phase a/1, just not printed as its
+  own `RESULT` line). Profiled the whole process anyway (matches the
+  task's "if the flush lands inside the window, fine, label it"
+  instruction — no code changes to the benchmark to hide this), then used
+  the two `RESULT` lines it prints (`settle_ms` = 1225,
+  `settle_ms + durable_extra_ms` = 4837, so `durable_extra_ms` ≈ 3612) to
+  time-slice the *tail* of the same recording into two windows for a
+  cleaner read:
+  - **settle-only** window: propagation + snapshot/enqueue, isolated from
+    both the initial build and the flush.
+  - **flush-only** window: the explicit `persist_now()` call alone.
+
+  (A combined last-`settle_ms + durable_extra_ms + 300ms buffer`
+  tail — the literal "if the flush lands inside the window" reading — was
+  also pulled and is consistent with just overlaying the two split tables
+  below, so it's omitted here in favor of the more legible split.)
+
+### Caveat: absolute times this run are not the notes' baseline numbers
+
+This box's load average during the session ranged **12–30 on 14 cores**
+(other concurrent work on a shared devbox, confirmed with `uptime`/`vm_stat`
+— not attributable to this benchmark). Phase a's profiled run reported
+3820 ms/999,760 reruns (**3.82 µs/node**, close to Stage 5's clean
+2.91–2.96 s baseline) but phase b's profiled run reported 5170 ms for a
+restore Stage 5 measured at 1.36–1.44 s — a **~3.5–3.8× inflation**,
+consistent with scheduler contention rather than a regression (the
+`--hide-idle` per-thread check above independently confirms real
+contention: threads doing genuine restore work were frequently *not*
+running). **Self-time percentages (the ranking and rough shares) are the
+reliable output of this stage; the absolute ms figures embedded in the
+`RESULT` lines during profiling should not be compared against earlier
+stages' numbers.** Re-running this specific profiling pass on an idle box
+would be worth doing before quoting these tables in a public writeup.
+
+### (a) cold eval, no persistence — top hotspots (whole process, 6271 leaf samples, 38.7% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 3.6% | `NodeTable::id_of` | node-table lookup (per-def `HashMap<Hash128,u32>`) |
+| 3.4% | `EngineInner::record_call_dep` | node-table mutation, under the global `Mutex<NodeTable>` |
+| 3.3% | `blake3::portable::compress_in_place` | blake3 hashing (param/result identity) |
+| 2.6% | `mach_absolute_time` | timing syscalls (tracing `elapsed_ms` + tokio internals) |
+| 2.5% | `sip::Hasher::write` | HashMap hashing (SipHash, see below) |
+| 2.1% | `_platform_memmove` | alloc/memcpy noise |
+| 2.0% | `BuildHasher::hash_one` | HashMap hashing |
+| 2.0% | `Instrumented<T>::poll` | **tracing span overhead** (see finding below) |
+| 2.6% | `libsystem_malloc.dylib` (2 offsets) | allocator |
+| 1.1% | `DefaultHasher::write` | HashMap hashing |
+| 0.9% | `String::write_str` | tracing field formatting |
+| 0.9% | `raw_vec::finish_grow` | allocator (Vec growth) |
+| 0.9% | `RawTable::remove_entry` | HashMap ops (GC/row reuse) |
+| 0.8% | `Registry::enter` (tracing_subscriber) | tracing span overhead |
+| 0.7% | `pthread_mutex_lock` | lock contention (the global `Mutex<NodeTable>`) |
+| 0.7% | `core::fmt::write` | tracing field formatting |
+| 0.5% | `sharded_slab::pool::Pool::get` | tracing_subscriber span storage |
+
+### (b) warm restart, with persistence — top hotspots (whole process, 8100 leaf samples, 43.8% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 11.2% | `pread` | redb (mmap'd file reads) |
+| 7.0% | `EngineInner::restore_nodes` | persist: decode + wire restored nodes |
+| 4.2% | `BuildHasher::hash_one` | HashMap hashing |
+| 3.5% | `sip::Hasher::write` | HashMap hashing |
+| 2.0% | `HashMap::insert` | node-table/index rebuild |
+| 1.9% | `libsystem_malloc.dylib` | allocator |
+| 1.8% | `_platform_memmove` | alloc/memcpy noise |
+| 1.4% | `NodeTable::id_of` | node-table lookup |
+| 1.2% | `Engine::run::{{closure}}` | driver (post-restore initial round) |
+| 1.0% | `blake3::compress_in_place` | blake3 hashing (fingerprint/probe path) |
+| 0.9% | `RawTable::reserve_rehash` | HashMap growth (index rebuild) |
+| 0.8% | `persist::open_and_read` | redb (txn open + table read) |
+| 0.8% | `NodeTable::source_deps_clone` | node-table/side-table access |
+| 0.6% | `serde` `Vec<T>` deserialize | postcard decode |
+| 0.5% | `NodeTable::insert_new` | node-table row insert |
+| 0.3% | `NodeRecord::deserialize` | postcard decode |
+
+### (c) live incremental, with persistence — settle-only window (1935 leaf samples, 38.1% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 5.4% | `drop_in_place<PendingRecord>` | persist: pending-map churn (coalescing map insert/replace) |
+| 4.3% | `Instrumented<T>::poll` | tracing span overhead |
+| 4.1% | `BuildHasher::hash_one` | HashMap hashing |
+| 3.8% | `sip::Hasher::write` | HashMap hashing |
+| 2.8% | `blake3::compress_in_place` | blake3 hashing (result hash, early cutoff) |
+| 2.3% | `EngineInner::record_call_dep` | node-table mutation |
+| 1.8% | `mach_absolute_time` | timing syscalls |
+| 0.9% | `NodeTable::clear_comp_deps` / `comp_deps` | node-table/column access |
+| 0.8% | `NodeTable::id_of` | node-table lookup |
+| 0.7% | `persist::enqueue_changed` | persist: pending-map enqueue |
+| 0.6% | `postcard::ser::serialize_with_flavor` | postcard encode (value snapshot for the pending map) |
+
+### (c) live incremental, with persistence — flush-only window (`persist_now`, 3681 leaf samples, only 2.7% idle — single synchronous txn)
+
+| % self | function | subsystem |
+|---|---|---|
+| 14.5% | `MutateHelper::insert_helper` (redb) | redb (B-tree insert) |
+| 8.7% | `_platform_memmove` | redb page copy / alloc |
+| 8.2% | `BranchAccessor::child_for_key` (redb) | redb (B-tree traversal) |
+| 5.3% | `fcntl` | redb (file locking/sync) |
+| 4.7% | `pwrite` | redb (page writes) |
+| 2.5% | `postcard::ser::serialize_with_flavor` | postcard encode |
+| 2.4% | `Vec<T>::clone` | persist snapshot-clone |
+| 1.8% | `String::clone` | persist snapshot-clone (def names) |
+| 1.7% | `LeafMutator::insert` (redb) | redb (B-tree leaf write) |
+| 1.2% | `LeafMutator::update_value_end` (redb) | redb |
+| 1.1% | `Instrumented<T>::poll` | tracing span overhead |
+| 1.0% | `sip::Hasher::write` | HashMap hashing |
+| 0.9% | `PersistHandle::flush::{{closure}}` | persist (flush driver) |
+
+### Interpretation
+
+- **The ~3.7–3.8 µs/node cold-eval floor is genuinely engine overhead, not
+  tokio** — but not quite the story Stage 3–5's byte-accounting alone
+  would suggest. After excluding idle-park noise, phase a's top spenders
+  are, in order: **node-table bookkeeping** (`id_of` + `record_call_dep`,
+  ~7% combined — every one of the graph's ~3M `ctx.eval` calls does two
+  per-def `HashMap<Hash128,u32>` lookups plus a `SmallVec` push in each
+  direction under the global lock), **hashing** (blake3 ~3.3% direct +
+  HashMap SipHash ~5.6% combined — two *different* hashing costs, see
+  below), and — the surprise — **tracing instrumentation** (`Instrumented`
+  poll + `Registry::enter` + `sharded_slab` span storage + field
+  formatting ≈ **4–5% combined**, likely more once `mach_absolute_time`'s
+  share attributable to `elapsed_ms` timestamps is folded in). Allocator
+  traffic (malloc entries + `raw_vec` growth) adds another ~3%. None of
+  this is tokio scheduling once idle-park samples are set aside — that
+  confirms the floor is where Stage 3–5 assumed it was (engine bookkeeping
+  + hashing), just with tracing overhead as a real, previously invisible
+  fourth contributor.
+- **Two independent hashing costs are visible and worth telling apart.**
+  (1) `blake3::compress_in_place` is `CompKey`/result-hash computation —
+  unavoidable, it *is* the identity/early-cutoff scheme. (2) `sip::Hasher`/
+  `DefaultHasher`/`BuildHasher::hash_one` is **std's default SipHash-1-3
+  hasher being used to hash `Hash128` keys in every `HashMap<Hash128, u32>`
+  index** (`NodeTable`'s per-def `index` field, `engine.rs:331`) — hashing
+  an already-cryptographically-random 128-bit blake3 output *again* with a
+  general-purpose DoS-resistant hasher designed for attacker-controlled
+  string keys. This is dead weight: nothing in this engine's key space is
+  adversarial. Combined SipHash-family self-time (`hash_one` + `sip::write`
+  + `DefaultHasher::write`) is **~5.6–8.7% across every phase profiled** —
+  bigger than blake3 itself in two of the three phases. This is the same
+  "hash at the call site, every time" pattern the Haskell interlude noted
+  independently (`mkCompAp` MD5-hashing on every parent eval) — except here
+  it's compounded by *re*-hashing a hash.
+- **Warm restart goes to redb reads + restore wiring, not postcard decode.**
+  `pread` (11.2%) + `restore_nodes` (7.0%) + `open_and_read` (0.8%) ≈ 19%
+  is redb/IO; postcard deserialize (`Vec<T>`/`NodeRecord`) is under 1%
+  combined. `restore_nodes` itself is dominated by hashing
+  (`hash_one`/`sip::write` = 7.7% combined, the same per-def index
+  `HashMap<Hash128,u32>` being *rebuilt* on load) and `HashMap::insert`
+  (2.0%) — i.e. restoring 999,760 nodes pays the identical
+  "hash-the-already-hashed-key" tax as steady-state operation, once per
+  node, up front. This matches the doc's existing "Startup probe cost at
+  1M is bundled into warm-restart time; not separately instrumented" open
+  item — the profile now answers that: most of it is redb I/O plus index
+  rebuild, not the probe logic itself (no `probe_versions` frame appears
+  in the top 25).
+- **The live-increment/flush split is exactly what Stage 2's design
+  predicted, cross-checked at the function level.** Settle-only is
+  dominated by `PendingRecord` churn (5.4%) and hashing/tracing — the
+  same engine-floor shape as phase a, plus persist's pending-map
+  bookkeeping, and **no redb symbols at all** (confirms the async
+  debounced design: propagation genuinely doesn't touch redb). Flush-only
+  is **83%+ redb/IO/serialization** (`insert_helper` + `child_for_key` +
+  `fcntl` + `pwrite` + `LeafMutator::*` + postcard) with only 2.7% idle —
+  a single synchronous transaction, no thread-pool slack, exactly as
+  `persist_now()`'s contract describes. No surprises here; this is the
+  clean confirmation the design intended.
+- **Nothing that looks like an O(n) rescan or an outright bug surfaced.**
+  No phase shows a function whose self-time is disproportionate to its
+  expected O(n) role (e.g. nothing suggests an accidental O(n²) scan
+  hiding in GC or restore). The one thing worth flagging as a possible
+  **benchmark-harness artifact rather than an engine bug**: `persist_bench`
+  installs `tracing_subscriber::registry()` with two plain `Layer`s (no
+  `EnvFilter`/`Targets`, no `max_level_hint` override) purely to watch for
+  two specific debug-level message strings (see the module's "Detecting
+  settled" docs). Because neither layer restricts its level, tracing's
+  callsite cache treats every `debug_span!`/`debug!` call site as globally
+  "interested," so `comp.eval`'s per-node span (`engine.rs:1055`, one per
+  `ctx.eval` — millions of calls) and its one completion event
+  (`engine.rs`, several `tracing::debug!("comp.eval finished")` sites)
+  pay their **full** field-formatting + span-storage cost on every call,
+  not tracing's designed-for near-zero disabled-level fast path. That's
+  real, measured cost (4–5% of phase a alone) that a production deployment
+  with a normal `EnvFilter` (e.g. `RUST_LOG=info`) would not pay at all —
+  worth keeping in mind before quoting this stage's percentages as "the"
+  engine floor in a public writeup, and see the optimization candidates
+  below for two ways to remove the confound.
+
+### Optimization candidates suggested by the profile (candidates only — not implemented)
+
+Ranked by estimated impact × confidence, given the profile data above:
+
+1. **Stop re-hashing already-hashed keys.** Swap the per-def
+   `index: HashMap<Hash128, u32>` (and any other `HashMap<Hash128, _>` /
+   `HashMap<CompKey, _>` on the hot path) from `std`'s default SipHash to a
+   hasher that just reads bytes out of the key (`FxHashMap`-style, or a
+   trivial custom `Hasher` that takes the first 8 bytes of the already-
+   uniform `Hash128` verbatim) — the exact fix Salsa itself uses for the
+   same reason (interned/hashed keys, `FxHashMap` throughout). Estimated
+   ~5–8% of self-time across every phase profiled here, for a
+   change confined to hasher-type parameters — no data-structure or
+   on-disk format change. Single highest confidence item on this list: the
+   evidence (SipHash entries in every top-15) is direct and consistent.
+2. **Investigate whether `comp.eval`'s per-node span is worth its cost
+   under this benchmark's own instrumentation setup — or fix the
+   instrumentation setup instead.** Two independent fixes, either
+   sufficient on its own: (a) in `persist_bench.rs`, give the two
+   `MessageSignal` layers a `Targets`/`EnvFilter` (or override
+   `max_level_hint`) so `debug_span!`/`debug!` calls skip tracing's fast
+   disabled-path during a benchmark that doesn't want their content, only
+   their occurrence — removes a 4–5%-of-self-time confound from every
+   future profiling pass with zero engine changes; or (b) in the engine
+   itself, reconsider whether `comp.eval`'s span needs to exist on every
+   call vs. only under an explicit opt-in (mirroring stage 3(a)'s
+   `param_debug` lazy-render precedent, but for the span/event itself, not
+   just one field). (a) is the safer, more surgical first step — it fixes
+   the measurement without touching engine semantics.
+3. **The global `Mutex<NodeTable>` shows real (if modest) direct contention
+   cost** — `pthread_mutex_lock` at 0.7% self-time in phase a, plus
+   `record_call_dep`'s 3.4% *is* lock-held work, not lock-wait, but every
+   one of ~3M `ctx.eval` calls takes this one mutex. Not warranted as a
+   priority on this evidence alone (0.7% direct wait is small), but worth
+   watching if a future change adds more concurrent evaluators — the
+   `--hide-idle` per-thread check above already showed most of this
+   benchmark's actual parallelism tops out around 2–3 concurrently-active
+   threads regardless of the lock, so contention isn't yet the bottleneck
+   RSS/hashing are.
+4. **Default tokio worker-thread count is oversubscribed for this
+   workload.** The per-thread breakdown (phase b) showed only 2 of 14
+   default (`num_cpus`) worker threads ever did real work; the rest parked
+   after ~2 samples each. Spawning and maintaining 12 threads that never
+   run anything is small but non-zero overhead (thread creation, parking
+   syscalls); `Engine::builder`'s runtime construction (or this benchmark's
+   own `tokio::runtime::Builder::new_multi_thread()`) could cap
+   `worker_threads` to a number closer to this workload's actual
+   concurrency, or the benchmark could measure whether a lower cap changes
+   wall time at all. Lowest-confidence item here — likely small, easy to
+   verify, low risk.
+5. **Not the redb write path** — `insert_helper`/`child_for_key`/`pwrite`
+   dominating the flush window is redb doing exactly what a B-tree insert
+   should; no candidate here beyond what "Tried and rejected" already
+   covers (chunked transactions measured and rejected as unwarranted).
+   Listed only to record that the flush window was checked and came back
+   clean, not overlooked.
+
+### Artifacts kept out of git
+
+`profile.json`/`profile.json.gz` (samply's default output names) and
+`*.syms.json` sidecars are now in `.gitignore`; every profile from this
+stage was written to the session scratchpad, not the repo, so no explicit
+cleanup was needed — the `.gitignore` entries are a guard for next time
+someone runs `samply record` from inside the repo root.
+
