@@ -674,6 +674,74 @@ for evicted nodes (memory becomes a knob, not a linear function of graph size).
   truth" framing is what makes the whole async design sound.
 - Glitches during propagation are possible (same trade as the paper).
 
+## Sources & prior art — every borrowed idea, mapped to where it came from
+
+**The architecture itself**
+- Coarse-grained self-adjusting computations, push driver, sources/sinks,
+  `CompM`-style effect tracking, name+128-bit-param-hash identity, the
+  restart-cost problem this whole persistence effort answers: Stefan Wehr,
+  ["A Software Architecture Based on Coarse-Grained Self-Adjusting
+  Computations"](https://doi.org/10.1145/3609025.3609481), FUNARCH '23 +
+  reference impl [skogsbaer/computations](https://github.com/skogsbaer/computations).
+- Self-adjusting computation foundations (dynamic dependence graphs +
+  memoization): Acar, Blelloch, Harper, ["Adaptive Functional
+  Programming"](https://dl.acm.org/doi/10.1145/1186632.1186634), TOPLAS 2006;
+  memoized function caching goes back to Pugh & Teitelbaum, ["Incremental
+  Computation via Function Caching"](https://dl.acm.org/doi/10.1145/75277.75305),
+  POPL '89 (both via the FUNARCH paper's related-work section).
+- Haxl-style concurrency (the "implicit batching/dedup" model our explicit
+  `join` + single-flight design deliberately simplified): Marlow, Brandy,
+  Coens, Purdy, ["There is no fork: an abstraction for efficient, concurrent,
+  and concise data access"](https://dl.acm.org/doi/10.1145/2628136.2628144),
+  ICFP '14.
+
+**Persistence design vocabulary**
+- *Verifying traces* vs *constructive traces* (exactly our deps+hashes vs
+  deps+hashes+values split), *early cutoff*, scheduler taxonomy: Mokhov,
+  Mitchell, Peyton Jones, ["Build systems à la
+  carte"](https://dl.acm.org/doi/10.1145/3236774), ICFP '18; expanded journal
+  version ["Theory and practice"](https://simon.peytonjones.org/build-systems-a-la-carte-theory-and-practice/),
+  JFP 2020.
+- Persistent build database with journaled updates, keys/values encoding of
+  params/results (cited as inspiration by the FUNARCH paper too): Mitchell,
+  ["Shake before building"](https://dl.acm.org/doi/10.1145/2364527.2364538),
+  ICFP '12; [shakebuild.com](https://shakebuild.com).
+- "Persist the graph, load it, revalidate" at production scale + **eviction
+  as the biggest memory win** (Tier 3 blueprint): Turbopack —
+  ["Inside Turbopack: incremental computation"](https://nextjs.org/blog/turbopack-incremental-computation)
+  and Tobias Koppers' ["Turbopack Persistent Caching"](https://gitnation.com/contents/turbopack-persistent-caching) talk.
+
+**Memory-layout redesign (Stages 4-5)**
+- u32-interned ids, per-query-type columnar "ingredient" tables, typed memo
+  storage, revision-counter cutoff (Tier 2 blueprint): [Salsa](https://github.com/salsa-rs/salsa)
+  ([book/IR chapter](https://salsa-rs.github.io/salsa/tutorial/ir.html),
+  [interned.rs](https://github.com/salsa-rs/salsa/blob/master/src/interned.rs),
+  Ilya Lakhin's ["Salsa Algorithm Explained"](https://medium.com/@eliah.lakhin/salsa-algorithm-explained-c5d6df1dd291)).
+- Int-keyed nodes + compact dep arrays in a parallel evaluation framework:
+  [Bazel Skyframe docs](https://bazel.build/reference/skyframe).
+- The rejected-but-instructive no-per-instance-nodes model: McSherry, Murray,
+  Isaacs, Isard, ["Differential Dataflow"](https://www.microsoft.com/en-us/research/publication/differential-dataflow/),
+  CIDR '13 (accessible summary: [the morning paper](https://blog.acolyer.org/2015/06/17/differential-dataflow/)).
+- Other engines surveyed for contrast: Hammer, Khoo, Hicks, Foster,
+  ["Adapton: composable, demand-driven incremental computation"](https://dl.acm.org/doi/10.1145/2594291.2594324),
+  PLDI '14; Jane Street's in-memory
+  ["Introducing Incremental"](https://blog.janestreet.com/introducing-incremental/) (2015).
+
+**Storage-engine research (Stage 0 groundwork)**
+- [redb](https://github.com/cberner/redb) (chosen; pure-Rust LMDB-inspired
+  B-tree, ACID txns as the "journal").
+- Rejected with reasons in "Tried and rejected":
+  [okaywal](https://bonsaidb.io/blog/introducing-okaywal/) (self-declared
+  format-unstable), [fjall 3.0](https://fjall-rs.github.io/post/fjall-3/)
+  (LSM, write-heavy focus), sled (alpha rewrite), SQLite.
+
+Everything not listed here (load-anyway restart with priority tiers and
+max-wins dirtying, Input-preempts-Revalidate scheduling, probe-and-resubscribe,
+the debounced coalescing pending map, the process-per-phase benchmark harness)
+is, to our knowledge, this project's own synthesis — the closest published
+relative being turbo-tasks' restore-and-revalidate, which does not have the
+two-tier priority scheme.
+
 ## Possible blog angles (later)
 
 - "Load the stale cache anyway": restart persistence with priority tiers instead
@@ -690,6 +758,10 @@ for evicted nodes (memory becomes a knob, not a linear function of graph size).
 - "What does a bit cost you?" — stage 4(d) packs `last_changed` into one bit;
   the Haskell reference answers the same question with a version-keyed reverse
   index costing ~360 B/node. Same semantics, three orders of magnitude apart.
+- "The equalizer": every per-object diet leaves Haskell 1.3×–9× behind Rust —
+  until columnar-unboxed, which exits GHC's traced heap entirely and lands at
+  ~1× (Interlude 3). The GC multiplier wasn't a constant; it was a design
+  choice about where state lives.
 
 ## Stage 5 — Tier 2 columnar per-def tables (Salsa-style, typed value columns)
 
@@ -891,4 +963,108 @@ move.
   the *absence* of a separate heap allocation per node, not a smaller
   in-place representation — worth stating plainly since it doesn't show up
   in any `size_of` assertion, only in RSS.
+
+## Interlude 3 — the rest of the arc: persistence, columnar, eviction (Haskell feasibility)
+
+Interludes 1–2 covered Stages 3–4. This closes the loop over everything else
+tested in Rust: the persistence stack (Stages 0–2), Tier 2 columnar (Stage 5),
+Tier 3, and the open items. Same caveat as always: static reading against
+`skogsbaer/computations` @ `e0bec07`, nothing built or run.
+
+| Rust work | Haskell feasibility | Size guess |
+|---|---|---|
+| Stage 0–1: redb snapshot store | feasible; LMDB instead of redb | db ~270–550 MB, same order |
+| Stage 0: revive from `(def, param bytes)` | feasible; `CompMap` *is* `erased_defs` | needs `Serialize p` in `IsCompParam` |
+| Stage 1: load-anyway + priority tiers | feasible; PAQ already has 4 priority lanes | ~0 extra |
+| Stage 2: async debounced flush | feasible and **easier** (STM) | the 80k-record snapshot-clone cost is **0** |
+| Stage 5: Tier 2 columnar per-def | feasible via unboxed vectors; **the equalizer** | ~170–250 B/cap, RSS **~250–350 MB ≈ Rust parity** |
+| Tier 3 eviction | **the primitive already exists in the reference's types** | floor ~60–100 B/cap |
+| packed-u32 `NodeRef` (open item) | identical trade (`Word32` unboxed) | same ceilings |
+| arena'd `param_bytes` (open item) | n/a — params typed and live; the typed param column *is* the arena | — |
+
+### Stages 0–2: persistence ports cleanly, and one Rust problem vanishes
+
+- **Store**: no redb equivalent; LMDB (`lmdb-simple`) is the natural pick.
+  sled/fjall have no Haskell analogues to reject. SQLite was rejected in Rust
+  partly for the C dep — in Haskell that objection mostly evaporates, since
+  LMDB is a C dep too and there is no mature pure-Haskell embedded KV (haskey
+  is closest, alpha). Serialization: `cereal`/`store` in place of postcard,
+  wired as a `ccb_serialize` on `CompCacheBehavior` — exactly stage 3(b)'s
+  per-def erased serializer shape.
+- **Revival**: the reference is already set up for it.
+  `comp_compMap :: Map CompId AnyComp` is `erased_defs`, and `initCompAp`
+  re-evals from `(Comp, typed param)` — the design stage 4(a) converged on.
+  The only missing piece is `Serialize p` in `IsCompParam` so a param can
+  round-trip disk.
+- **The Stage-2 flush is where Haskell structurally wins.** The coalescing
+  pending map is a `TVar (Map CompKey Upsert)`; debounce/threshold/staleness
+  triggers are `registerDelay` + `orElse` — STM composes what the Rust side
+  hand-built with `Notify` + `Weak`. Better: **Stage 2's residual problem does
+  not exist.** The "synchronous snapshot-clone of ~80k records under the node
+  lock" (the ~130 ms live-update tax, still an open item as "could be sharded
+  or made copy-on-write") — pure persistent structures in a `TVar` are
+  *already* copy-on-write. `readTVarIO` hands the flusher an immutable
+  snapshot in O(1), zero copying, zero lock hold. The 2× memory tax of
+  persistent containers buys exactly this. Tension to note: adopting Tier 2's
+  mutable columns (next) spends this advantage back.
+- **Load-anyway tiers**: PAQ's four lanes (realtime/express/regular/bulk)
+  already implement the two-tier preemption — `Revalidate`→bulk,
+  `Input`→express is configuration, not architecture. Fingerprint: executable
+  hash or TH-embedded git hash.
+- Warm-restart guess: 1M records via `cereal` + container rebuild ≈ 2–5 s —
+  same order as Rust's 1.4–3.3 s across stages; rebuilding into unboxed
+  columns (below) lands at the low end.
+
+### Stage 5 / Tier 2: feasible, and it fixes what "no diet fixes"
+
+Deepest restructure, but the abstraction boundary already exists:
+`CompEngineStateIf m` (`Core.hs:95`) is an interface record and
+`SimpleStateIf` just one impl — a mutable columnar `CompEngineStateIf IO`
+slots in behind it without touching `Impl.hs`'s eval loop. Losses:
+`atomically` composability (an `MVar` suffices; `stepCompEngine` is
+sequential) and the `lookupLE`-sharing + `validateSifState` machinery,
+already moot under interning.
+
+Columns map directly: `param_hash`/`result_hash`/`flags` →
+`Data.Vector.Unboxed`/`MutablePrimArray` (16/16/1 B per row, flat); `NodeRef`
+→ packed `Word64` (8 B, same as Rust's struct); typed value/param columns
+live on the `Comp p a` record where the types are statically known — the
+same trick as `CompDef<P, R>`, with existentials surviving only at the
+already-existing `AnyComp` boundary; edges as per-row `ByteArray`
+(~40 B/direction at fan-in 3) or CSR-with-slack (~60–90 B/cap both
+directions); per-def index `HashMap Hash128 Int` ~40–64 B/cap — and Stage
+5's "splitting one HashMap into 50" surprise transfers directly. Assumes the
+flat-rdeps + changed-bit semantics change (dropping `VerList`), which a
+columnar rewrite would adopt anyway. Shake is the existence proof that the
+interning half is idiomatic Haskell: it interns keys to `Id` (an `Int`) and
+stores flat records against them.
+
+**The Haskell-specific twist: unboxed columns leave the traced heap
+entirely.** Large `ByteArray#`s live in the large-object area — never
+scanned, never copied. Tier 2 in Haskell therefore attacks precisely what
+"What no diet fixes" says no diet fixes: the copying-collector 2–3× RSS
+multiplier applies only to the *boxed* residue. Tally: ~170–250 B/cap, of
+which maybe ~50 B stays traced → **RSS ~250–350 MB — parity with Rust Stage
+5's 328–354 MB.** Every earlier interlude concluded Haskell trails 1.3×–9×;
+columnar-unboxed is the first move that closes the gap to ~1×, because it
+dodges the boxing tax and the GC multiplier in one step.
+
+Stage 5's `Option<R>` niche surprise transfers, stronger: `Vector (Maybe a)`
+boxes every element — the Haskell version of "no `size_of` win, only
+allocation-count win" is a separate has-result bit + unboxed column, or a
+pointer per row.
+
+### Tier 3: the reference already has the type for it
+
+The Rust open item calls Tier 3 "hashCaching-style value-less records" — and
+the reference *ships* that state: `CapCached = CapMetaCached CompCacheMeta |
+CapValueCached ...` (`Core.hs:140-143`), and `evalWithCapCached` already
+handles `CapMetaCached` by recomputing (`Impl.hs:275-278`). Eviction is
+demoting `CapValueCached` → `CapMetaCached` at runtime — a state transition
+the eval loop handles today with zero new code paths. Without persistence
+that's a memory-for-recompute knob; with the Stage 0–2 port it's full Tier 3,
+floor ≈ interned key + hash ≈ 60–100 B/cap against Rust's ~40 B/node
+projection (the residue is dictionary/box overhead). Of everything in this
+doc, this is the one item where the Haskell side is *ahead*: the paper's
+"verifying traces" design left the door open on purpose.
 
