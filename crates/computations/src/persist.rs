@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::def::ErasedDef;
-use crate::engine::{DirtyPriority, EngineInner, Node, NodeId, NodeTable, RevivedNode};
+use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable};
 use crate::key::{CompKey, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
@@ -343,12 +343,12 @@ impl RawOutputRepr {
     }
 }
 
-/// One `nodes` table row: everything needed to revive a `Clean` [`Node`]
+/// One `nodes` table row: everything needed to revive a `Clean` node
 /// without ever re-executing its computation. The on-disk shape — always
 /// carries fully-serialized `value_bytes`, satisfying the standing
 /// requirement that the *database* keep every byte of information it always
-/// has, even though the in-memory [`Node`] this is built from no longer
-/// keeps a permanent serialized copy of its own value (see [`PendingRecord`],
+/// has, even though the in-memory node this is built from no longer keeps a
+/// permanent serialized copy of its own value (see [`PendingRecord`],
 /// which is what actually gets built at enqueue time; `value_bytes` is only
 /// ever filled in lazily, at flush time, from [`PendingRecord::value`]).
 #[derive(Serialize, Deserialize)]
@@ -384,38 +384,35 @@ struct PendingRecord {
 }
 
 impl PendingRecord {
-    /// Snapshots everything needed to persist `key`'s node, minus its
-    /// serialized value bytes (see [`PendingRecord`]'s docs). Callers hold
-    /// `EngineInner::nodes`'s lock while calling this (see
-    /// [`enqueue_changed`]) so the snapshot can never observe a torn write
-    /// from a concurrent rerun of the same node. `nodes` (the whole live
-    /// table, not just `node`) is needed to translate `node.comp_deps`'
-    /// `NodeId`s back into the `CompKey`s persistence actually stores (see
-    /// `crate::engine::NodeId`'s docs), and to read `id`'s `source_deps`/
-    /// `outputs` out of `nodes`'s sparse side tables (see
-    /// `crate::engine::Node`'s docs on why those no longer live directly on
-    /// `Node`).
-    ///
-    /// Returns `None` for a node with no successful run yet (no
-    /// `value`/`result_hash`) — nothing coherent to persist.
-    fn snapshot(nodes: &NodeTable, id: NodeId, key: &CompKey, node: &Node) -> Option<PendingRecord> {
-        let value = node.value.clone()?;
-        let result_hash = node.result_hash?;
-        let comp_deps: Vec<CompKeyRepr> = node
-            .comp_deps
-            .iter()
-            .filter_map(|&id| nodes.get_by_id(id))
-            .map(|dep_node| CompKeyRepr::from_key(&dep_node.key))
-            .collect();
-        Some(PendingRecord {
+    /// Snapshots everything needed to persist `r`'s node, given its already
+    /// resolved `value`/`result_hash` (see [`enqueue_changed`], the only
+    /// caller: it reads those two off `r`'s typed value column /
+    /// `result_hash` column before calling this, since `NodeTable` itself
+    /// stays generic over every definition's `R` — see
+    /// `crate::def::CompDef::values`'s docs). Callers hold
+    /// `EngineInner::nodes`'s lock while calling this so the snapshot can
+    /// never observe a torn write from a concurrent rerun of the same node.
+    /// `nodes` is needed to translate `r`'s `comp_deps` [`NodeRef`]s back
+    /// into the `CompKey`s persistence actually stores, and to read `r`'s
+    /// `source_deps`/`outputs` out of `nodes`'s sparse side tables.
+    fn snapshot(
+        nodes: &NodeTable,
+        r: NodeRef,
+        key: &CompKey,
+        value: Arc<dyn Any + Send + Sync>,
+        result_hash: Hash128,
+    ) -> PendingRecord {
+        let comp_deps: Vec<CompKeyRepr> =
+            nodes.comp_deps(r).iter().map(|&dep| CompKeyRepr::from_key(&nodes.key_of(dep))).collect();
+        PendingRecord {
             def_name: key.def().name().to_string(),
-            param_bytes: node.param_bytes.clone(),
+            param_bytes: nodes.param_bytes(r).to_vec(),
             comp_deps,
-            source_deps: nodes.source_deps_iter(id).map(RawDepRepr::from_dep).collect(),
+            source_deps: nodes.source_deps_iter(r).map(RawDepRepr::from_dep).collect(),
             result_hash: result_hash.as_bytes(),
             value,
-            outputs: nodes.outputs_iter(id).map(RawOutputRepr::from_output).collect(),
-        })
+            outputs: nodes.outputs_iter(r).map(RawOutputRepr::from_output).collect(),
+        }
     }
 }
 
@@ -885,15 +882,15 @@ impl EngineInner {
         tokio::spawn(persister_loop(Arc::downgrade(&handle), notify));
     }
 
-    /// Turns every decodable, still-registered record into a `Clean`
-    /// [`Node`], inserts every one of them into `self.nodes` (assigning each
-    /// a fresh [`NodeId`]), then — now that every restored node has an id —
+    /// Turns every decodable, still-registered record into a `Clean` row,
+    /// inserting every one of them into `self.nodes` (assigning each a
+    /// fresh [`NodeRef`]), then — now that every restored node has a ref —
     /// wires up `comp_deps`/`rdeps` and rebuilds `source_index` from the
     /// whole restored batch. Returns the number of nodes actually restored.
     ///
     /// The two-pass shape (decode-and-insert, then wire up edges) is
-    /// required by [`NodeId`]-based edges: a dependency edge can only be
-    /// expressed once *both* of its endpoints already have an id, which
+    /// required by [`NodeRef`]-based edges: a dependency edge can only be
+    /// expressed once *both* of its endpoints already have a ref, which
     /// isn't true of any single record in isolation (it may name a
     /// dependency that itself appears later in the same batch, or not at
     /// all — see the second pass's handling of a dangling `comp_deps`
@@ -901,7 +898,10 @@ impl EngineInner {
     fn restore_nodes(&self, records: Vec<NodeRecord>) -> usize {
         struct PendingNode {
             key: CompKey,
-            node: Node,
+            param_bytes: Vec<u8>,
+            result_hash: Hash128,
+            value_bytes: Vec<u8>,
+            erased_def: Arc<dyn ErasedDef>,
             comp_dep_keys: Vec<CompKey>,
             source_deps: HashSet<RawDep>,
             outputs: HashSet<RawOutput>,
@@ -924,79 +924,80 @@ impl EngineInner {
                 tracing::debug!(def = %record.def_name, "persistence: dropping a record whose param bytes failed to decode");
                 continue;
             };
-            let Some(value) = erased_def.revive_value(&record.value_bytes) else {
-                tracing::debug!(def = %record.def_name, "persistence: dropping a record whose value bytes failed to decode");
-                continue;
-            };
 
             let comp_dep_keys: Vec<CompKey> =
                 record.comp_deps.iter().filter_map(|dep| dep.to_key(&self.def_names)).collect();
             let source_deps: HashSet<RawDep> = record.source_deps.iter().map(RawDepRepr::to_dep).collect();
             let outputs: HashSet<RawOutput> = record.outputs.iter().map(RawOutputRepr::to_output).collect();
 
-            let node = Node::from_persisted(
-                key.clone(),
-                RevivedNode {
-                    param_bytes: record.param_bytes,
-                    value,
-                    result_hash: Hash128::from_bytes(record.result_hash),
-                },
-            );
-            pending.push(PendingNode { key, node, comp_dep_keys, source_deps, outputs });
+            pending.push(PendingNode {
+                key,
+                param_bytes: record.param_bytes,
+                result_hash: Hash128::from_bytes(record.result_hash),
+                value_bytes: record.value_bytes,
+                erased_def: erased_def.clone(),
+                comp_dep_keys,
+                source_deps,
+                outputs,
+            });
         }
 
-        let restored_count = pending.len();
-        if restored_count == 0 {
+        if pending.is_empty() {
             return 0;
         }
 
         let mut nodes = self.nodes.lock().unwrap();
 
-        // Pass 1: every restored node gets a `NodeId`, and — now that it has
-        // one — its `source_deps`/`outputs` (kept off `Node` itself; see
-        // `crate::engine::Node`'s docs) land in `NodeTable`'s sparse side
+        // Pass 1: every restored node gets a `NodeRef`, its value is decoded
+        // straight into its definition's typed value column (see
+        // `crate::def::ErasedDef::revive_and_store` — a record whose value
+        // bytes fail to decode here has its just-inserted row un-inserted
+        // again rather than left half-formed), and — now that it has a ref
+        // — its `source_deps`/`outputs` land in `NodeTable`'s sparse side
         // tables directly.
-        let mut edge_work: Vec<(NodeId, Vec<CompKey>)> = Vec::with_capacity(pending.len());
+        let mut edge_work: Vec<(NodeRef, Vec<CompKey>)> = Vec::with_capacity(pending.len());
         for p in pending {
-            let id = nodes.insert_new(p.key, p.node);
-            nodes.extend_source_deps(id, &p.source_deps);
-            nodes.extend_outputs(id, &p.outputs);
-            edge_work.push((id, p.comp_dep_keys));
+            let r = nodes.insert_new(&p.key, &p.param_bytes);
+            if !p.erased_def.revive_and_store(r.row, &p.value_bytes) {
+                tracing::debug!(
+                    def = %p.key.def().name(),
+                    "persistence: dropping a record whose value bytes failed to decode"
+                );
+                nodes.remove_by_id(r);
+                continue;
+            }
+            nodes.set_result(r, p.result_hash);
+            nodes.extend_source_deps(r, &p.source_deps);
+            nodes.extend_outputs(r, &p.outputs);
+            edge_work.push((r, p.comp_dep_keys));
         }
+        let restored_count = edge_work.len();
 
-        // Pass 2: wire up `comp_deps`/`rdeps` now that every id exists. A
-        // dependency key with no matching id (its own record failed to
+        // Pass 2: wire up `comp_deps`/`rdeps` now that every ref exists. A
+        // dependency key with no matching ref (its own record failed to
         // decode, or named an unregistered definition) is simply dropped —
         // exactly as silently as `crate::driver`'s liveness GC already
         // tolerates a `comp_deps` entry pointing nowhere.
-        for (caller_id, dep_keys) in edge_work {
+        for (caller_r, dep_keys) in edge_work {
             for dep_key in dep_keys {
-                let Some(callee_id) = nodes.id_of(&dep_key) else { continue };
-                if let Some(caller_node) = nodes.get_mut_by_id(caller_id)
-                    && !caller_node.comp_deps.contains(&callee_id)
-                {
-                    caller_node.comp_deps.push(callee_id);
-                }
-                if let Some(callee_node) = nodes.get_mut_by_id(callee_id)
-                    && !callee_node.rdeps.contains(&caller_id)
-                {
-                    callee_node.rdeps.push(caller_id);
-                }
+                let Some(callee_r) = nodes.id_of(&dep_key) else { continue };
+                nodes.push_comp_dep(caller_r, callee_r);
+                nodes.push_rdep(callee_r, caller_r);
             }
         }
 
         // Rebuild `source_index` the same way `record_source_deps` builds it
         // incrementally for a live node.
-        let source_index_entries: Vec<(SourceId, KeyBytes, NodeId)> = nodes
-            .iter()
-            .flat_map(|(id, _node)| nodes.source_deps_iter(id).map(move |dep| (dep.source.clone(), dep.key.clone(), id)))
+        let source_index_entries: Vec<(SourceId, KeyBytes, NodeRef)> = nodes
+            .iter_refs()
+            .flat_map(|r| nodes.source_deps_iter(r).map(move |dep| (dep.source.clone(), dep.key.clone(), r)))
             .collect();
         drop(nodes);
 
         {
             let mut source_index = self.source_index.lock().unwrap();
-            for (source, key_bytes, id) in source_index_entries {
-                source_index.entry((source, key_bytes)).or_default().insert(id);
+            for (source, key_bytes, r) in source_index_entries {
+                source_index.entry((source, key_bytes)).or_default().insert(r);
             }
         }
 
@@ -1020,7 +1021,7 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
     // rely on and easy to deadlock).
     let deps_by_key: HashMap<CompKey, HashSet<RawDep>> = {
         let nodes = engine.nodes.lock().unwrap();
-        nodes.iter().map(|(id, n)| (n.key.clone(), nodes.source_deps_clone(id))).collect()
+        nodes.iter_refs().map(|r| (nodes.key_of(r), nodes.source_deps_clone(r))).collect()
     };
 
     let mut by_source: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
@@ -1077,11 +1078,14 @@ fn mark_dirty_transitive(engine: &EngineInner, initial: HashSet<CompKey>, priori
         let nodes = engine.nodes.lock().unwrap();
         let mut next = HashSet::new();
         for key in &frontier {
-            if let Some(node) = nodes.get(key) {
-                for &rdep_id in &node.rdeps {
-                    let Some(rdep_node) = nodes.get_by_id(rdep_id) else { continue };
-                    if !seen.contains(&rdep_node.key) {
-                        next.insert(rdep_node.key.clone());
+            if let Some(r) = nodes.id_of(key) {
+                for &rdep_r in nodes.rdeps(r) {
+                    if !nodes.contains(rdep_r) {
+                        continue;
+                    }
+                    let rdep_key = nodes.key_of(rdep_r);
+                    if !seen.contains(&rdep_key) {
+                        next.insert(rdep_key);
                     }
                 }
             }
@@ -1134,9 +1138,11 @@ impl EngineInner {
 /// entirely outside it (see [`PendingRecord`]'s docs).
 pub(crate) fn enqueue_changed(engine: &EngineInner, nodes: &NodeTable, key: &CompKey) {
     let Some(handle) = engine.persist.lock().unwrap().clone() else { return };
-    let Some(id) = nodes.id_of(key) else { return };
-    let Some(node) = nodes.get_by_id(id) else { return };
-    let Some(record) = PendingRecord::snapshot(nodes, id, key, node) else { return };
+    let Some(r) = nodes.id_of(key) else { return };
+    let Some(erased_def) = engine.erased_defs.get(key.def()) else { return };
+    let Some(value) = erased_def.value_any(r.row) else { return };
+    let Some(result_hash) = nodes.result_hash(r) else { return };
+    let record = PendingRecord::snapshot(nodes, r, key, value, result_hash);
     handle.enqueue_upsert(key.clone(), record);
 }
 

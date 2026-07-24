@@ -2,12 +2,17 @@
 //! propagation.
 //!
 //! [`Engine`] owns the def table (registered [`CompDef`]s, looked up by
-//! [`DefId`]) and the node table (one [`Node`] per evaluated [`CompKey`],
-//! i.e. per computation application). Evaluating a computation walks the
-//! same algorithm whether it is a root call ([`Engine::eval_root`]) or a
-//! nested call ([`crate::ctx::Ctx::eval`]):
+//! [`DefId`]) and the node table: one row per evaluated [`CompKey`] (i.e.
+//! per computation application), addressed by [`NodeRef`] and stored in a
+//! per-definition, struct-of-arrays [`DefTable`] rather than one
+//! heterogeneous slab — see [`NodeRef`]'s and [`DefTable`]'s docs for the
+//! Tier-2 columnar layout this module implements. Evaluating a computation
+//! walks the same algorithm whether it is a root call
+//! ([`Engine::eval_root`]) or a nested call ([`crate::ctx::Ctx::eval`]):
 //!
-//! 1. A clean, cached node is returned immediately (memoization).
+//! 1. A clean, cached node is returned immediately (memoization) — a typed
+//!    clone straight out of [`crate::def::CompDef::values`], never an
+//!    erased downcast.
 //! 2. A node already being computed is joined via its shared, cloneable
 //!    in-flight future (single-flight dedup) rather than recomputed.
 //! 3. Otherwise the computation actually runs: its dependencies are
@@ -20,7 +25,7 @@
 //! primitive it drives: re-evaluating one node — see
 //! [`EngineInner::rerun_node`], which decodes `(def, param_bytes)` and
 //! re-runs the computation on demand rather than through any closure a node
-//! keeps around (see [`Node`]'s docs for why there is no such closure).
+//! keeps around.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -91,50 +96,61 @@ pub enum DirtyPriority {
     Input = 2,
 }
 
-/// The identity of a node's slot in [`EngineInner`]'s slab (`NodeTable`).
-///
-/// Unlike [`CompKey`] (a computation's stable, content-addressed identity),
-/// a `NodeId` is only a cheap (4-byte) local handle into the *current*
-/// process's in-memory node table: it is never persisted, never compared
-/// across restarts, and is only valid until the node it names is collected
-/// by [`crate::driver`]'s liveness GC — at which point its slot may be
-/// reused for a completely unrelated node. Every long-lived reference to a
-/// computation (a persisted record, `roots`) is keyed by `CompKey` instead,
-/// precisely so it can never be invalidated by GC reusing a `NodeId`;
-/// `NodeId` is used purely as an edge (`comp_deps`, `rdeps`, `source_index`)
-/// representation, and as the key of the node table's sparse side tables
-/// (`source_deps`/`outputs`/`inflight` — see [`NodeTable`]), inside a single
-/// process's live node table, translated back to a `CompKey` (via
-/// [`Node::key`]) whenever an edge needs to leave that table (persistence,
-/// driver-level dirty bookkeeping).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct NodeId(u32);
-
 /// A compact index into the engine's def table (see [`NodeTable`]),
 /// assigned in registration order by [`EngineBuilder::build`].
 ///
-/// This exists purely to shrink [`NodeTable`]'s `CompKey`-keyed index: a
-/// `(DefIndex, Hash128)` pair is 18 bytes versus a full [`CompKey`]'s 32
-/// (a `DefId` is a 16-byte fat pointer; a `DefIndex` is 2). It never
-/// replaces `CompKey`/`DefId` anywhere in the public API, on disk, or on
-/// [`Node`] itself (which still keeps its own full `CompKey` — see
-/// [`Node::key`] — so comp names stay trivially loggable everywhere without
-/// needing to thread a def-table lookup through call sites that only ever
-/// had a `Node` in hand); it is strictly an internal detail of how
-/// [`NodeTable`] indexes its slab.
+/// This exists purely to shrink [`NodeRef`]'s identity down from a full
+/// [`CompKey`] (32 bytes: a `DefId` is a 16-byte fat pointer) to 2 bytes. It
+/// never replaces `CompKey`/`DefId` anywhere in the public API or on disk;
+/// it is strictly an internal detail of how [`NodeTable`] indexes its
+/// per-definition tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DefIndex(u16);
 
-/// The small set of mutually-exclusive/boolean bits that used to be three
-/// separate [`Node`] fields (`state`, `dirty_priority`, `last_changed`),
-/// packed into one byte.
+/// The identity of one row in [`NodeTable`]'s columnar, per-definition
+/// storage (see [`DefTable`]) — the Tier-2 replacement for Tier 1's
+/// `NodeId` (a single global slab index).
 ///
-/// `state` takes 2 bits (3 values), `dirty_priority` takes 2 bits (`None`
-/// plus 2 values), `last_changed` takes 1 bit — 5 bits total, comfortably
-/// inside a `u8`. Accessed only through [`Node`]'s own `state`/`set_state`/
-/// `dirty_priority`/`set_dirty_priority`/`last_changed`/`set_last_changed`
-/// methods, which read exactly like the plain fields they replaced at every
-/// call site.
+/// Like the `NodeId` it replaces, a `NodeRef` is only a cheap (8-byte)
+/// local handle into the *current* process's in-memory node table: it is
+/// never persisted, never compared across restarts, and is only valid
+/// until the node it names is collected by [`crate::driver`]'s liveness GC
+/// — at which point its row may be reused for a completely unrelated node
+/// of the *same* definition. Every long-lived reference to a computation (a
+/// persisted record, `roots`) is keyed by `CompKey` instead; a `NodeRef` is
+/// translated back to one, in O(1), via [`NodeTable::key_of`] — which needs
+/// no per-node storage at all, since a `NodeRef` already carries both
+/// halves of a `CompKey` (the definition, via `def`, and the parameter
+/// hash, read from [`DefTable::param_hash`] at `row`) implicitly. This is
+/// what lets Tier 2 drop the full `CompKey` Tier 1's `Node` kept purely so
+/// `NodeId -> CompKey` translation had somewhere to read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NodeRef {
+    pub(crate) def: DefIndex,
+    pub(crate) row: u32,
+}
+
+/// The small set of mutually-exclusive/boolean bits packed into one byte
+/// per row: `state` (2 bits, 3 values), `dirty_priority` (2 bits, `None`
+/// plus 2 values), `last_changed` (1 bit), `has_result` (1 bit — Tier 2's
+/// addition, see below), and `free` (1 bit — Tier 2's addition, see below).
+/// 7 bits total, comfortably inside a `u8`.
+///
+/// `has_result` replaces Tier 1's `Node::value: Option<_>` / `result_hash:
+/// Option<Hash128>` — a columnar `DefTable` stores dense
+/// `Vec<Hash128>`/value columns (see `crate::def::CompDef::values`) with no
+/// room for a per-row `Option` discriminant of their own, so "has this row
+/// ever completed a successful run" has to live here instead, gating every
+/// read of those columns.
+///
+/// `free` replaces Tier 1's `Vec<Option<Node>>` slab's own `None` sentinel:
+/// a columnar `DefTable`'s per-column `Vec`s can't represent "this row
+/// doesn't exist" by absence (every column must stay the same length), so a
+/// freed row is instead marked here and skipped by every iteration method
+/// ([`NodeTable::iter_refs`], [`DefTable::retain_rdeps`]) — its other
+/// columns' bytes are left as stale garbage until the row is reused (see
+/// [`DefTable::insert`]), exactly as `crate::def::CompDef`'s value column
+/// and [`DefTable`]'s param arena also tolerate GC garbage between reuses.
 #[derive(Debug, Clone, Copy, Default)]
 struct NodeFlags(u8);
 
@@ -150,6 +166,8 @@ const PRIORITY_REVALIDATE: u8 = 1;
 const PRIORITY_INPUT: u8 = 2;
 
 const LAST_CHANGED_BIT: u8 = 0b0001_0000;
+const HAS_RESULT_BIT: u8 = 0b0010_0000;
+const FREE_BIT: u8 = 0b0100_0000;
 
 impl NodeFlags {
     fn new(state: NodeState) -> Self {
@@ -205,193 +223,213 @@ impl NodeFlags {
             self.0 &= !LAST_CHANGED_BIT;
         }
     }
-}
 
-/// One computation application's memoized state.
-///
-/// Deliberately holds no closure of any kind (see [`EngineInner::rerun_node`]
-/// for how the driver re-runs a dirtied node instead): an earlier design
-/// gave every node a boxed `rerun: RerunFn` closure capturing a permanent
-/// `Arc<EngineInner>` plus its typed, owned parameter, which meant an
-/// `Engine` was never actually freed even once every external handle to it
-/// was dropped (any node that had ever executed kept the whole engine alive
-/// via that closure's self-reference). Re-deriving the execution future on
-/// demand from `(def, param_bytes)` — the same mechanism persistence's
-/// revival path already used — removes that cycle entirely, at the cost of
-/// one postcard param decode per rerun (see `EngineInner::rerun_node`),
-/// negligible next to a node's actual body cost.
-///
-/// Two other collections that used to live directly on every `Node` —
-/// `source_deps`/`outputs` (a `HashSet` each, reserved even for the many
-/// nodes that have none) and `inflight` (relevant only to a node currently
-/// running) — now live in sparse side tables on [`NodeTable`], keyed by
-/// [`NodeId`], present only for nodes that actually have an entry.
-pub(crate) struct Node {
-    flags: NodeFlags,
-    /// This node's own stable identity — the `NodeTable`'s index entry,
-    /// duplicated here so a `NodeId` can be translated back to its
-    /// `CompKey` in O(1) (needed by GC, persistence snapshotting, and the
-    /// driver's rdeps-to-dirty-keys translation) without a second, reverse
-    /// index. Deliberately kept as a full `CompKey` (not the compact
-    /// `(DefIndex, Hash128)` pair `NodeTable`'s own index uses internally —
-    /// see [`DefIndex`]'s docs) so every one of those call sites keeps
-    /// working, and comp names stay trivially loggable, with no def-table
-    /// lookup required.
-    pub(crate) key: CompKey,
-    /// The cached result, erased. `Some` even when `state() == Dirty` (a
-    /// stale-but-not-yet-superseded value), `None` only before the first
-    /// successful execution.
-    ///
-    /// Deliberately *not* accompanied by a pre-serialized `value_bytes`
-    /// field: `crate::persist` re-derives postcard bytes lazily, from this
-    /// `Arc`, only for a node actually about to be flushed (see
-    /// `crate::def::ErasedDef::serialize_value`), rather than every node
-    /// permanently carrying a redundant serialized copy of its own value in
-    /// memory.
-    pub(crate) value: Option<Arc<dyn Any + Send + Sync>>,
-    pub(crate) result_hash: Option<Hash128>,
-    /// Postcard-encoded bytes of this node's parameter, computed once when
-    /// the node is first created (a `CompKey`'s param never changes across
-    /// reruns of that same key). Read by `crate::persist` to save a node
-    /// without needing to know its concrete parameter type, and by
-    /// `EngineInner::rerun_node` to decode the typed param again on every
-    /// rerun (see [`Node`]'s docs on why there is no cached rerun closure).
-    ///
-    /// Kept eagerly serialized (unlike `value`) rather than lazily derived
-    /// from a stored erased param: a param is written exactly once per node
-    /// (never re-serialized on rerun, so it never duplicates work the way an
-    /// eager `value_bytes` used to on every changed rerun) and is typically
-    /// far smaller than a result value (a single hashable lookup key vs. a
-    /// potentially large aggregated/computed value) — storing it erased
-    /// (`Arc<dyn Any>` plus a deferred serializer call) would cost at least
-    /// as much memory as the bytes themselves, for no reruns-avoided upside.
-    pub(crate) param_bytes: Vec<u8>,
-    /// Computations this node called during its last execution, by
-    /// [`NodeId`] rather than the full [`CompKey`] each edge would otherwise
-    /// have to repeat.
-    ///
-    /// A `SmallVec` rather than a `HashSet`: fan-out is small in practice, so
-    /// a linear dedup-on-insert scan (see `EngineInner::record_call_dep`) is
-    /// cheaper in both time and space than a hash table's per-entry
-    /// overhead at this size — a deliberate small-set tradeoff, not an
-    /// oversight.
-    pub(crate) comp_deps: SmallVec<[NodeId; 4]>,
-    /// Computations that called this node during their last execution, by
-    /// [`NodeId`] (see `comp_deps`'s docs for why `SmallVec` and why by id).
-    pub(crate) rdeps: SmallVec<[NodeId; 4]>,
-}
-
-impl Node {
-    pub(crate) fn state(&self) -> NodeState {
-        self.flags.state()
+    fn has_result(self) -> bool {
+        self.0 & HAS_RESULT_BIT != 0
     }
 
-    pub(crate) fn set_state(&mut self, state: NodeState) {
-        self.flags.set_state(state);
+    fn set_has_result(&mut self, has_result: bool) {
+        if has_result {
+            self.0 |= HAS_RESULT_BIT;
+        } else {
+            self.0 &= !HAS_RESULT_BIT;
+        }
     }
 
-    pub(crate) fn dirty_priority(&self) -> Option<DirtyPriority> {
-        self.flags.dirty_priority()
+    fn is_free(self) -> bool {
+        self.0 & FREE_BIT != 0
     }
 
-    pub(crate) fn set_dirty_priority(&mut self, priority: Option<DirtyPriority>) {
-        self.flags.set_dirty_priority(priority);
-    }
-
-    pub(crate) fn last_changed(&self) -> bool {
-        self.flags.last_changed()
-    }
-
-    pub(crate) fn set_last_changed(&mut self, changed: bool) {
-        self.flags.set_last_changed(changed);
-    }
-
-    /// Constructs a `Node` directly in the `Clean` state from a persisted
-    /// record's revived pieces (see `crate::persist`), without ever having
-    /// executed the computation in this process.
-    ///
-    /// `comp_deps`/`rdeps` both start empty: `crate::persist`'s loader wires
-    /// them up itself afterward, once every record in the batch has a
-    /// [`NodeId`] (a dependency edge can only be expressed once both of its
-    /// endpoints are already in the table), mirroring how a live node's
-    /// edges are built incrementally by `EngineInner::record_call_dep` as it
-    /// actually runs. Likewise, this node's `source_deps`/`outputs` are not
-    /// set here: `crate::persist::restore_nodes` populates `NodeTable`'s
-    /// side tables for them directly, once this node has a [`NodeId`].
-    pub(crate) fn from_persisted(key: CompKey, revived: RevivedNode) -> Node {
-        Node {
-            flags: NodeFlags::new(NodeState::Clean),
-            key,
-            value: Some(revived.value),
-            result_hash: Some(revived.result_hash),
-            param_bytes: revived.param_bytes,
-            comp_deps: SmallVec::new(),
-            rdeps: SmallVec::new(),
+    fn set_free(&mut self, free: bool) {
+        if free {
+            self.0 |= FREE_BIT;
+        } else {
+            self.0 &= !FREE_BIT;
         }
     }
 }
 
-/// Every piece [`Node::from_persisted`] needs to revive a `Clean` node from
-/// a persisted record, bundled into one struct purely to keep that
-/// constructor's argument list manageable (see `crate::persist`, which
-/// builds one of these per decodable, still-registered record). Excludes
-/// `comp_deps` (and the node's own `CompKey`, passed to `from_persisted`
-/// separately) for the same reason `crate::persist::restore_nodes` also
-/// keeps `source_deps`/`outputs` out of this struct: all three need either
-/// every record in the batch to already have a [`NodeId`] (`comp_deps`) or
-/// this node's own not-yet-assigned [`NodeId`] (`source_deps`/`outputs`,
-/// which land in `NodeTable`'s side tables, not on `Node` itself) before
-/// they can be resolved — `restore_nodes` handles all of that itself, after
-/// every record has been turned into a `Node`.
-pub(crate) struct RevivedNode {
-    pub(crate) param_bytes: Vec<u8>,
-    pub(crate) value: Arc<dyn Any + Send + Sync>,
-    pub(crate) result_hash: Hash128,
+/// One definition's columnar row storage: every `crate::engine`-generic
+/// (non-typed) column for every computation application (row) of this
+/// single definition, addressed by the row half of a [`NodeRef`].
+///
+/// This is the Tier-2 replacement for Tier 1's `Node` struct-of-node slab:
+/// instead of one heterogeneous `Vec<Option<Node>>` shared by every
+/// definition (an `Arc<dyn Any + Send + Sync>` value, a `CompKey`, and every
+/// other field repeated per node regardless of def), each definition gets
+/// its own struct-of-arrays, one allocation per column, so a `u8` flags byte
+/// costs a `u8` per row rather than sharing a cache line with fields that
+/// happen to belong to a completely different definition's nodes.
+///
+/// Two columns deliberately do *not* live here:
+/// - `crate::def::CompDef::values` (the typed `R` result column) lives on
+///   the definition's own `CompDef<P, R>` instead, since `DefTable` must
+///   stay generic over every definition's `R` at once — see that field's
+///   docs for why, and for the object-safe `ErasedDef` methods GC/persist
+///   use to touch it without ever naming `R`.
+/// - `source_deps`/`outputs`/`inflight` stay on [`NodeTable`] as sparse
+///   side maps (unchanged from Tier 1): most nodes have none of the first
+///   two, and essentially no node is ever `inflight` at rest, so a dense
+///   per-row column for any of the three would mostly store nothing.
+///
+/// Row reuse (`Self::insert`, after `Self::remove` frees a row into
+/// `free`) resets every column that could otherwise leak a stale value
+/// across two unrelated `CompKey`s occupying the same row over time —
+/// `comp_deps`/`rdeps`/`param_off`/`param_len`/`param_hash` — **except**
+/// `result_hash`, whose staleness is instead gated by `flags.has_result()`
+/// (cleared on every fresh/reused row), and the `param_arena` bytes a freed
+/// row's slice pointed into, which are simply abandoned (never reclaimed;
+/// see `Self::param_arena`'s docs) — both deliberate, documented garbage
+/// tolerances rather than oversights, mirroring `crate::def::CompDef`'s own
+/// value-column garbage tolerance.
+#[derive(Default)]
+struct DefTable {
+    /// Row `i`'s parameter content hash — together with this table's
+    /// `DefIndex` (implicit: `DefTable`s are indexed by `DefIndex` in
+    /// [`NodeTable::defs`]), the two halves of the `CompKey` a `NodeRef{def,
+    /// row: i}` names. This is also what lets [`NodeTable::key_of`]
+    /// reconstruct a full `CompKey` from a bare `NodeRef` with no
+    /// additional storage — see [`NodeRef`]'s docs.
+    param_hash: Vec<Hash128>,
+    /// Row `i`'s last successful result's content hash, valid only when
+    /// `flags[i].has_result()` (see [`NodeFlags`]'s docs on why a dense
+    /// column can't carry its own `Option` discriminant).
+    result_hash: Vec<Hash128>,
+    flags: Vec<NodeFlags>,
+    /// Row `i`'s parameter bytes are `param_arena[param_off[i] ..
+    /// param_off[i] + param_len[i] as usize]` — see `Self::param_arena`.
+    param_off: Vec<u32>,
+    param_len: Vec<u16>,
+    /// An append-only byte arena backing every row's postcard-encoded
+    /// parameter, replacing Tier 1's one-`Vec<u8>`-allocation-per-node with
+    /// one allocation per definition. Parameters are small in practice
+    /// (a single hashable lookup key, per `crate::engine::Node`'s original
+    /// Tier-1 docs), so the append-only cost (never reclaiming a freed
+    /// row's span) is a deliberate simplicity/memory tradeoff: `Self::remove`
+    /// does not shrink or compact this arena, and nothing here ever will —
+    /// a def whose instance population churns heavily under GC accumulates
+    /// unreachable arena bytes for the lifetime of the process. This is
+    /// judged acceptable for the same reason Tier 1's docs judged an
+    /// always-allocated-even-when-empty per-node `Vec<u8>` unacceptable: the
+    /// steady-state population (not the GC churn) dominates real workloads,
+    /// and an arena is strictly smaller than one heap allocation per row
+    /// even before any garbage is accounted for.
+    param_arena: Vec<u8>,
+    /// Row `i`'s outgoing call edges, by [`NodeRef`] (replaces Tier 1's
+    /// `Node::comp_deps`, unchanged in spirit: small in practice, so a
+    /// dedup-on-insert `SmallVec` beats a hash set at this size).
+    comp_deps: Vec<SmallVec<[NodeRef; 4]>>,
+    /// Row `i`'s incoming call edges — see `comp_deps`.
+    rdeps: Vec<SmallVec<[NodeRef; 4]>>,
+    /// Freed row indices available for `Self::insert` to reuse before
+    /// growing any column.
+    free: Vec<u32>,
+    /// `param_hash -> row`, this definition's own share of what used to be
+    /// `NodeTable`'s single `(DefIndex, Hash128) -> NodeId` index — split
+    /// per-definition here for the same struct-of-arrays reason as every
+    /// other column.
+    index: HashMap<Hash128, u32>,
 }
 
-/// The engine's node table: a slab (`Vec<Option<Node>>` plus a free list) of
-/// every live node, addressable either by its stable [`CompKey`] (via an
-/// index) or by its process-local [`NodeId`] (a direct slab slot).
+impl DefTable {
+    /// Existing row for `param_hash`, if any.
+    fn row_of(&self, param_hash: Hash128) -> Option<u32> {
+        self.index.get(&param_hash).copied()
+    }
+
+    fn contains(&self, row: u32) -> bool {
+        (row as usize) < self.flags.len() && !self.flags[row as usize].is_free()
+    }
+
+    /// Allocates a fresh `Dirty`, no-result row for `param_hash`/
+    /// `param_bytes`, reusing a freed row if one is available, and indexes
+    /// it. Callers must ensure `param_hash` is not already indexed (the
+    /// coalescing "find-or-insert" case is [`NodeTable::get_or_insert`]).
+    fn insert(&mut self, param_hash: Hash128, param_bytes: &[u8]) -> u32 {
+        assert!(
+            param_bytes.len() <= u16::MAX as usize,
+            "param_bytes too large ({} bytes) for this definition's u16 arena span",
+            param_bytes.len()
+        );
+        let off = self.param_arena.len() as u32;
+        self.param_arena.extend_from_slice(param_bytes);
+        let len = param_bytes.len() as u16;
+
+        let row = match self.free.pop() {
+            Some(row) => {
+                let i = row as usize;
+                self.param_hash[i] = param_hash;
+                self.flags[i] = NodeFlags::new(NodeState::Dirty);
+                self.param_off[i] = off;
+                self.param_len[i] = len;
+                self.comp_deps[i] = SmallVec::new();
+                self.rdeps[i] = SmallVec::new();
+                row
+            }
+            None => {
+                self.param_hash.push(param_hash);
+                self.result_hash.push(Hash128::from_bytes([0; 16]));
+                self.flags.push(NodeFlags::new(NodeState::Dirty));
+                self.param_off.push(off);
+                self.param_len.push(len);
+                self.comp_deps.push(SmallVec::new());
+                self.rdeps.push(SmallVec::new());
+                (self.param_hash.len() - 1) as u32
+            }
+        };
+        self.index.insert(param_hash, row);
+        row
+    }
+
+    /// Frees `row`: removes it from the param-hash index and returns it to
+    /// the free list for a future [`Self::insert`] to reuse. Every other
+    /// column's bytes are left in place (stale, gated by `flags.is_free()`
+    /// — see [`DefTable`]'s docs) until that reuse overwrites them.
+    fn remove(&mut self, row: u32) {
+        let i = row as usize;
+        self.index.remove(&self.param_hash[i]);
+        self.flags[i].set_free(true);
+        self.free.push(row);
+    }
+}
+
+/// The engine's node table: [`NodeTable::defs`] holds one [`DefTable`] per
+/// registered definition (indexed by [`DefIndex`]), addressable either by a
+/// node's stable [`CompKey`] (via each `DefTable`'s own index) or by its
+/// process-local [`NodeRef`] (a direct `(DefIndex, row)` pair) — see
+/// [`NodeRef`]'s docs for why this Tier-2 columnar-per-definition layout
+/// replaces Tier 1's single flat `Vec<Option<Node>>` slab.
 ///
-/// This is the in-memory analogue of what used to be a plain
-/// `HashMap<CompKey, Node>`: most of the methods that existed on that map
-/// (`get`/`get_mut`/`keys`/`values_mut`) are preserved here with the same
-/// `CompKey`-keyed signature, so most call sites needed no changes at all
-/// when this replaced it — only code that stores or walks *edges*
-/// (`comp_deps`/`rdeps`/`source_index`) needed to switch to the `NodeId`-based
-/// methods (`get_by_id`/`get_mut_by_id`/`id_of`) to get the point of this
-/// type: an edge only needs 4 bytes (`NodeId`), not 32 (`CompKey`).
-///
-/// Two independent memory-diet moves live here rather than on `Node` itself:
-///
-/// - The `CompKey`-keyed lookup index is keyed on `(DefIndex, Hash128)`
-///   internally (18 bytes) rather than the full `CompKey` (32 bytes) — see
-///   [`DefIndex`]'s docs. `def_index` is this table's own private copy of
-///   "`DefId` -> `DefIndex`", built once (from registration order) by
-///   [`EngineBuilder::build`] and never mutated afterward.
-/// - `source_deps`/`outputs`/`inflight` — fields that used to live directly
-///   on every `Node` even though most nodes have zero source deps/outputs
-///   and are essentially never `inflight` at rest — are sparse side maps
-///   here instead, keyed by [`NodeId`], with an entry only for a node that
-///   actually has one. [`Self::remove_by_id`] purges all three whenever a
-///   node is collected, so a GC'd node never leaves an orphaned side-table
-///   entry behind.
+/// `source_deps`/`outputs`/`inflight` stay exactly as they were in Tier 1:
+/// sparse side maps, now keyed by [`NodeRef`] instead of `NodeId`, with an
+/// entry only for a node that actually has one. [`Self::remove_by_id`]
+/// purges all three whenever a node is collected, so a GC'd node never
+/// leaves an orphaned side-table entry behind.
 pub(crate) struct NodeTable {
-    slots: Vec<Option<Node>>,
-    free: Vec<u32>,
-    index: HashMap<(DefIndex, Hash128), NodeId>,
+    /// Indexed by [`DefIndex`].
+    defs: Vec<DefTable>,
+    /// `DefIndex -> DefId`, the inverse of `def_index`, needed to
+    /// reconstruct a `CompKey` from a bare `NodeRef` (see
+    /// [`Self::key_of`]).
+    def_ids: Vec<DefId>,
     def_index: HashMap<DefId, DefIndex>,
-    source_deps: HashMap<NodeId, HashSet<RawDep>>,
-    outputs: HashMap<NodeId, HashSet<RawOutput>>,
-    inflight: HashMap<NodeId, SharedExec>,
+    source_deps: HashMap<NodeRef, HashSet<RawDep>>,
+    outputs: HashMap<NodeRef, HashSet<RawOutput>>,
+    inflight: HashMap<NodeRef, SharedExec>,
 }
 
 impl NodeTable {
-    fn new(def_index: HashMap<DefId, DefIndex>) -> Self {
+    /// Builds an empty table with one (empty) [`DefTable`] per entry of
+    /// `def_order`, in registration order — the same order
+    /// [`EngineBuilder::build`] uses to assign each definition its
+    /// [`DefIndex`] (simply its position in `def_order`).
+    fn new(def_order: Vec<DefId>) -> Self {
+        let def_index: HashMap<DefId, DefIndex> =
+            def_order.iter().enumerate().map(|(i, &id)| (id, DefIndex(i as u16))).collect();
+        let defs = def_order.iter().map(|_| DefTable::default()).collect();
         NodeTable {
-            slots: Vec::new(),
-            free: Vec::new(),
-            index: HashMap::new(),
+            defs,
+            def_ids: def_order,
             def_index,
             source_deps: HashMap::new(),
             outputs: HashMap::new(),
@@ -399,180 +437,243 @@ impl NodeTable {
         }
     }
 
-    /// Translates a `CompKey` into this table's compact internal index key,
-    /// `None` if `key`'s definition isn't registered on this engine (can't
-    /// happen for any `CompKey` that legitimately reached this table, since
-    /// every one is built from a registered `DefId` — see [`DefIndex`]'s
-    /// docs — but returning `Option` here rather than panicking keeps every
-    /// caller's existing "no node for this key" handling exactly as it was).
-    fn index_key(&self, key: &CompKey) -> Option<(DefIndex, Hash128)> {
-        Some((*self.def_index.get(key.def())?, key.param_hash()))
+    fn dt(&self, d: DefIndex) -> &DefTable {
+        &self.defs[d.0 as usize]
     }
 
-    pub(crate) fn id_of(&self, key: &CompKey) -> Option<NodeId> {
-        let ik = self.index_key(key)?;
-        self.index.get(&ik).copied()
+    fn dt_mut(&mut self, d: DefIndex) -> &mut DefTable {
+        &mut self.defs[d.0 as usize]
     }
 
-    pub(crate) fn get(&self, key: &CompKey) -> Option<&Node> {
-        let id = self.id_of(key)?;
-        self.slots[id.0 as usize].as_ref()
+    pub(crate) fn id_of(&self, key: &CompKey) -> Option<NodeRef> {
+        let def = *self.def_index.get(key.def())?;
+        let row = self.dt(def).row_of(key.param_hash())?;
+        Some(NodeRef { def, row })
     }
 
-    pub(crate) fn get_mut(&mut self, key: &CompKey) -> Option<&mut Node> {
-        let id = self.id_of(key)?;
-        self.slots[id.0 as usize].as_mut()
+    /// Whether `r` still names a live (non-freed) row.
+    pub(crate) fn contains(&self, r: NodeRef) -> bool {
+        self.dt(r.def).contains(r.row)
     }
 
-    pub(crate) fn get_by_id(&self, id: NodeId) -> Option<&Node> {
-        self.slots.get(id.0 as usize)?.as_ref()
+    /// Reconstructs `r`'s full `CompKey` — O(1), and needs no per-row
+    /// storage beyond `r` itself and this def's `param_hash` column; see
+    /// [`NodeRef`]'s docs.
+    pub(crate) fn key_of(&self, r: NodeRef) -> CompKey {
+        CompKey::from_parts(self.def_ids[r.def.0 as usize], self.dt(r.def).param_hash[r.row as usize])
     }
 
-    pub(crate) fn get_mut_by_id(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.slots.get_mut(id.0 as usize)?.as_mut()
+    pub(crate) fn state(&self, r: NodeRef) -> NodeState {
+        self.dt(r.def).flags[r.row as usize].state()
     }
 
-    /// Inserts a brand-new node under `key` (which must equal `node.key`;
-    /// enforced here rather than trusted, since a caller mismatch would
-    /// otherwise silently corrupt the id<->key mapping), returning its
-    /// freshly assigned `NodeId`. Reuses a GC-freed slab slot if one is
-    /// available (see `Self::remove_by_id`), otherwise grows the slab.
-    ///
-    /// Callers must ensure `key` is not already present — [`Self::get_or_insert_with`]
-    /// is the coalescing variant used by the ordinary "cache miss, create a
-    /// node" path.
-    pub(crate) fn insert_new(&mut self, key: CompKey, mut node: Node) -> NodeId {
-        debug_assert_eq!(node.key, key, "Node::key must match the key it is inserted under");
-        node.key = key.clone();
-        let id = match self.free.pop() {
-            Some(slot) => {
-                self.slots[slot as usize] = Some(node);
-                NodeId(slot)
+    pub(crate) fn set_state(&mut self, r: NodeRef, state: NodeState) {
+        self.dt_mut(r.def).flags[r.row as usize].set_state(state);
+    }
+
+    pub(crate) fn dirty_priority(&self, r: NodeRef) -> Option<DirtyPriority> {
+        self.dt(r.def).flags[r.row as usize].dirty_priority()
+    }
+
+    pub(crate) fn set_dirty_priority(&mut self, r: NodeRef, priority: Option<DirtyPriority>) {
+        self.dt_mut(r.def).flags[r.row as usize].set_dirty_priority(priority);
+    }
+
+    pub(crate) fn last_changed(&self, r: NodeRef) -> bool {
+        self.dt(r.def).flags[r.row as usize].last_changed()
+    }
+
+    pub(crate) fn set_last_changed(&mut self, r: NodeRef, changed: bool) {
+        self.dt_mut(r.def).flags[r.row as usize].set_last_changed(changed);
+    }
+
+    /// `r`'s last successful result hash, `None` if it has never completed
+    /// a run (gated by `NodeFlags::has_result`, not by a per-row `Option` —
+    /// see [`DefTable::result_hash`]'s docs).
+    pub(crate) fn result_hash(&self, r: NodeRef) -> Option<Hash128> {
+        let t = self.dt(r.def);
+        t.flags[r.row as usize].has_result().then(|| t.result_hash[r.row as usize])
+    }
+
+    /// Records `r`'s just-completed successful result: sets its hash,
+    /// marks it `Clean` with no pending dirty priority, and sets
+    /// `has_result`. Does *not* touch `r`'s typed value column
+    /// (`crate::def::CompDef::write_value`) — callers write that
+    /// separately, since `NodeTable` itself stays generic over every
+    /// definition's `R`.
+    pub(crate) fn set_result(&mut self, r: NodeRef, hash: Hash128) {
+        let t = self.dt_mut(r.def);
+        t.result_hash[r.row as usize] = hash;
+        let flags = &mut t.flags[r.row as usize];
+        flags.set_state(NodeState::Clean);
+        flags.set_dirty_priority(None);
+        flags.set_has_result(true);
+    }
+
+    pub(crate) fn param_bytes(&self, r: NodeRef) -> &[u8] {
+        let t = self.dt(r.def);
+        let off = t.param_off[r.row as usize] as usize;
+        let len = t.param_len[r.row as usize] as usize;
+        &t.param_arena[off..off + len]
+    }
+
+    pub(crate) fn comp_deps(&self, r: NodeRef) -> &[NodeRef] {
+        &self.dt(r.def).comp_deps[r.row as usize]
+    }
+
+    pub(crate) fn rdeps(&self, r: NodeRef) -> &[NodeRef] {
+        &self.dt(r.def).rdeps[r.row as usize]
+    }
+
+    pub(crate) fn clear_comp_deps(&mut self, r: NodeRef) {
+        self.dt_mut(r.def).comp_deps[r.row as usize].clear();
+    }
+
+    /// Records a `r -> dep` call edge, deduping on insert (see
+    /// `DefTable::comp_deps`'s docs on why a linear scan over a small
+    /// `SmallVec` beats a hash set here).
+    pub(crate) fn push_comp_dep(&mut self, r: NodeRef, dep: NodeRef) {
+        let v = &mut self.dt_mut(r.def).comp_deps[r.row as usize];
+        if !v.contains(&dep) {
+            v.push(dep);
+        }
+    }
+
+    /// Records a `dep -> r` (i.e. `r` is a caller of `dep`) reverse edge on
+    /// `dep`'s own `rdeps` — see [`Self::push_comp_dep`].
+    pub(crate) fn push_rdep(&mut self, dep: NodeRef, r: NodeRef) {
+        let v = &mut self.dt_mut(dep.def).rdeps[dep.row as usize];
+        if !v.contains(&r) {
+            v.push(r);
+        }
+    }
+
+    /// Removes every dead ref in `dead` from every *live* row's `rdeps`
+    /// across every definition — the columnar equivalent of Tier 1's
+    /// `nodes.values_mut().for_each(|n| n.rdeps.retain(...))`, run by
+    /// `crate::driver`'s liveness GC once per pass, before any freed row
+    /// can be reused. Freed rows are skipped (their stale `rdeps` bytes are
+    /// abandoned, not scanned — see [`DefTable`]'s docs).
+    pub(crate) fn retain_rdeps_not_in(&mut self, dead: &HashSet<NodeRef>) {
+        for t in &mut self.defs {
+            for i in 0..t.flags.len() {
+                if t.flags[i].is_free() {
+                    continue;
+                }
+                t.rdeps[i].retain(|x| !dead.contains(x));
             }
-            None => {
-                let idx = self.slots.len() as u32;
-                self.slots.push(Some(node));
-                NodeId(idx)
-            }
-        };
-        let ik = self
-            .index_key(&key)
+        }
+    }
+
+    /// Existing row for `key`, or a freshly inserted `Dirty` one (built from
+    /// `param_bytes()`, called only on the insert path).
+    pub(crate) fn get_or_insert(&mut self, key: &CompKey, param_bytes: impl FnOnce() -> Vec<u8>) -> NodeRef {
+        if let Some(r) = self.id_of(key) {
+            return r;
+        }
+        self.insert_new(key, &param_bytes())
+    }
+
+    /// Inserts a brand-new row for `key`. Callers must ensure `key` is not
+    /// already present — [`Self::get_or_insert`] is the coalescing variant.
+    pub(crate) fn insert_new(&mut self, key: &CompKey, param_bytes: &[u8]) -> NodeRef {
+        let def = *self
+            .def_index
+            .get(key.def())
             .expect("insert_new: key's definition must be registered in this engine's def table");
-        self.index.insert(ik, id);
-        id
+        let row = self.dt_mut(def).insert(key.param_hash(), param_bytes);
+        NodeRef { def, row }
     }
 
-    /// Returns the existing node for `key` if present, otherwise builds one
-    /// via `make` and inserts it — the id/node pair either way. `make`'s
-    /// result's `key` field is overwritten with `key` regardless of what it
-    /// sets, so callers may leave it at any placeholder value.
-    pub(crate) fn get_or_insert_with(&mut self, key: &CompKey, make: impl FnOnce() -> Node) -> (NodeId, &mut Node) {
-        if let Some(id) = self.id_of(key) {
-            (id, self.slots[id.0 as usize].as_mut().expect("slab slot present for an indexed key"))
-        } else {
-            let id = self.insert_new(key.clone(), make());
-            (id, self.slots[id.0 as usize].as_mut().expect("just inserted"))
-        }
+    /// Frees `r`'s row (see [`DefTable::remove`]) and purges every sparse
+    /// side-table entry (`source_deps`/`outputs`/`inflight`) for it, so a
+    /// collected node never leaves one behind.
+    pub(crate) fn remove_by_id(&mut self, r: NodeRef) {
+        self.dt_mut(r.def).remove(r.row);
+        self.source_deps.remove(&r);
+        self.outputs.remove(&r);
+        self.inflight.remove(&r);
     }
 
-    /// Removes and returns the node at `id` (if any), freeing its slab slot
-    /// for reuse by a future [`Self::insert_new`]/[`Self::get_or_insert_with`]
-    /// call — which is exactly why a [`NodeId`] must never be treated as
-    /// stable across a GC pass (see [`NodeId`]'s docs): the slot this
-    /// returns can be handed out again, for an entirely unrelated `CompKey`,
-    /// the very next time a node is created.
-    ///
-    /// Also purges every sparse side-table entry (`source_deps`/`outputs`/
-    /// `inflight`) for `id`, if any, so a collected node never leaves one
-    /// behind — the single place that guarantees this regardless of which
-    /// caller triggered the removal.
-    pub(crate) fn remove_by_id(&mut self, id: NodeId) -> Option<Node> {
-        let node = self.slots.get_mut(id.0 as usize)?.take()?;
-        if let Some(ik) = self.index_key(&node.key) {
-            self.index.remove(&ik);
-        }
-        self.source_deps.remove(&id);
-        self.outputs.remove(&id);
-        self.inflight.remove(&id);
-        self.free.push(id.0);
-        Some(node)
+    /// Every currently-live (non-freed) row, across every definition.
+    pub(crate) fn iter_refs(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.defs.iter().enumerate().flat_map(|(di, t)| {
+            let def = DefIndex(di as u16);
+            t.flags
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !f.is_free())
+                .map(move |(row, _)| NodeRef { def, row: row as u32 })
+        })
     }
 
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &CompKey> {
-        self.slots.iter().filter_map(|s| s.as_ref().map(|n| &n.key))
-    }
-
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Node> {
-        self.slots.iter_mut().filter_map(|s| s.as_mut())
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
-        self.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|n| (NodeId(i as u32), n)))
+    pub(crate) fn keys(&self) -> impl Iterator<Item = CompKey> + '_ {
+        self.iter_refs().map(|r| self.key_of(r))
     }
 
     // -- sparse side tables (`source_deps`/`outputs`/`inflight`) --
 
-    pub(crate) fn source_deps_iter(&self, id: NodeId) -> impl Iterator<Item = &RawDep> {
-        self.source_deps.get(&id).into_iter().flatten()
+    pub(crate) fn source_deps_iter(&self, r: NodeRef) -> impl Iterator<Item = &RawDep> {
+        self.source_deps.get(&r).into_iter().flatten()
     }
 
-    pub(crate) fn source_deps_contains(&self, id: NodeId, dep: &RawDep) -> bool {
-        self.source_deps.get(&id).is_some_and(|deps| deps.contains(dep))
+    pub(crate) fn source_deps_contains(&self, r: NodeRef, dep: &RawDep) -> bool {
+        self.source_deps.get(&r).is_some_and(|deps| deps.contains(dep))
     }
 
-    pub(crate) fn source_deps_clone(&self, id: NodeId) -> HashSet<RawDep> {
-        self.source_deps.get(&id).cloned().unwrap_or_default()
+    pub(crate) fn source_deps_clone(&self, r: NodeRef) -> HashSet<RawDep> {
+        self.source_deps.get(&r).cloned().unwrap_or_default()
     }
 
-    /// Removes and returns `id`'s source deps (empty if it had none),
+    /// Removes and returns `r`'s source deps (empty if it had none),
     /// leaving no entry behind — the side-table equivalent of clearing a
     /// plain field.
-    pub(crate) fn take_source_deps(&mut self, id: NodeId) -> HashSet<RawDep> {
-        self.source_deps.remove(&id).unwrap_or_default()
+    pub(crate) fn take_source_deps(&mut self, r: NodeRef) -> HashSet<RawDep> {
+        self.source_deps.remove(&r).unwrap_or_default()
     }
 
-    /// Merges `raw` into `id`'s source-dep set, creating the entry if this
+    /// Merges `raw` into `r`'s source-dep set, creating the entry if this
     /// is its first one. A no-op for an empty `raw`, so a node that never
     /// reads any source never gets an entry at all.
-    pub(crate) fn extend_source_deps(&mut self, id: NodeId, raw: &HashSet<RawDep>) {
+    pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &HashSet<RawDep>) {
         if raw.is_empty() {
             return;
         }
-        self.source_deps.entry(id).or_default().extend(raw.iter().cloned());
+        self.source_deps.entry(r).or_default().extend(raw.iter().cloned());
     }
 
-    pub(crate) fn outputs_iter(&self, id: NodeId) -> impl Iterator<Item = &RawOutput> {
-        self.outputs.get(&id).into_iter().flatten()
+    pub(crate) fn outputs_iter(&self, r: NodeRef) -> impl Iterator<Item = &RawOutput> {
+        self.outputs.get(&r).into_iter().flatten()
     }
 
-    pub(crate) fn outputs_clone(&self, id: NodeId) -> HashSet<RawOutput> {
-        self.outputs.get(&id).cloned().unwrap_or_default()
+    pub(crate) fn outputs_clone(&self, r: NodeRef) -> HashSet<RawOutput> {
+        self.outputs.get(&r).cloned().unwrap_or_default()
     }
 
-    /// Removes and returns `id`'s outputs (empty if it had none) — see
+    /// Removes and returns `r`'s outputs (empty if it had none) — see
     /// [`Self::take_source_deps`].
-    pub(crate) fn take_outputs(&mut self, id: NodeId) -> HashSet<RawOutput> {
-        self.outputs.remove(&id).unwrap_or_default()
+    pub(crate) fn take_outputs(&mut self, r: NodeRef) -> HashSet<RawOutput> {
+        self.outputs.remove(&r).unwrap_or_default()
     }
 
-    /// Merges `raw` into `id`'s output set — see [`Self::extend_source_deps`].
-    pub(crate) fn extend_outputs(&mut self, id: NodeId, raw: &HashSet<RawOutput>) {
+    /// Merges `raw` into `r`'s output set — see [`Self::extend_source_deps`].
+    pub(crate) fn extend_outputs(&mut self, r: NodeRef, raw: &HashSet<RawOutput>) {
         if raw.is_empty() {
             return;
         }
-        self.outputs.entry(id).or_default().extend(raw.iter().cloned());
+        self.outputs.entry(r).or_default().extend(raw.iter().cloned());
     }
 
-    pub(crate) fn inflight_get(&self, id: NodeId) -> Option<SharedExec> {
-        self.inflight.get(&id).cloned()
+    pub(crate) fn inflight_get(&self, r: NodeRef) -> Option<SharedExec> {
+        self.inflight.get(&r).cloned()
     }
 
-    pub(crate) fn inflight_set(&mut self, id: NodeId, shared: SharedExec) {
-        self.inflight.insert(id, shared);
+    pub(crate) fn inflight_set(&mut self, r: NodeRef, shared: SharedExec) {
+        self.inflight.insert(r, shared);
     }
 
-    pub(crate) fn inflight_clear(&mut self, id: NodeId) {
-        self.inflight.remove(&id);
+    pub(crate) fn inflight_clear(&mut self, r: NodeRef) {
+        self.inflight.remove(&r);
     }
 }
 
@@ -585,11 +686,16 @@ struct PreRunSnapshot {
     old_source_deps: HashSet<RawDep>,
 }
 
-/// What `prepare` decided to do about an evaluation request.
-enum Action {
-    CacheHit(Arc<dyn Any + Send + Sync>),
+/// What `prepare` decided to do about an evaluation request. Generic over
+/// `R`: unlike Tier 1 (where a cache hit handed back an erased `Arc<dyn
+/// Any>` for the caller to downcast), `prepare::<P, R>` already has `R` in
+/// scope, so a cache hit clones the typed value straight out of
+/// `crate::def::CompDef::values` (see that field's docs) with no erasure
+/// round-trip at all.
+enum Action<R> {
+    CacheHit(R),
     Join(SharedExec),
-    Run(PreRunSnapshot),
+    Run(NodeRef, PreRunSnapshot),
 }
 
 /// Shared engine state. Always accessed through `Arc<EngineInner>` (see
@@ -600,10 +706,10 @@ pub(crate) struct EngineInner {
     pub(crate) nodes: Mutex<NodeTable>,
     /// Maintained on every dependency (re-)collection so the driver can map
     /// a changed (source, key) pair back to the computations that read it,
-    /// without scanning the whole node table. Stores [`NodeId`]s rather than
-    /// full [`CompKey`]s for the same reason `Node::comp_deps`/`rdeps` do —
-    /// see [`NodeId`]'s docs.
-    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<NodeId>>>,
+    /// without scanning the whole node table. Stores [`NodeRef`]s rather
+    /// than full [`CompKey`]s for the same reason `DefTable::comp_deps`/
+    /// `rdeps` do — see [`NodeRef`]'s docs.
+    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<NodeRef>>>,
     /// Root applications (evaluated via `Engine::eval_root`), so the
     /// driver's liveness GC knows which nodes are reachable from outside the
     /// graph and must not be collected even with no `rdeps`.
@@ -659,11 +765,11 @@ impl EngineInner {
 
     /// Re-runs `key`'s computation via the normal `eval` path, decoding its
     /// typed parameter from `param_bytes` fresh on every call rather than
-    /// through any closure a node keeps around — see [`Node`]'s docs for why
-    /// there is no such closure anymore, and [`crate::def::ErasedDef::rerun`]
-    /// for the object-safe dispatch this needs (the driver, working only
-    /// from a `Node`'s `CompKey`/`param_bytes`, has no static `P`/`R` to
-    /// call `eval::<P, R>` with directly). This is exactly what persisted
+    /// through any closure a node keeps around, and
+    /// [`crate::def::ErasedDef::rerun`] for the object-safe dispatch this
+    /// needs (the driver, working only from a node's `CompKey`/
+    /// `param_bytes`, has no static `P`/`R` to call `eval::<P, R>` with
+    /// directly). This is exactly what persisted
     /// revival's `ErasedDef::revive_key` decodes at load time, applied on
     /// demand instead of once into a permanent closure — the two paths
     /// collapse into this one function precisely because neither needs a
@@ -694,57 +800,67 @@ impl EngineInner {
     }
 
     /// Decides whether `key` is a cache hit, an in-flight join, or needs a
-    /// fresh run, creating its `Node` on first sight. On the `Run` path this
+    /// fresh run, creating its row on first sight. On the `Run` path this
     /// also resets the node's dynamic dependency/output collections and
     /// marks it `Running`, so the caller must actually run the computation
     /// after this returns.
-    fn prepare<P: CompParam>(self: &Arc<Self>, key: &CompKey, param: &P) -> Action {
+    ///
+    /// Takes `def` (already resolved by [`Self::eval`]) so a cache hit can
+    /// clone the typed result straight out of `def`'s value column (see
+    /// [`crate::def::CompDef::read_value`]) rather than downcasting an
+    /// erased `Arc<dyn Any>` — the Tier-2 fast path [`Action`]'s docs
+    /// describe.
+    fn prepare<P: CompParam, R: CompResult>(
+        self: &Arc<Self>,
+        def: &Arc<CompDef<P, R>>,
+        key: &CompKey,
+        param: &P,
+    ) -> Action<R> {
         let mut nodes = self.nodes.lock().unwrap();
 
-        if let Some(id) = nodes.id_of(key) {
-            if let Some(node) = nodes.get_by_id(id)
-                && node.state() == NodeState::Clean
-                && let Some(v) = &node.value
+        if let Some(r) = nodes.id_of(key) {
+            if nodes.state(r) == NodeState::Clean
+                && let Some(v) = def.read_value(r.row)
             {
-                return Action::CacheHit(v.clone());
+                return Action::CacheHit(v);
             }
-            if let Some(shared) = nodes.inflight_get(id) {
+            if let Some(shared) = nodes.inflight_get(r) {
                 return Action::Join(shared);
             }
         }
 
-        let (id, node) = nodes.get_or_insert_with(key, || Node {
-            flags: NodeFlags::new(NodeState::Dirty),
-            key: key.clone(),
-            value: None,
-            result_hash: None,
-            param_bytes: postcard::to_stdvec(param)
-                .expect("postcard serialization of a well-formed value should not fail"),
-            comp_deps: SmallVec::new(),
-            rdeps: SmallVec::new(),
+        let r = nodes.get_or_insert(key, || {
+            postcard::to_stdvec(param).expect("postcard serialization of a well-formed value should not fail")
         });
 
-        let old_hash = node.result_hash;
-        node.set_state(NodeState::Running);
-        node.comp_deps.clear();
+        let old_hash = nodes.result_hash(r);
+        nodes.set_state(r, NodeState::Running);
+        nodes.clear_comp_deps(r);
 
-        let old_outputs = nodes.take_outputs(id);
-        let old_source_deps = nodes.take_source_deps(id);
+        let old_outputs = nodes.take_outputs(r);
+        let old_source_deps = nodes.take_source_deps(r);
 
-        Action::Run(PreRunSnapshot {
-            old_hash,
-            old_outputs,
-            old_source_deps,
-        })
+        Action::Run(
+            r,
+            PreRunSnapshot {
+                old_hash,
+                old_outputs,
+                old_source_deps,
+            },
+        )
     }
 
-    /// Actually runs the computation for `key`, building its child `Ctx`,
-    /// awaiting the body, updating the node on success or failure, and
-    /// reconciling `source_index` / dropped sink outputs.
+    /// Actually runs the computation for `key`/`node_ref`, building its
+    /// child `Ctx`, awaiting the body, updating the node on success or
+    /// failure, and reconciling `source_index` / dropped sink outputs.
+    /// `def` is already resolved (by [`Self::eval`]), unlike Tier 1 where
+    /// this method did its own `get_def` lookup — see [`Self::prepare`]'s
+    /// docs for why `def` now needs to be in hand earlier.
     async fn run<P: CompParam, R: CompResult>(
         self: &Arc<Self>,
+        def: &Arc<CompDef<P, R>>,
         key: &CompKey,
-        def_id: &DefId,
+        node_ref: NodeRef,
         param: P,
         chain: Arc<Vec<CompKey>>,
         snapshot: PreRunSnapshot,
@@ -754,20 +870,6 @@ impl EngineInner {
             old_outputs,
             old_source_deps,
         } = snapshot;
-        let def = match self.get_def::<P, R>(def_id) {
-            Ok(def) => def,
-            Err(e) => {
-                // Def lookup failed before we ever started executing: leave
-                // the node dirty (not stuck `Running`) so the next attempt
-                // retries cleanly.
-                let mut nodes = self.nodes.lock().unwrap();
-                if let Some(node) = nodes.get_mut(key) {
-                    node.set_state(NodeState::Dirty);
-                }
-                tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
-                return Err(e);
-            }
-        };
 
         let mut child_chain = (*chain).clone();
         child_chain.push(key.clone());
@@ -779,21 +881,21 @@ impl EngineInner {
 
         // `param` is about to be moved into the execution future below, but
         // the "executed" completion event further down wants to render it
-        // for diagnostics — never stored on `Node` (see its docs), so this
-        // is the one place left with the typed param in scope. Guarding the
-        // clone itself behind `tracing::enabled!` means a disabled DEBUG
-        // level pays neither the clone nor the eventual `format!`.
+        // for diagnostics — never stored on the node, so this is the one
+        // place left with the typed param in scope. Guarding the clone
+        // itself behind `tracing::enabled!` means a disabled DEBUG level
+        // pays neither the clone nor the eventual `format!`.
         let param_for_trace = if tracing::enabled!(tracing::Level::DEBUG) { Some(param.clone()) } else { None };
 
+        let body = def.body.clone();
         let fut: BoxFuture<'static, ExecResult> = Box::pin(async move {
             let start = Instant::now();
-            let result = (def.body)(ctx, param).await?;
+            let result = (body)(ctx, param).await?;
             let elapsed = start.elapsed();
             // `value_bytes` here is purely a local scratch encoding for the
             // content hash below (early cutoff) — it is never returned or
-            // stored on the node (see `Node::value`'s docs); `crate::persist`
-            // re-derives its own copy, lazily, only for a node that actually
-            // needs to be flushed.
+            // stored anywhere; `crate::persist` re-derives its own copy,
+            // lazily, only for a node that actually needs to be flushed.
             let value_bytes = postcard::to_stdvec(&result)
                 .expect("postcard serialization of a well-formed value should not fail");
             let hash = Hash128::from_blake3(blake3::hash(&value_bytes));
@@ -804,9 +906,7 @@ impl EngineInner {
 
         {
             let mut nodes = self.nodes.lock().unwrap();
-            if let Some(id) = nodes.id_of(key) {
-                nodes.inflight_set(id, shared.clone());
-            }
+            nodes.inflight_set(node_ref, shared.clone());
         }
 
         let outcome = shared.await;
@@ -814,45 +914,38 @@ impl EngineInner {
         match outcome {
             Ok((value_any, hash, elapsed)) => {
                 let changed = old_hash != Some(hash);
-                let (id, new_source_deps, new_outputs) = {
+                let value: R = downcast_value::<R>(value_any, key)?;
+                let (new_source_deps, new_outputs) = {
                     let mut nodes = self.nodes.lock().unwrap();
-                    let id = nodes.id_of(key).expect("node present: created by prepare() before run() is called");
-                    {
-                        let node = nodes.get_mut_by_id(id).expect("node present: just looked up its id above");
-                        node.set_state(NodeState::Clean);
-                        node.set_dirty_priority(None);
-                        node.value = Some(value_any.clone());
-                        node.result_hash = Some(hash);
-                        node.set_last_changed(changed);
-                    }
-                    nodes.inflight_clear(id);
+                    nodes.set_result(node_ref, hash);
+                    nodes.set_last_changed(node_ref, changed);
+                    // The one clone of `R` this Tier-2 design pays on the
+                    // hot path — only on a genuine state change (not on
+                    // every cache hit; see `crate::def::CompDef`'s docs).
+                    def.write_value(node_ref.row, value.clone());
+                    nodes.inflight_clear(node_ref);
 
                     // Only a genuinely changed result needs a fresh save: a
                     // recomputation that hit early cutoff already has its
                     // (still correct) record on disk. A brand-new node's
                     // first run always counts as changed (`old_hash` was
                     // `None`), so this naturally covers "just created" too,
-                    // without a separate case. Snapshotting and enqueuing
-                    // here, while `nodes` is still locked, is what makes
-                    // `crate::persist`'s background flush race-free: the
-                    // record it eventually writes is exactly this node's
-                    // state at this instant, never a state some later
-                    // (possibly concurrent) rerun has since overwritten. Only
-                    // the node's *value* `Arc` is cloned under this lock
-                    // (cheap, a refcount bump); the postcard bytes
-                    // `crate::persist` actually writes are serialized later,
-                    // outside this lock entirely (see
-                    // `crate::persist::enqueue_changed`).
+                    // without a separate case. Enqueuing here, while `nodes`
+                    // is still locked, is what makes `crate::persist`'s
+                    // background flush race-free: the snapshot it takes is
+                    // exactly this node's state at this instant, never a
+                    // state some later (possibly concurrent) rerun has since
+                    // overwritten.
                     if changed {
                         crate::persist::enqueue_changed(self, &nodes, key);
                     }
 
-                    let new_source_deps = nodes.source_deps_clone(id);
-                    let new_outputs = nodes.outputs_clone(id);
-                    (id, new_source_deps, new_outputs)
+                    let new_source_deps = nodes.source_deps_clone(node_ref);
+                    let new_outputs = nodes.outputs_clone(node_ref);
+                    (new_source_deps, new_outputs)
                 };
 
-                self.remove_stale_source_index(id, &old_source_deps, &new_source_deps);
+                self.remove_stale_source_index(node_ref, &old_source_deps, &new_source_deps);
 
                 let dropped_outputs: HashSet<RawOutput> =
                     old_outputs.iter().filter(|o| !new_outputs.contains(o)).cloned().collect();
@@ -869,19 +962,15 @@ impl EngineInner {
                         "comp.eval finished"
                     );
                 }
-                downcast_value::<R>(value_any, key)
+                Ok(value)
             }
             Err(e) => {
                 // Errors are not memoized: leave the node `Dirty` (not
                 // `Clean`) so the next eval retries instead of reusing the
                 // stale (or absent) value.
                 let mut nodes = self.nodes.lock().unwrap();
-                if let Some(id) = nodes.id_of(key) {
-                    if let Some(node) = nodes.get_mut_by_id(id) {
-                        node.set_state(NodeState::Dirty);
-                    }
-                    nodes.inflight_clear(id);
-                }
+                nodes.set_state(node_ref, NodeState::Dirty);
+                nodes.inflight_clear(node_ref);
                 tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 Err(e)
             }
@@ -905,7 +994,7 @@ impl EngineInner {
     /// registration for that identical pair one statement later,
     /// orphaning it: the very next change to that key would then map to no
     /// node at all in `affected_keys`, permanently.
-    fn remove_stale_source_index(&self, id: NodeId, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
+    fn remove_stale_source_index(&self, r: NodeRef, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
         if old == new {
             return;
         }
@@ -918,7 +1007,7 @@ impl EngineInner {
                 continue;
             }
             if let Some(set) = index.get_mut(&idx_key) {
-                set.remove(&id);
+                set.remove(&r);
                 if set.is_empty() {
                     index.remove(&idx_key);
                 }
@@ -976,12 +1065,23 @@ impl EngineInner {
                 return Err(e);
             }
 
-            let action = self.prepare::<P>(&key, &param);
+            // Resolved up front (rather than only on the `Run` path, as
+            // Tier 1 did) because `prepare`'s cache-hit fast path needs it
+            // too — see `Self::prepare`'s docs.
+            let def = match self.get_def::<P, R>(&def_id) {
+                Ok(def) => def,
+                Err(e) => {
+                    tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                    return Err(e);
+                }
+            };
+
+            let action = self.prepare::<P, R>(&def, &key, &param);
 
             let value = match action {
                 Action::CacheHit(v) => {
                     tracing::debug!(outcome = "cache_hit", "comp.eval finished");
-                    downcast_value::<R>(v, &key)?
+                    v
                 }
                 Action::Join(shared) => match shared.await {
                     Ok((v, _hash, _elapsed)) => {
@@ -993,7 +1093,7 @@ impl EngineInner {
                         return Err(e);
                     }
                 },
-                Action::Run(snapshot) => self.run::<P, R>(&key, &def_id, param, chain, snapshot).await?,
+                Action::Run(node_ref, snapshot) => self.run::<P, R>(&def, &key, node_ref, param, chain, snapshot).await?,
             };
 
             Ok((value, key))
@@ -1003,23 +1103,16 @@ impl EngineInner {
     }
 
     /// Records a `caller -> callee` call edge, deduping on insert: both
-    /// `comp_deps`/`rdeps` are small `SmallVec`s (see [`Node`]'s docs), so a
-    /// linear "already present?" scan before pushing is the deliberately
-    /// cheap choice here, not an oversight — fan-in/fan-out stays small in
-    /// practice, and a `SmallVec` has no hash table to check in O(1) anyway.
+    /// `comp_deps`/`rdeps` are small `SmallVec`s (see [`DefTable`]'s docs),
+    /// so a linear "already present?" scan before pushing is the
+    /// deliberately cheap choice here, not an oversight — fan-in/fan-out
+    /// stays small in practice, and a `SmallVec` has no hash table to check
+    /// in O(1) anyway.
     pub(crate) fn record_call_dep(&self, caller: &CompKey, callee: &CompKey) {
         let mut nodes = self.nodes.lock().unwrap();
-        let callee_id = nodes.id_of(callee);
-        if let (Some(callee_id), Some(node)) = (callee_id, nodes.get_mut(caller))
-            && !node.comp_deps.contains(&callee_id)
-        {
-            node.comp_deps.push(callee_id);
-        }
-        let caller_id = nodes.id_of(caller);
-        if let (Some(caller_id), Some(node)) = (caller_id, nodes.get_mut(callee))
-            && !node.rdeps.contains(&caller_id)
-        {
-            node.rdeps.push(caller_id);
+        if let (Some(caller_r), Some(callee_r)) = (nodes.id_of(caller), nodes.id_of(callee)) {
+            nodes.push_comp_dep(caller_r, callee_r);
+            nodes.push_rdep(callee_r, caller_r);
         }
     }
 
@@ -1031,18 +1124,18 @@ impl EngineInner {
         if raw.is_empty() {
             return;
         }
-        let caller_id = {
+        let caller_r = {
             let mut nodes = self.nodes.lock().unwrap();
-            let id = nodes.id_of(caller);
-            if let Some(id) = id {
-                nodes.extend_source_deps(id, &raw);
+            let r = nodes.id_of(caller);
+            if let Some(r) = r {
+                nodes.extend_source_deps(r, &raw);
             }
-            id
+            r
         };
-        let Some(caller_id) = caller_id else { return };
+        let Some(caller_r) = caller_r else { return };
         let mut index = self.source_index.lock().unwrap();
         for dep in raw {
-            index.entry((dep.source, dep.key)).or_default().insert(caller_id);
+            index.entry((dep.source, dep.key)).or_default().insert(caller_r);
         }
     }
 
@@ -1051,8 +1144,8 @@ impl EngineInner {
             return;
         }
         let mut nodes = self.nodes.lock().unwrap();
-        if let Some(id) = nodes.id_of(caller) {
-            nodes.extend_outputs(id, &raw);
+        if let Some(r) = nodes.id_of(caller) {
+            nodes.extend_outputs(r, &raw);
         }
     }
 }
@@ -1132,8 +1225,8 @@ impl Engine {
     /// useful for unit-testing this module in isolation from `driver.rs`.
     pub(crate) fn mark_dirty_for_test(&self, key: &CompKey) {
         let mut nodes = self.inner.nodes.lock().unwrap();
-        if let Some(node) = nodes.get_mut(key) {
-            node.set_state(NodeState::Dirty);
+        if let Some(r) = nodes.id_of(key) {
+            nodes.set_state(r, NodeState::Dirty);
         }
     }
 }
@@ -1352,12 +1445,10 @@ impl EngineBuilder {
             "engine has {} registered computations, exceeding the u16::MAX+1 DefIndex capacity",
             self.def_order.len()
         );
-        let def_index: HashMap<DefId, DefIndex> =
-            self.def_order.iter().enumerate().map(|(i, &id)| (id, DefIndex(i as u16))).collect();
         Engine {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
-                nodes: Mutex::new(NodeTable::new(def_index)),
+                nodes: Mutex::new(NodeTable::new(self.def_order)),
                 source_index: Mutex::new(HashMap::new()),
                 roots: Mutex::new(HashSet::new()),
                 registry: self.registry,
@@ -1379,31 +1470,57 @@ mod tests {
     use crate::registry::Registry;
     use crate::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
 
-    /// Guards the point of the "node memory diet": a regression that
-    /// accidentally reintroduces a wide field (a full `CompKey` per edge, a
-    /// pre-serialized `value_bytes`/`param_debug`, a 256-bit hash, a
-    /// per-node rerun closure, or an always-allocated `source_deps`/
-    /// `outputs`/`inflight` field) should fail loudly here rather than only
-    /// show up as a surprise in the 1M-instance `persist_bench` benchmark's
-    /// RSS figure. The bound is deliberately generous (comfortably above
-    /// the measured size on the platform this was tuned on) — this is a
-    /// coarse tripwire, not a precise layout contract; exact field layout is
-    /// not part of any public API.
-    ///
-    /// Measured at 296 bytes before the Tier-1 memory redesign (closure-kill
-    /// plus `u16` `DefIndex` plus sparse side tables plus the
-    /// `state`/`dirty_priority`/`last_changed` bitfield packing), 160 bytes
-    /// after — the tripwire bound below is set with headroom above that
-    /// 160, not tight to it.
+    /// Tier-2 replacement for Tier 1's `size_of::<Node>()` tripwire — the
+    /// `Node` struct that guarded no longer exists (Tier 2 replaced the
+    /// single flat node slab with per-definition struct-of-arrays; see
+    /// [`DefTable`]). Sums the per-row cost of every *common* (non-typed)
+    /// column a live row costs in `DefTable`, excluding the append-only
+    /// param arena, the per-definition `param_hash -> row` index map, and
+    /// the typed value column on `crate::def::CompDef` (which varies with
+    /// `R` by design — see that field's docs, and
+    /// `typed_value_column_is_no_larger_than_a_boxed_any` below for a spot
+    /// check of the win that split buys). A regression that widens any of
+    /// these dense per-row columns (a bigger hash, a wider flags byte, a
+    /// `NodeRef` that grows past its documented 8 bytes, a `SmallVec`
+    /// inline capacity bump) should fail loudly here rather than only show
+    /// up as a surprise in the 1M-instance `persist_bench` benchmark's RSS
+    /// figure. The bound is deliberately generous — a coarse tripwire, not
+    /// a precise layout contract.
     #[test]
-    fn node_stays_small() {
-        let size = std::mem::size_of::<Node>();
-        assert!(size <= 192, "Node grew to {size} bytes — see this test's doc comment");
+    fn node_ref_and_row_stay_small() {
+        assert_eq!(std::mem::size_of::<NodeRef>(), 8, "NodeRef grew past its documented 8 bytes");
+
+        let per_row = std::mem::size_of::<Hash128>() * 2 // param_hash + result_hash
+            + std::mem::size_of::<NodeFlags>()
+            + std::mem::size_of::<u32>() // param_off
+            + std::mem::size_of::<u16>() // param_len
+            + std::mem::size_of::<SmallVec<[NodeRef; 4]>>() * 2; // comp_deps + rdeps
+        assert!(
+            per_row <= 150,
+            "DefTable's per-row common-column cost grew to {per_row} bytes — see this test's doc comment"
+        );
+    }
+
+    /// A `u64` result costs a `u64`-sized slot in `crate::def::CompDef`'s
+    /// value column (see that field's docs), no worse than the size of the
+    /// fat pointer alone that Tier 1's `Arc<dyn Any + Send + Sync>` cost
+    /// regardless of `R`. Unlike that fat pointer, the typed column needs
+    /// no separate heap allocation, which is the real Tier-2 saving: a
+    /// difference in allocation count, not in `size_of` on its own.
+    #[test]
+    fn typed_value_column_is_no_larger_than_a_boxed_any() {
+        let typed = std::mem::size_of::<Option<u64>>();
+        let erased = std::mem::size_of::<Arc<dyn Any + Send + Sync>>();
+        assert!(
+            typed <= erased,
+            "Option<u64> ({typed} B) should be no larger than a boxed Arc<dyn Any> handle ({erased} B) alone, \
+             which additionally always costs a separate heap allocation this typed column never pays"
+        );
     }
 
     /// Regression test for the `rerun`-closure -> `Arc<EngineInner>`
-    /// reference cycle this Tier-1 memory redesign removes (see [`Node`]'s
-    /// docs): before this change, any node that had ever executed via the
+    /// reference cycle the Tier-1 memory redesign removed: before that
+    /// change, any node that had ever executed via the
     /// driver's rerun path permanently captured `Arc<EngineInner>` inside
     /// its own closure, so an `Engine` was never actually freed even once
     /// every external handle to it was dropped. Exercises a source-driven

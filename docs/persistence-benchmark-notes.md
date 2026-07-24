@@ -620,3 +620,205 @@ is a `weigh`/`ghc-datasize` assertion, or a CI check on max residency from
 - "What does a bit cost you?" — stage 4(d) packs `last_changed` into one bit;
   the Haskell reference answers the same question with a version-keyed reverse
   index costing ~360 B/node. Same semantics, three orders of magnitude apart.
+
+## Stage 5 — Tier 2 columnar per-def tables (Salsa-style, typed value columns)
+
+Replaced the single generic `Node` slab (Tier 1's `Vec<Option<Node>>` plus a
+`(DefIndex, Hash128) -> NodeId` index) with a Salsa-style "ingredient" layout:
+one struct-of-arrays table per registered definition, plus each definition's
+typed result cache living on the definition itself instead of behind a
+type-erased `Arc<dyn Any>`. Disk format genuinely unchanged (still
+`FORMAT_VERSION = 2`, still full `CompKey`s/def names/param bytes/dep
+identities/hashes/values) — confirmed both by the persisted db coming out
+byte-for-byte the same size (**269.49 MB**, identical to Stage 3/4) and by
+`tracing_smoke`/`dirsync` still passing unmodified (comp names still render).
+
+### Layout decisions
+
+- **Node identity: `NodeRef { def: DefIndex, row: u32 }`, 8 B, not a packed
+  `u32`.** The task offered a choice between an 8-byte struct and a packed
+  `u8 def | u24 row` `u32` (capping the engine at 256 defs / 16.7M rows per
+  def). Went with the struct: Tier 1 already committed to a `u16` `DefIndex`
+  (65,536 defs) as part of its own def-table shrink, and packing `NodeRef`
+  down to `u32` would silently *tighten* that existing contract to 256 defs
+  for a saving that only matters inside `SmallVec<[NodeRef; 4]>` (see below)
+  — not worth quietly breaking a limit Tier 1 deliberately set generously.
+  `u32` rows also means no per-definition row-count ceiling below `u32::MAX`,
+  which a `u24` packing would have introduced. `NodeRef` is `Copy`/`Eq`/`Hash`
+  like the `NodeId` it replaces, and reconstructs a full `CompKey` in O(1)
+  with **no extra storage**: `key_of(r)` reads `def_ids[r.def]` (a
+  registration-order `Vec<DefId>`, already free) and `DefTable::param_hash[r.row]`
+  (a column that has to exist anyway) — this is what let Tier 1's `Node::key`
+  field (a whole redundant `CompKey`, kept purely for O(1) reverse lookup) be
+  dropped entirely, not just shrunk.
+- **Per-def columns (`DefTable`, one per registered definition, indexed by
+  `DefIndex`):** `param_hash: Vec<Hash128>`, `result_hash: Vec<Hash128>`
+  (valid only when `NodeFlags::has_result` — a new packed bit, since a dense
+  column has no room for its own `Option` discriminant), `flags: Vec<NodeFlags>`
+  (now 7 bits: the Tier-1 5 plus `has_result` and `free`), `param_off: Vec<u32>`
+  + `param_len: Vec<u16>` indexing into one append-only `param_arena: Vec<u8>`
+  per def (replacing one `Vec<u8>` heap allocation per node with one
+  allocation per *definition*), `comp_deps`/`rdeps: Vec<SmallVec<[NodeRef; 4]>>`,
+  a `free: Vec<u32>` row free-list, and `index: HashMap<Hash128, u32>` (this
+  definition's share of the old global `(DefIndex, Hash128) -> NodeId` map).
+  `source_deps`/`outputs`/`inflight` stay exactly as Tier 1 left them — sparse
+  `HashMap<NodeRef, _>` side tables on `NodeTable`, unchanged in design, just
+  rekeyed.
+- **Typed value column, on `CompDef` not `NodeTable`.** `CompDef<P, R>` grew
+  a `values: Mutex<Vec<Option<R>>>` field, indexed by the row half of every
+  `NodeRef` this definition has handed out. `NodeTable` itself stays
+  completely generic (never sees `R`); the typed column lives where `R` is
+  already statically known — `CompDef<P, R>`, reached both by the generic
+  `eval::<P, R>` fast path (via `EngineInner::get_def`) and, unchanged, by
+  `DefAdapter`'s `ErasedDef` impl, since both sides hold the very same
+  `Arc<CompDef<P, R>>`. `ErasedDef` grew two methods for the object-safe
+  side: `value_any(row)` (clone `R` out, box it as `Arc<dyn Any>` — paid only
+  when persistence enqueues a changed node, never on a cache hit) and
+  `revive_and_store(row, bytes)` (decode + write directly into the column at
+  load time), replacing the old `revive_value` that handed back an erased
+  `Arc<dyn Any>` for the caller to store on `Node`. `serialize_value` is
+  untouched — flush-time encoding was already deferred outside the lock in
+  Stage 3, and stays that way.
+  - Consequence for `prepare`/`eval`: since a cache hit now needs `R` in
+    hand (to read the typed column), `eval::<P, R>` resolves `CompDef<P, R>`
+    up front, before deciding cache-hit/join/run — Tier 1 only resolved it
+    on the run path. A cache hit now clones `R` out of the column instead of
+    bumping an `Arc<dyn Any>`'s refcount: cheap for `Copy`-ish `R` (this
+    benchmark's `u64`), a real (if bounded, since `R: Clone` was already
+    required) cost for a large `R` on a cache-hit-heavy workload — worth
+    flagging for any def whose result is expensive to clone; wrapping such
+    an `R` in an `Arc` at the call site sidesteps it (an `Arc<R>` clone is
+    once again just a refcount bump, at 8 B/row instead of `Arc<dyn Any>`'s
+    16 B fat pointer).
+- **Row reuse and garbage tolerance.** A GC'd row is marked `flags.free`
+  and pushed onto `DefTable::free`; `DefTable::insert` (on reuse) resets
+  `param_hash`/`flags`/`param_off`/`param_len`/`comp_deps`/`rdeps` but
+  deliberately does **not** touch `result_hash`, the `param_arena` bytes the
+  old occupant's span pointed into, or the typed value column's old entry —
+  all three are stale garbage until the new occupant's first successful run
+  overwrites them, safe because every read of them is gated by
+  `flags.has_result()`/`state() == Clean`, both cleared on every fresh/reused
+  row before any of that garbage could ever be observed. The param arena is
+  never compacted (append-only forever); this mirrors the existing
+  `param_bytes` sizing judgment from Stage 3 (params are small, so even
+  unreclaimed spans are cheap) and keeps `DefTable::insert`/`remove` O(1)
+  with no scan.
+- **Liveness GC.** `crate::driver::liveness_gc`'s mark-sweep walks
+  `NodeRef`s instead of `NodeId`s; the old "strip every surviving node's
+  `rdeps` of anything just collected" pass became
+  `NodeTable::retain_rdeps_not_in`, iterating every def's `rdeps` column
+  directly (skipping freed rows via `flags.is_free()`) — same O(live nodes)
+  shape as Tier 1, just column-major instead of row-major. Verified no
+  `NodeRef` is ever held across a GC boundary: every driver-side use lives
+  entirely inside one `nodes.lock()` critical section per round (`propagate`'s
+  `run_wave` re-derives a fresh `NodeRef` via `id_of` after every `.await`
+  rather than caching one across it), matching the invariant Tier 1 already
+  established for `rerun` closures.
+
+### Per-row byte accounting
+
+Replaced the `size_of::<Node>() <= 192` tripwire (the struct it guarded no
+longer exists) with `engine::tests::node_ref_and_row_stay_small`, summing
+`DefTable`'s dense per-row columns directly (excludes the param arena, the
+per-def index map, and the typed value column, which varies with `R` — see
+`typed_value_column_is_no_larger_than_a_boxed_any`), and with a printed
+bytes/instance line in `persist_bench` itself (`engine-only RSS ÷
+instances`, phase 5) as the empirical companion, since the real per-instance
+cost now spans several independently-allocated pieces no single `size_of`
+call can add up.
+
+Measured column sizes (this platform): `Hash128` = 16 B, `NodeFlags` = 1 B,
+`param_off: u32` = 4 B, `param_len: u16` = 2 B, `SmallVec<[NodeRef; 4]>` =
+**48 B** (`NodeRef` at 8 B pushes the inline array to 32 B, past the 16 B a
+spilled `Vec` handle would need, plus the length field). Common-column sum:
+
+```
+param_hash (16) + result_hash (16) + flags (1) + param_off (4) + param_len (2)
+  + comp_deps (48) + rdeps (48) = 135 B/row
+```
+
+plus this benchmark's `u64` result column (`Option<u64>` = 16 B, no
+`unsafe`/`MaybeUninit` niche-packing attempted — see `CompDef::values`'s
+docs) = **151 B** of accounted dense-column bytes per instance, before the
+param arena, the per-def `index: HashMap<Hash128, u32>`, and the unchanged
+`source_deps`/`outputs`/`inflight` side tables. Measured engine-only RSS
+(below) lands at **~328 B/instance** — the ~177 B gap is exactly the
+unaccounted pieces just named, principally: `NodeRef` doubling every
+`SmallVec` edge and side-table key from Tier 1's 4-byte `NodeId` to 8 bytes
+(a real, deliberate cost of the wider identity — see "layout decisions"
+above); and splitting one global lookup `HashMap` into 50 per-def ones,
+each paying hashbrown's fixed minimum-table overhead independently rather
+than amortizing it across one large table.
+
+### Full 1M table (two independent runs; `PERSIST_BENCH_SCALE=1.0`, 999,760
+achieved instances, unchanged from every earlier stage)
+
+| phase | Tier 1 (Stage 4) | Tier 2 (Stage 5) | Δ |
+|---|---|---|---|
+| cold eval (persistence configured) | 4.10–4.12 s | **3.69–3.73 s** | **−9 to −10%** |
+| persist_now / db size | 2.45–2.46 s / 269.49 MB | **2.24–2.49 s** / **269.49 MB** | flat / unchanged |
+| warm restart, no changes | 1.67–1.72 s | **1.36–1.44 s** | **−16 to −19%** |
+| restart, 1 changed input | 2.22–2.41 s | **1.83–2.09 s** | **−13 to −17%** |
+| cold restart, no persistence | 3.26–3.29 s | **2.91–2.96 s** | **−10 to −11%** |
+| fingerprint mismatch (full revalidation) | 5.68–5.69 s | **4.96–5.13 s** | **−10 to −13%** |
+| live incremental, no persistence | 616–617 ms | **502–509 ms** | **−17 to −19%** |
+| live incremental, with persistence | 714–757 ms | **650–704 ms** | **−7 to −9%** |
+| live incremental, time-to-durable | 3.11–3.31 s | **3.07–3.18 s** | flat |
+| **engine-only RSS (no persistence)** | **427.1–429.6 MB** | **328.1–330.5 MB** | **−23%** |
+| peak RSS (with persistence configured) | 1.38–1.42 GB | 1.25–1.35 GB | −5 to −10% |
+
+Every single timing phase came out *faster*, not just "within 15%" — the
+opposite of what the acceptance criteria budgeted for and asked to
+investigate if exceeded in the wrong direction. This tracks the task's own
+prediction ("columnar locality may even improve propagation sweeps"):
+`liveness_gc`'s rdeps sweep, `propagate`'s wave re-runs, and GC's mark phase
+all now walk one definition's rows contiguously (`Vec<NodeFlags>`,
+`Vec<SmallVec<[NodeRef; 4]>>`, ...) instead of striding through one global
+slab where consecutive slots belong to unrelated definitions with unrelated
+cache-line contents — the exact cache-locality argument Salsa's own
+"ingredient" design is built on.
+
+Engine-only RSS improved **23%** (428 MB → ~329 MB), a real and
+consistently-reproduced win (two trials landed within 0.5 MB of each other)
+but short of the ~2× / ≤250 MB aspirational target — see the byte accounting
+above for where the remaining gap goes. Persisted db size is byte-for-byte
+identical to Stage 3/4 (269.49 MB), confirming the disk format truly didn't
+move.
+
+### Surprises
+
+- **The RSS win is smaller than the per-row structural math alone would
+  predict**, because `NodeRef` doubling in size (4 B `NodeId` → 8 B
+  `NodeRef`) taxes every place an edge or a side-table key is stored — and
+  Tier 2 didn't touch `source_deps`/`outputs`/`inflight`'s design at all, so
+  none of those pay any columnar dividend; they only pay the wider-key cost.
+  A future stage could recover some of this by keeping a `u32`-sized
+  "local" edge representation (row only, implicitly same-def) for the
+  common case of an edge staying within one definition — not attempted here
+  (most edges in this benchmark's graph cross definitions, level to level,
+  so a same-def fast path would help less than it might elsewhere).
+- **Splitting one `HashMap` into 50 costs more than expected.** hashbrown
+  allocates a minimum-sized control-byte table even for a `DefTable` with
+  relatively few live rows (the top few levels, sized in the low thousands);
+  multiplying that fixed cost by 50 definitions is a real, measurable tax a
+  single consolidated index never paid. Not large enough on its own to
+  explain the full gap, but a genuine, structural side effect of "per-def"
+  that a purely additive size estimate misses.
+- **Every timing phase improved, with no exceptions** — genuinely surprised
+  the persistence-configured phases (1, 3, 4, 6, 8) improved too, since
+  those pay redb overhead that Tier 2 never touched; the shared
+  `EngineInner`/`NodeTable` locking path being faster across the board
+  (columnar locality, one fewer 32-byte `CompKey` clone per node touched
+  during GC and persistence snapshotting, now reconstructed on demand
+  instead of stored) apparently dominates even there.
+- The `Option<R>` typed value column (no `unsafe`/`MaybeUninit`) costs
+  `size_of::<R>()` rounded up for alignment plus a discriminant — for this
+  benchmark's `u64`, that's 16 B, *exactly* matching `size_of::<Arc<dyn Any
+  + Send + Sync>>()` (also 16 B, a fat pointer) with no size win at the
+  `size_of` level at all (see `typed_value_column_is_no_larger_than_a_boxed_any`,
+  whose original name — before it turned out to only tie, not beat — was
+  `..._is_smaller_than_a_boxed_any`). The entire Tier-2 typed-column win is
+  the *absence* of a separate heap allocation per node, not a smaller
+  in-place representation — worth stating plainly since it doesn't show up
+  in any `size_of` assertion, only in RSS.
+

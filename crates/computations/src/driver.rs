@@ -34,7 +34,7 @@ use futures::future::{BoxFuture, FutureExt, join_all, select_all};
 use tracing::Instrument;
 
 use crate::def::Comp;
-use crate::engine::{DirtyPriority, Engine, EngineInner, NodeId, NodeState};
+use crate::engine::{DirtyPriority, Engine, EngineInner, NodeRef, NodeState};
 use crate::error::CompError;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
@@ -276,7 +276,7 @@ impl EngineInner {
     fn live_outputs_by_sink(&self) -> HashMap<SinkId, HashSet<OutBytes>> {
         let nodes = self.nodes.lock().unwrap();
         let mut live: HashMap<SinkId, HashSet<OutBytes>> = HashMap::new();
-        for (id, _node) in nodes.iter() {
+        for id in nodes.iter_refs() {
             for out in nodes.outputs_iter(id) {
                 live.entry(out.sink.clone()).or_default().insert(out.out.clone());
             }
@@ -319,11 +319,13 @@ impl EngineInner {
                 continue;
             };
             for &id in ids {
-                let Some(node) = nodes.get_by_id(id) else { continue };
+                if !nodes.contains(id) {
+                    continue;
+                }
                 if nodes.source_deps_contains(id, dep) {
                     continue;
                 }
-                affected.insert(node.key.clone());
+                affected.insert(nodes.key_of(id));
             }
         }
         affected
@@ -345,13 +347,13 @@ impl EngineInner {
     pub(crate) fn mark_dirty_quiet(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
         let mut nodes = self.nodes.lock().unwrap();
         for key in keys {
-            if let Some(node) = nodes.get_mut(key) {
-                let merged = match node.dirty_priority() {
+            if let Some(r) = nodes.id_of(key) {
+                let merged = match nodes.dirty_priority(r) {
                     Some(existing) => existing.max(priority),
                     None => priority,
                 };
-                node.set_dirty_priority(Some(merged));
-                node.set_state(NodeState::Dirty);
+                nodes.set_dirty_priority(r, Some(merged));
+                nodes.set_state(r, NodeState::Dirty);
             }
         }
     }
@@ -375,7 +377,7 @@ impl EngineInner {
     pub(crate) fn mark_all_dirty(&self, priority: DirtyPriority) {
         let keys: HashSet<CompKey> = {
             let nodes = self.nodes.lock().unwrap();
-            nodes.keys().cloned().collect()
+            nodes.keys().collect()
         };
         self.mark_dirty(&keys, priority);
     }
@@ -434,7 +436,7 @@ impl EngineInner {
         let mut input = HashSet::new();
         let mut revalidate = HashSet::new();
         for key in keys {
-            match nodes.get(&key).and_then(|n| n.dirty_priority()) {
+            match nodes.id_of(&key).and_then(|r| nodes.dirty_priority(r)) {
                 Some(DirtyPriority::Input) => {
                     input.insert(key);
                 }
@@ -554,9 +556,9 @@ impl EngineInner {
             batch
                 .iter()
                 .filter_map(|key| {
-                    let node = nodes.get_mut(key)?;
-                    node.set_state(NodeState::Dirty);
-                    Some((key.clone(), node.param_bytes.clone()))
+                    let r = nodes.id_of(key)?;
+                    nodes.set_state(r, NodeState::Dirty);
+                    Some((key.clone(), nodes.param_bytes(r).to_vec()))
                 })
                 .collect()
         };
@@ -572,14 +574,17 @@ impl EngineInner {
                 match result {
                     Ok(()) => {
                         reran += 1;
-                        let Some(node) = nodes.get(key) else {
+                        let Some(r) = nodes.id_of(key) else {
                             continue;
                         };
-                        if node.last_changed() {
-                            for &rdep_id in &node.rdeps {
-                                let Some(rdep_node) = nodes.get_by_id(rdep_id) else { continue };
-                                if !done.contains(&rdep_node.key) {
-                                    next_frontier.insert(rdep_node.key.clone());
+                        if nodes.last_changed(r) {
+                            for &rdep_r in nodes.rdeps(r) {
+                                if !nodes.contains(rdep_r) {
+                                    continue;
+                                }
+                                let rdep_key = nodes.key_of(rdep_r);
+                                if !done.contains(&rdep_key) {
+                                    next_frontier.insert(rdep_key);
                                 }
                             }
                         } else {
@@ -631,17 +636,17 @@ impl EngineInner {
         let (dead_keys, outputs_by_sink, dead_source_deps) = {
             let mut nodes = self.nodes.lock().unwrap();
 
-            let mut reachable: HashSet<NodeId> = HashSet::new();
-            let mut stack: Vec<NodeId> = {
+            let mut reachable: HashSet<NodeRef> = HashSet::new();
+            let mut stack: Vec<NodeRef> = {
                 let roots = self.roots.lock().unwrap();
                 roots.iter().filter_map(|key| nodes.id_of(key)).collect()
             };
-            while let Some(id) = stack.pop() {
-                if !reachable.insert(id) {
+            while let Some(r) = stack.pop() {
+                if !reachable.insert(r) {
                     continue;
                 }
-                if let Some(node) = nodes.get_by_id(id) {
-                    for &dep in &node.comp_deps {
+                if nodes.contains(r) {
+                    for &dep in nodes.comp_deps(r) {
                         if !reachable.contains(&dep) {
                             stack.push(dep);
                         }
@@ -649,8 +654,7 @@ impl EngineInner {
                 }
             }
 
-            let dead_ids: HashSet<NodeId> =
-                nodes.iter().map(|(id, _)| id).filter(|id| !reachable.contains(id)).collect();
+            let dead_ids: HashSet<NodeRef> = nodes.iter_refs().filter(|r| !reachable.contains(r)).collect();
             if dead_ids.is_empty() {
                 return GcStats::default();
             }
@@ -658,35 +662,33 @@ impl EngineInner {
             let mut dead_keys: Vec<CompKey> = Vec::with_capacity(dead_ids.len());
             let mut outputs_by_sink: HashMap<SinkId, Vec<OutBytes>> = HashMap::new();
             let mut dead_source_deps: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
-            for &id in &dead_ids {
+            for &r in &dead_ids {
                 // Captured before `remove_by_id`, which purges every
                 // side-table entry (`source_deps`/`outputs`/`inflight`) for
-                // `id` as part of collecting the node itself — see its docs.
-                let outputs = nodes.outputs_clone(id);
-                let source_deps = nodes.source_deps_clone(id);
-                if let Some(node) = nodes.remove_by_id(id) {
-                    dead_keys.push(node.key);
-                    for RawOutput { sink, out } in outputs {
-                        outputs_by_sink.entry(sink).or_default().push(out);
-                    }
-                    for dep in source_deps {
-                        dead_source_deps.entry(dep.source).or_default().insert(dep.key);
-                    }
+                // `r` as part of collecting the node itself — see its docs.
+                let key = nodes.key_of(r);
+                let outputs = nodes.outputs_clone(r);
+                let source_deps = nodes.source_deps_clone(r);
+                nodes.remove_by_id(r);
+                dead_keys.push(key);
+                for RawOutput { sink, out } in outputs {
+                    outputs_by_sink.entry(sink).or_default().push(out);
+                }
+                for dep in source_deps {
+                    dead_source_deps.entry(dep.source).or_default().insert(dep.key);
                 }
             }
 
             {
                 let mut index = self.source_index.lock().unwrap();
                 index.retain(|_, callers| {
-                    for id in &dead_ids {
-                        callers.remove(id);
+                    for r in &dead_ids {
+                        callers.remove(r);
                     }
                     !callers.is_empty()
                 });
             }
-            for node in nodes.values_mut() {
-                node.rdeps.retain(|id| !dead_ids.contains(id));
-            }
+            nodes.retain_rdeps_not_in(&dead_ids);
 
             (dead_keys, outputs_by_sink, dead_source_deps)
         };
@@ -763,25 +765,23 @@ mod tests {
         keys.insert(key.clone());
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
+        let node_ref = engine.inner.nodes.lock().unwrap().id_of(&key).unwrap();
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
+            engine.inner.nodes.lock().unwrap().dirty_priority(node_ref),
             Some(DirtyPriority::Revalidate)
         );
-        assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().state(),
-            NodeState::Dirty
-        );
+        assert_eq!(engine.inner.nodes.lock().unwrap().state(node_ref), NodeState::Dirty);
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Input);
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
+            engine.inner.nodes.lock().unwrap().dirty_priority(node_ref),
             Some(DirtyPriority::Input),
             "Input must win over a prior Revalidate mark"
         );
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);
         assert_eq!(
-            engine.inner.nodes.lock().unwrap().get(&key).unwrap().dirty_priority(),
+            engine.inner.nodes.lock().unwrap().dirty_priority(node_ref),
             Some(DirtyPriority::Input),
             "a later Revalidate mark must not downgrade an already-Input pending priority"
         );
@@ -806,7 +806,7 @@ mod tests {
         engine.inner.mark_all_dirty(DirtyPriority::Revalidate);
 
         let nodes = engine.inner.nodes.lock().unwrap();
-        assert_eq!(nodes.get(&key_a).unwrap().dirty_priority(), Some(DirtyPriority::Revalidate));
-        assert_eq!(nodes.get(&key_b).unwrap().dirty_priority(), Some(DirtyPriority::Revalidate));
+        assert_eq!(nodes.dirty_priority(nodes.id_of(&key_a).unwrap()), Some(DirtyPriority::Revalidate));
+        assert_eq!(nodes.dirty_priority(nodes.id_of(&key_b).unwrap()), Some(DirtyPriority::Revalidate));
     }
 }

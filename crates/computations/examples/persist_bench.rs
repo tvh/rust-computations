@@ -492,6 +492,24 @@ fn orchestrator_main() {
     }
     println!();
     println!("peak RSS observed across phases (max of each isolated worker process): {peak_rss:.1} MB");
+
+    // Tier-2 replacement for the old size_of::<Node>() tripwire: a printed
+    // bytes-per-node accounting (engine-only RSS ÷ instances), computed
+    // straight from phase 5's measured numbers (cold restart, no
+    // persistence configured at all — the same "engine-only RSS" figure
+    // this doc's Tier-1/Tier-2 stages both report) rather than a
+    // compile-time struct size, since the real per-instance cost now spans
+    // several independently-allocated columns (`DefTable`'s struct-of-arrays,
+    // the param arena, each definition's typed value column, the sparse
+    // side tables) that no single `size_of::<T>()` can add up.
+    println!();
+    println!("=== bytes/node (engine-only RSS / instances, phase 5) ===");
+    for r in results.iter().filter(|r| r.label.starts_with("5. cold restart, no persistence")) {
+        if r.reruns > 0 {
+            let bytes_per_node = r.rss_mb * 1_000_000.0 / r.reruns as f64;
+            println!("{}: {:.1} MB / {} instances = {:.1} B/instance", r.label, r.rss_mb, r.reruns, bytes_per_node);
+        }
+    }
 }
 
 /// Runs the single phase (or trial) named by `phase_id` in this (worker)
