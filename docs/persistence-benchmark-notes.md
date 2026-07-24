@@ -1347,7 +1347,8 @@ would be worth doing before quoting these tables in a public writeup.
 
 Ranked by estimated impact × confidence, given the profile data above:
 
-1. **Stop re-hashing already-hashed keys.** Swap the per-def
+1. **Stop re-hashing already-hashed keys. — DONE, see addendum below.**
+   Swap the per-def
    `index: HashMap<Hash128, u32>` (and any other `HashMap<Hash128, _>` /
    `HashMap<CompKey, _>` on the hot path) from `std`'s default SipHash to a
    hasher that just reads bytes out of the key (`FxHashMap`-style, or a
@@ -1407,4 +1408,108 @@ Ranked by estimated impact × confidence, given the profile data above:
 stage was written to the session scratchpad, not the repo, so no explicit
 cleanup was needed — the `.gitignore` entries are a guard for next time
 someone runs `samply record` from inside the repo root.
+
+### Addendum — identity hashing for `Hash128` keys (candidate 1 applied)
+
+Implemented optimization candidate 1 above: stopped re-hashing keys that
+are already a uniformly-distributed content hash.
+
+**What changed.** A new `crate::hashers` module (`src/hashers.rs`) defines
+`IdentityHasher`/`IdentityBuildHasher`: a tiny hand-rolled `Hasher` that
+keeps a single `u64` accumulator, folds a `write_u64`/`write_u128` call in
+with a cheap rotate-xor (the identity function for the common case of a
+key hashed via exactly one `write_u64` from a fresh accumulator), and falls
+back to a plain FNV-1a fold for `write(bytes)` (needed for `CompKey`'s
+short `DefId` string field). `Hash128`'s `Hash` impl (`src/key.rs`) was
+changed from `#[derive(Hash)]` (which would `write` all 16 raw bytes) to a
+manual impl that calls `write_u64` once with the hash's own first 8 bytes
+— safe because `Hash128` is already a uniform blake3-derived value (see
+the type's own docs and `crate::hashers`' module docs for the full
+HashDoS-surface argument: nothing in this engine's key space is
+adversary-controlled independently of also controlling the value that was
+blake3-hashed to produce the `Hash128` in the first place, and `Eq` still
+checks the full 128 bits regardless of what feeds the hash).
+
+Applied `IdentityBuildHasher` (via new `crate::key::{Hash128Map, CompKeySet,
+CompKeyMap}` type aliases) to every map/set actually keyed by `Hash128` or
+by `CompKey` (whose derived hash is dominated by its `Hash128` field):
+
+- `DefTable::index: Hash128Map<u32>` (`src/engine.rs`) — the single hottest
+  map this targets; every `ctx.eval` call does a lookup and, on a cache
+  miss, an insert here.
+- `EngineInner::roots: Mutex<CompKeySet>` (`src/engine.rs`).
+- Every `HashSet<CompKey>`/`HashMap<CompKey, _>` on the driver's live
+  propagation path (`src/driver.rs`): `affected_keys`, `mark_dirty_quiet`/
+  `mark_dirty` (the `pub(crate)` `EngineInner` versions), `mark_all_dirty`,
+  `recv_marked_dirty`, `poll_pending_input_changes`, `split_by_tier`,
+  `propagate`/`propagate_tier`/`run_wave` (including their `done`/frontier
+  sets — the wave-propagation hot loop phase (c) of Stage 6 profiled).
+- `PendingMap::entries: CompKeyMap<PendingEntry>` and
+  `PersistHandle::requeue_after_failure`'s parameter (`src/persist.rs`) —
+  the persist-side pending map named in the task.
+- `probe_restored_source_deps`'s `deps_by_key`/return value and
+  `mark_dirty_transitive`'s `seen`/frontier sets (`src/persist.rs`,
+  restore-time dirtying).
+
+**Deliberately left untouched** (out of scope, genuinely non-uniform or
+public-API-facing keys): `RawDep`/`SourceId`/`KeyBytes`/`SinkId`/`OutBytes`
+side tables (string/byte-keyed, not `Hash128`-dominated — still need
+`std`'s HashDoS-resistant SipHash), `NodeRef`-keyed side tables
+(`source_deps`, `outputs`, `inflight`, `source_index`'s inner
+`HashSet<NodeRef>`), and the **public** `Engine::mark_dirty(&self, keys:
+&HashSet<CompKey>, …)` entry point, which keeps its original
+default-hashed `std::collections::HashSet<CompKey>` signature for backward
+compatibility and converts once (`keys.iter().cloned().collect()`) into a
+`CompKeySet` before handing off to the identity-hashed internal path — a
+one-time, off-hot-path cost paid only by external callers of this method,
+not by the propagation loop.
+
+**Correctness.** 92 tests green (`cargo test --workspace --all-features`,
+up from 88 pre-change — the net +4 is `hashers.rs`'s own unit tests:
+`Hash128`'s hash is exactly its first-8-bytes verbatim, equal
+`Hash128`/`CompKey` values still hash equal, and a differing `param_hash`
+usually changes the hash). `cargo clippy --all-targets --all-features -D
+warnings` clean.
+
+**Benchmark.** Machine load was elevated throughout this session
+(`uptime` load averages ranging **9.8–15.2** across the runs below, on the
+same box Stage 6 flagged as having a 12–30 load average during its own
+profiling pass) — consistent with Stage 6's caveat that a loaded box
+inflates absolute times well above the original Stage 5 clean-box
+baselines (cold eval 3.69–3.73 s, warm restart 1.36–1.44 s, live
+incremental 502–509 ms / 650–704 ms). Rather than compare against those
+now-stale-condition numbers directly, this run did a same-session,
+same-load A/B: `git stash`'d this change, rebuilt, ran the **pre-change**
+binary twice, `git stash pop`'d, rebuilt, and ran the **patched** binary
+four times total (two runs from before the A/B was set up, two more
+immediately after), all within about a 5-minute window on the same idle
+level. Per-phase average across runs (ms; phase numbers/labels match the
+`persist_bench` output and Stage 5's table):
+
+| phase | pre-change avg (2 runs) | patched avg (4 runs) | Δ |
+|---|---|---|---|
+| 1. cold eval (persistence configured) | 4433 | 3976 | **−10.3%** |
+| 3. warm restart, no changes | 1647 | 1399 | **−15.1%** |
+| 4. restart, 1 changed input | 2219 | 1950 | **−12.1%** |
+| 5. cold restart, no persistence | 3112 | 2896 | **−6.9%** |
+| 6. fingerprint mismatch (full revalidation) | 5653 | 4801 | **−15.1%** |
+| 7. live incremental, no persistence | 603 | 520 | **−13.8%** |
+| 8. live incremental, with persistence (settle) | 791 | 727 | **−8.0%** |
+| 8. live incremental, time-to-durable | 3602 | 3283 | **−8.8%** |
+
+Every phase improved, by more than the profiler's ~5–8%-of-self-time
+estimate in several cases (warm restart and fingerprint mismatch, both
+−15%) — plausible, not just noise: those two phases *rebuild* every
+per-def `index` map from scratch on load (`restore_nodes`, the exact
+function Stage 6's profile named as paying the "hash the already-hashed
+key" tax once per restored node), so they're disproportionately
+hash-bound to begin with, and some of the win compounds because less time
+spent hashing under `EngineInner`'s global `Mutex<NodeTable>` shortens
+that lock's held time too, not just the hashing itself. Individual runs
+were noisy under this load (e.g. phase 8's settle time ranged 627–974 ms
+across the four patched runs) — the *averages* and the consistent
+same-direction sign across every phase are the reliable signal here, not
+any single run's absolute number. Worth re-running on an idle box before
+quoting tighter confidence intervals in a public writeup, per Stage 6's
+own standing caveat.
 

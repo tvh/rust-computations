@@ -36,7 +36,7 @@ use tracing::Instrument;
 use crate::def::Comp;
 use crate::engine::{DirtyPriority, Engine, EngineInner, NodeRef, NodeState};
 use crate::error::CompError;
-use crate::key::{CompKey, CompParam, CompResult};
+use crate::key::{CompKey, CompKeySet, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId};
 
@@ -225,8 +225,14 @@ impl Engine {
     }
 
     /// Marks `keys` dirty at `priority`. See [`Engine::mark_all_dirty`].
+    ///
+    /// Takes `std`'s default-hashed `HashSet` (this is a public entry point,
+    /// unlike the identity-hashed [`CompKeySet`] the hot propagation path
+    /// uses internally — see `crate::hashers`' docs) and converts once here,
+    /// off the hot path.
     pub fn mark_dirty(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
-        self.inner.mark_dirty(keys, priority);
+        let keys: CompKeySet = keys.iter().cloned().collect();
+        self.inner.mark_dirty(&keys, priority);
     }
 }
 
@@ -310,10 +316,10 @@ impl EngineInner {
     /// computations that depend on them, skipping any dep whose reported
     /// version is already the one recorded on the node (a spurious wake:
     /// the node's last run already observed this exact version).
-    fn affected_keys(&self, changed: &HashSet<RawDep>) -> HashSet<CompKey> {
+    fn affected_keys(&self, changed: &HashSet<RawDep>) -> CompKeySet {
         let index = self.source_index.lock().unwrap();
         let nodes = self.nodes.lock().unwrap();
-        let mut affected = HashSet::new();
+        let mut affected = CompKeySet::default();
         for dep in changed {
             let Some(ids) = index.get(&(dep.source.clone(), dep.key.clone())) else {
                 continue;
@@ -344,7 +350,7 @@ impl EngineInner {
     /// initial evaluation ever runs). Marking from outside an active round,
     /// once the loop is already running, must go through [`Self::mark_dirty`]
     /// instead so the loop actually wakes up to service it.
-    pub(crate) fn mark_dirty_quiet(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+    pub(crate) fn mark_dirty_quiet(&self, keys: &CompKeySet, priority: DirtyPriority) {
         let mut nodes = self.nodes.lock().unwrap();
         for key in keys {
             if let Some(r) = nodes.id_of(key) {
@@ -362,7 +368,7 @@ impl EngineInner {
     /// and wakes the `run` loop so it services the work even if it is
     /// currently blocked waiting for a source change. The entry point for
     /// [`Engine::mark_dirty`].
-    pub(crate) fn mark_dirty(&self, keys: &HashSet<CompKey>, priority: DirtyPriority) {
+    pub(crate) fn mark_dirty(&self, keys: &CompKeySet, priority: DirtyPriority) {
         self.mark_dirty_quiet(keys, priority);
         for key in keys {
             let _ = self.dirty_tx.send(key.clone());
@@ -375,7 +381,7 @@ impl EngineInner {
     /// at every round boundary — so "every node" and "every live node"
     /// coincide here.)
     pub(crate) fn mark_all_dirty(&self, priority: DirtyPriority) {
-        let keys: HashSet<CompKey> = {
+        let keys: CompKeySet = {
             let nodes = self.nodes.lock().unwrap();
             nodes.keys().collect()
         };
@@ -386,9 +392,9 @@ impl EngineInner {
     /// propagation round (via [`Self::mark_dirty`]/[`Self::mark_all_dirty`]),
     /// draining whatever else is queued without blocking further — mirrors
     /// `wait_for_any_change`'s draining of a source's change channel.
-    async fn recv_marked_dirty(&self) -> HashSet<CompKey> {
+    async fn recv_marked_dirty(&self) -> CompKeySet {
         let mut rx = self.dirty_rx.lock().await;
-        let mut batch = HashSet::new();
+        let mut batch = CompKeySet::default();
         match rx.recv().await {
             Some(key) => {
                 batch.insert(key);
@@ -408,7 +414,7 @@ impl EngineInner {
     /// reports a change, marks the affected computations dirty at
     /// [`DirtyPriority::Input`] and returns their keys (empty if nothing
     /// new arrived).
-    fn poll_pending_input_changes(&self) -> HashSet<CompKey> {
+    fn poll_pending_input_changes(&self) -> CompKeySet {
         let sources: Vec<Arc<dyn crate::source::ErasedSource>> = self.registry.sources().cloned().collect();
         let mut changed: HashSet<RawDep> = HashSet::new();
         for source in &sources {
@@ -417,11 +423,11 @@ impl EngineInner {
             }
         }
         if changed.is_empty() {
-            return HashSet::new();
+            return CompKeySet::default();
         }
         let dirtied = self.affected_keys(&changed);
         if dirtied.is_empty() {
-            return HashSet::new();
+            return CompKeySet::default();
         }
         self.mark_dirty_quiet(&dirtied, DirtyPriority::Input);
         dirtied
@@ -431,10 +437,10 @@ impl EngineInner {
     /// each key's currently recorded `dirty_priority`. A key with no node,
     /// or no pending priority (nothing to do — already settled), is
     /// dropped from both.
-    fn split_by_tier(&self, keys: HashSet<CompKey>) -> (HashSet<CompKey>, HashSet<CompKey>) {
+    fn split_by_tier(&self, keys: CompKeySet) -> (CompKeySet, CompKeySet) {
         let nodes = self.nodes.lock().unwrap();
-        let mut input = HashSet::new();
-        let mut revalidate = HashSet::new();
+        let mut input = CompKeySet::default();
+        let mut revalidate = CompKeySet::default();
         for key in keys {
             match nodes.id_of(&key).and_then(|r| nodes.dirty_priority(r)) {
                 Some(DirtyPriority::Input) => {
@@ -473,8 +479,8 @@ impl EngineInner {
     /// skipped; the liveness GC pass that follows the round (after every
     /// tier has settled) cleans it up regardless, so this is a harmless
     /// wasted rerun rather than a correctness issue.
-    async fn propagate(self: &Arc<Self>, initial: HashSet<CompKey>) -> PropagateStats {
-        let mut done: HashSet<CompKey> = HashSet::new();
+    async fn propagate(self: &Arc<Self>, initial: CompKeySet) -> PropagateStats {
+        let mut done: CompKeySet = CompKeySet::default();
         let mut waves = 0usize;
         let mut total_reran = 0usize;
 
@@ -517,8 +523,8 @@ impl EngineInner {
     async fn propagate_tier(
         self: &Arc<Self>,
         tier: DirtyPriority,
-        initial: HashSet<CompKey>,
-        done: &mut HashSet<CompKey>,
+        initial: CompKeySet,
+        done: &mut CompKeySet,
         waves: &mut usize,
     ) -> usize {
         let mut frontier = initial;
@@ -546,9 +552,9 @@ impl EngineInner {
         self: &Arc<Self>,
         tier: DirtyPriority,
         batch: Vec<CompKey>,
-        done: &HashSet<CompKey>,
+        done: &CompKeySet,
         wave: usize,
-    ) -> (usize, HashSet<CompKey>) {
+    ) -> (usize, CompKeySet) {
         let dirty_count = batch.len();
 
         let jobs: Vec<(CompKey, Vec<u8>)> = {
@@ -565,7 +571,7 @@ impl EngineInner {
 
         let results = join_all(jobs.iter().map(|(key, param_bytes)| self.rerun_node(key, param_bytes))).await;
 
-        let mut next_frontier = HashSet::new();
+        let mut next_frontier = CompKeySet::default();
         let mut reran = 0usize;
         let mut cutoffs = 0usize;
         {
@@ -761,7 +767,7 @@ mod tests {
         engine.eval_root(&comp, ()).await.unwrap();
 
         let key = CompKey::new(*comp.def_id(), &());
-        let mut keys = HashSet::new();
+        let mut keys = CompKeySet::default();
         keys.insert(key.clone());
 
         engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Revalidate);

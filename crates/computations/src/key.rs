@@ -8,9 +8,12 @@
 //! specific application of a definition to a parameter (the analogue of
 //! `CompKey` / `c p`).
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::de::DeserializeOwned;
+
+use crate::hashers::IdentityBuildHasher;
 
 /// A 128-bit content hash: the first 16 bytes of a blake3 digest of a
 /// canonical byte encoding.
@@ -27,8 +30,38 @@ use serde::de::DeserializeOwned;
 /// `Hash128` is a plain value type: cheap to copy, comparable, hashable, and
 /// totally ordered so it can be used as a map/set key or sorted for stable
 /// output.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hash128([u8; 16]);
+
+/// Hashes via a single `write_u64` of this hash's own first 8 bytes,
+/// instead of `#[derive(Hash)]`'s default of writing all 16 raw bytes.
+///
+/// `Hash128` is already a uniformly-distributed content hash (see the type
+/// docs): folding only its first 8 bytes into a `Hasher` loses no
+/// practically-relevant bucket-distribution quality versus folding all 16 --
+/// 64 bits of already-random entropy is astronomically more than any
+/// in-process `HashMap` needs to keep bucket collisions negligible, and
+/// full 128-bit equality is still exactly what `Eq` checks; this only
+/// narrows what feeds the *hash*, never what decides equality. Writing
+/// exactly one `u64` (rather than 16 raw bytes) is also what lets
+/// [`crate::hashers::IdentityHasher`] treat a lone `Hash128` key as a true
+/// identity hash, with no mixing at all -- see that module's docs for the
+/// full rationale (this is the profiler-identified optimization from
+/// `docs/persistence-benchmark-notes.md`'s Stage 6).
+impl std::hash::Hash for Hash128 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut low8 = [0u8; 8];
+        low8.copy_from_slice(&self.0[..8]);
+        state.write_u64(u64::from_le_bytes(low8));
+    }
+}
+
+/// A `HashMap` keyed by [`Hash128`] using
+/// [`crate::hashers::IdentityBuildHasher`] instead of `std`'s default
+/// SipHash -- see that module's docs for why this is safe for a key type
+/// whose hash is already uniformly-distributed content. Construct with
+/// `::default()`, not `::new()`.
+pub(crate) type Hash128Map<V> = HashMap<Hash128, V, IdentityBuildHasher>;
 
 impl Hash128 {
     /// Builds a `Hash128` from raw bytes (typically a truncated blake3
@@ -190,6 +223,17 @@ impl fmt::Debug for CompKey {
         self.param_hash.write_hex(f, 4)
     }
 }
+
+/// A `HashSet<CompKey>` using [`crate::hashers::IdentityBuildHasher`]: safe
+/// for the same reason [`Hash128Map`] is, since `CompKey`'s `Hash` impl
+/// (derived) is dominated by its [`Hash128`] `param_hash` field (its other
+/// field, `DefId`, wraps a short definition name). Construct with
+/// `::default()`, not `::new()`.
+pub(crate) type CompKeySet = HashSet<CompKey, IdentityBuildHasher>;
+
+/// A `HashMap<CompKey, V>` using [`crate::hashers::IdentityBuildHasher`];
+/// see [`CompKeySet`].
+pub(crate) type CompKeyMap<V> = HashMap<CompKey, V, IdentityBuildHasher>;
 
 /// Bound satisfied by every valid computation parameter type.
 ///

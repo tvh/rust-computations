@@ -10,6 +10,7 @@ pub mod def;
 pub mod driver;
 pub mod engine;
 pub mod error;
+mod hashers;
 pub mod key;
 pub mod persist;
 pub mod registry;

@@ -73,7 +73,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::def::ErasedDef;
 use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable};
-use crate::key::{CompKey, DefId, Hash128};
+use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
 
@@ -453,7 +453,9 @@ struct PendingEntry {
 /// at flush time (see [`PendingRecord`]'s docs).
 #[derive(Default)]
 struct PendingMap {
-    entries: HashMap<CompKey, PendingEntry>,
+    /// Keyed by `CompKey`, whose hash is dominated by a `Hash128` — see
+    /// [`CompKeyMap`] and `crate::hashers`' docs.
+    entries: CompKeyMap<PendingEntry>,
     /// When the currently-pending batch started accumulating: set on the
     /// first enqueue after the map was last empty (i.e. after the last
     /// flush drained it), cleared back to `None` by that drain. Read by the
@@ -654,7 +656,7 @@ impl PersistHandle {
     /// pending map — but only where a fresher enqueue hasn't already
     /// replaced that key while the failed flush was in flight (that fresher
     /// entry already supersedes the one that just failed to write).
-    fn requeue_after_failure(&self, mut entries: HashMap<CompKey, PendingEntry>, error: &str) {
+    fn requeue_after_failure(&self, mut entries: CompKeyMap<PendingEntry>, error: &str) {
         let mut dropped = 0usize;
         entries.retain(|_, entry| {
             entry.attempts += 1;
@@ -1015,11 +1017,11 @@ impl EngineInner {
 /// version for some dep no longer matches what the source currently
 /// reports — including a source no longer registered, one that doesn't
 /// support probing at all, or a key the source can no longer observe.
-async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
+async fn probe_restored_source_deps(engine: &EngineInner) -> CompKeySet {
     // Snapshot what's needed and release the lock before awaiting anything
     // (holding a `std::sync::Mutex` guard across an `.await` is unsound to
     // rely on and easy to deadlock).
-    let deps_by_key: HashMap<CompKey, HashSet<RawDep>> = {
+    let deps_by_key: CompKeyMap<HashSet<RawDep>> = {
         let nodes = engine.nodes.lock().unwrap();
         nodes.iter_refs().map(|r| (nodes.key_of(r), nodes.source_deps_clone(r))).collect()
     };
@@ -1043,7 +1045,7 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
         probed.insert(source_id, result);
     }
 
-    let mut changed = HashSet::new();
+    let mut changed = CompKeySet::default();
     for (key, deps) in &deps_by_key {
         for dep in deps {
             let unchanged = matches!(
@@ -1068,15 +1070,15 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> HashSet<CompKey> {
 /// the initial evaluation, the same "Clean implies transitively up to
 /// date" invariant that `crate::driver`'s wave propagation maintains
 /// continuously while the engine is running live.
-fn mark_dirty_transitive(engine: &EngineInner, initial: HashSet<CompKey>, priority: DirtyPriority) {
-    let mut seen: HashSet<CompKey> = HashSet::new();
+fn mark_dirty_transitive(engine: &EngineInner, initial: CompKeySet, priority: DirtyPriority) {
+    let mut seen: CompKeySet = CompKeySet::default();
     let mut frontier = initial;
     while !frontier.is_empty() {
         engine.mark_dirty_quiet(&frontier, priority);
         seen.extend(frontier.iter().cloned());
 
         let nodes = engine.nodes.lock().unwrap();
-        let mut next = HashSet::new();
+        let mut next = CompKeySet::default();
         for key in &frontier {
             if let Some(r) = nodes.id_of(key) {
                 for &rdep_r in nodes.rdeps(r) {

@@ -43,7 +43,7 @@ use crate::def::{
     Comp, CompDef, DefAdapter, ErasedDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with,
 };
 use crate::error::CompError;
-use crate::key::{CompKey, CompParam, CompResult, DefId, Hash128};
+use crate::key::{CompKey, CompKeySet, CompParam, CompResult, DefId, Hash128, Hash128Map};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
 use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
@@ -328,7 +328,15 @@ struct DefTable {
     /// `NodeTable`'s single `(DefIndex, Hash128) -> NodeId` index — split
     /// per-definition here for the same struct-of-arrays reason as every
     /// other column.
-    index: HashMap<Hash128, u32>,
+    ///
+    /// Keyed by an already-uniform content hash, so this uses
+    /// [`crate::hashers::IdentityBuildHasher`] instead of `std`'s default
+    /// SipHash — see [`Hash128Map`] and `crate::hashers`' docs. This is the
+    /// single hottest map this optimization targets: every `ctx.eval` call
+    /// does a lookup and, on a cache miss, an insert here (Stage 6
+    /// profiling, `docs/persistence-benchmark-notes.md`, found SipHash
+    /// costing 5.6–8.7% of self-time, much of it this map).
+    index: Hash128Map<u32>,
 }
 
 impl DefTable {
@@ -713,7 +721,9 @@ pub(crate) struct EngineInner {
     /// Root applications (evaluated via `Engine::eval_root`), so the
     /// driver's liveness GC knows which nodes are reachable from outside the
     /// graph and must not be collected even with no `rdeps`.
-    pub(crate) roots: Mutex<HashSet<CompKey>>,
+    /// Keyed by `CompKey`, whose hash is dominated by a `Hash128` — see
+    /// [`CompKeySet`] and `crate::hashers`' docs.
+    pub(crate) roots: Mutex<CompKeySet>,
     pub(crate) registry: Registry,
     /// Wakes the driver's `run` loop when dirty work is marked from outside
     /// an active propagation round (`EngineInner::mark_dirty`/
@@ -1450,7 +1460,7 @@ impl EngineBuilder {
                 defs: Mutex::new(self.defs),
                 nodes: Mutex::new(NodeTable::new(self.def_order)),
                 source_index: Mutex::new(HashMap::new()),
-                roots: Mutex::new(HashSet::new()),
+                roots: Mutex::new(CompKeySet::default()),
                 registry: self.registry,
                 dirty_tx,
                 dirty_rx: AsyncMutex::new(dirty_rx),
