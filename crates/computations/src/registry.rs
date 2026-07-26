@@ -57,4 +57,64 @@ impl Registry {
     pub(crate) fn sink(&self, id: &SinkId) -> Option<&Arc<dyn ErasedSink>> {
         self.sinks.get(id)
     }
+
+    /// Merges `other`'s sources and sinks into `self`, used by
+    /// [`crate::EngineBuilder::registry`] so that call can *merge* into the
+    /// builder's existing registrations instead of replacing them wholesale.
+    ///
+    /// # Panics
+    /// Panics if `other` registers a source or sink id already present in
+    /// `self` — the same "duplicate is a startup configuration error" stance
+    /// [`Self::register_source`]/[`Self::register_sink`] already take,
+    /// applied uniformly here regardless of whether a given id got into
+    /// `self` via `register_source`/`register_sink` directly or via an
+    /// earlier `merge`. A silent "last write wins" here would let a
+    /// `.source(a)` call followed by a `.registry(other)` that happens to
+    /// also register `a` silently shadow the first registration — exactly
+    /// the class of surprise `EngineBuilder::registry`'s old "replaces
+    /// everything" behavior caused, just at a different granularity.
+    pub(crate) fn merge(&mut self, other: Registry) {
+        for (id, src) in other.sources {
+            let prev = self.sources.insert(id.clone(), src);
+            assert!(prev.is_none(), "duplicate source id: {id}");
+        }
+        for (id, sink) in other.sinks {
+            let prev = self.sinks.insert(id.clone(), sink);
+            assert!(prev.is_none(), "duplicate sink id: {id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{MemKvSource, VecSink};
+
+    #[test]
+    fn merge_combines_distinct_ids_from_both_registries() {
+        let mut base = Registry::default();
+        base.register_source(MemKvSource::new("kv_a"));
+
+        let mut other = Registry::default();
+        other.register_source(MemKvSource::new("kv_b"));
+        other.register_sink(VecSink::new("docs"));
+
+        base.merge(other);
+
+        assert!(base.source(&crate::source::SourceId::new("kv_a")).is_some());
+        assert!(base.source(&crate::source::SourceId::new("kv_b")).is_some());
+        assert!(base.sink(&crate::sink::SinkId::new("docs")).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate source id")]
+    fn merge_panics_on_a_source_id_present_in_both() {
+        let mut base = Registry::default();
+        base.register_source(MemKvSource::new("kv_a"));
+
+        let mut other = Registry::default();
+        other.register_source(MemKvSource::new("kv_a"));
+
+        base.merge(other);
+    }
 }

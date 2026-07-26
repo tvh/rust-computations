@@ -353,10 +353,25 @@ impl DefTable {
     /// `param_bytes`, reusing a freed row if one is available, and indexes
     /// it. Callers must ensure `param_hash` is not already indexed (the
     /// coalescing "find-or-insert" case is [`NodeTable::get_or_insert`]).
+    ///
+    /// # Panics (debug only)
+    /// `debug_assert`s that `param_bytes` fits this definition's `u16`
+    /// arena span. This used to be a runtime `assert!` reachable with the
+    /// node-table lock held (a param over 64 KB of postcard bytes would
+    /// panic mid-`prepare`, poisoning `EngineInner::nodes` for the rest of
+    /// the process — see Stage 7 of `docs/persistence-benchmark-notes.md`).
+    /// Both callers of this method now check the same bound *before* ever
+    /// taking that lock (`EngineInner::prepare` on the live-eval path,
+    /// `EngineInner::restore_nodes` on the persisted-load path) and turn a
+    /// violation into a recoverable outcome (a returned `CompError`, or a
+    /// dropped-with-a-warning record) instead of reaching this method at
+    /// all — so by the time `insert` runs, the bound is already an
+    /// established invariant, not user-facing input to validate.
     fn insert(&mut self, param_hash: Hash128, param_bytes: &[u8]) -> u32 {
-        assert!(
+        debug_assert!(
             param_bytes.len() <= u16::MAX as usize,
-            "param_bytes too large ({} bytes) for this definition's u16 arena span",
+            "param_bytes too large ({} bytes) for this definition's u16 arena span -- caller should have \
+             checked this before ever calling insert",
             param_bytes.len()
         );
         let off = self.param_arena.len() as u32;
@@ -706,6 +721,52 @@ enum Action<R> {
     Run(NodeRef, PreRunSnapshot),
 }
 
+/// Debug-only determinism check for a brand-new node's parameter (see
+/// [`crate::key::CompParam`]'s docs for the determinism requirement this
+/// enforces, and `crate::persist::EngineInner::restore_nodes`'s load-time
+/// key verification for the loud, load-time counterpart of the exact same
+/// hazard).
+///
+/// Round-trips `param_bytes` through a decode-then-re-encode (mirroring
+/// exactly what `crate::def::ErasedDef::revive_key` does at persisted-load
+/// time) and `debug_assert_eq!`s the two encodings. This — not a naive
+/// "serialize the same in-memory value twice" — is the check that actually
+/// catches a `HashMap`/`HashSet` parameter: re-serializing the very same
+/// `param` object twice in a row always produces identical bytes (its
+/// bucket layout, and thus iteration order, is already fixed for that
+/// object's lifetime), so it would never trip. A fresh decode builds a
+/// genuinely new instance — a new `HashMap` gets its own `RandomState` seed
+/// — so if the type's iteration order isn't actually deterministic, the
+/// round-tripped re-encoding is very likely to disagree with the original,
+/// right here, on the developer's very first run with such a parameter.
+///
+/// Never called for a cache hit or an already-existing dirty node — only
+/// when `param_bytes` is about to be stored for a node this engine has
+/// never seen before (see the one call site, in [`EngineInner::prepare`]).
+#[cfg(debug_assertions)]
+fn debug_check_param_determinism<P: CompParam>(key: &CompKey, param_bytes: &[u8]) {
+    let Ok(decoded) = postcard::from_bytes::<P>(param_bytes) else {
+        // A param this process just serialized should always decode back as
+        // its own type; if it doesn't, that's a distinct serde bug this
+        // check isn't meant to catch -- leave it to surface elsewhere
+        // (e.g. the very next `eval` of the same param will hit the same
+        // decode failure again, deterministically).
+        return;
+    };
+    let re_encoded = postcard::to_stdvec(&decoded).expect("postcard serialization of a well-formed value should not fail");
+    debug_assert_eq!(
+        param_bytes,
+        re_encoded.as_slice(),
+        "computation `{key:?}`: this parameter re-serializes to different bytes after a decode/encode \
+         round-trip -- almost always a HashMap/HashSet (or other iteration-order-dependent type) \
+         somewhere in the parameter, whose in-memory order isn't stable across a fresh instance; use \
+         BTreeMap/BTreeSet (or another deterministically-ordered container) for anything that feeds a \
+         CompKey's identity. Left undetected, this can silently split one logical computation \
+         application into multiple node identities, and orphan a persisted record across a restart \
+         (see `crate::key::CompParam`'s docs)."
+    );
+}
+
 /// Shared engine state. Always accessed through `Arc<EngineInner>` (see
 /// [`Engine`]); the node/def tables use plain `std::sync::Mutex` and are
 /// never held locked across an `.await`.
@@ -820,28 +881,63 @@ impl EngineInner {
     /// [`crate::def::CompDef::read_value`]) rather than downcasting an
     /// erased `Arc<dyn Any>` — the Tier-2 fast path [`Action`]'s docs
     /// describe.
+    ///
+    /// Also takes `param_bytes` — [`Self::eval`]'s own postcard encoding of
+    /// the parameter, computed once, before this call, entirely outside the
+    /// node-table lock (see that method). This is what lets `prepare` itself
+    /// never fallibly serialize anything while `self.nodes` is locked: the
+    /// one remaining failure mode reachable from user-supplied data on the
+    /// insert path — `param_bytes` not fitting this definition's `u16`
+    /// arena span (see `DefTable::insert`) — is checked here too, still
+    /// before the lock, and turned into a returned [`CompError`] instead of
+    /// a panic. See Stage 7 of `docs/persistence-benchmark-notes.md` for the
+    /// hazard this closes: a panic while `self.nodes` is locked poisons the
+    /// `std::sync::Mutex` for the rest of the process, taking down every
+    /// concurrent computation, not just the offending one.
     fn prepare<P: CompParam, R: CompResult>(
         self: &Arc<Self>,
         def: &Arc<CompDef<P, R>>,
         key: &CompKey,
-        param: &P,
-    ) -> Action<R> {
+        param_bytes: &[u8],
+    ) -> Result<Action<R>, CompError> {
+        // Checked before the lock (and before any node for `key` is known
+        // to exist or not) so a caller resubmitting an oversized param never
+        // even reaches `self.nodes.lock()` — cheap enough (one length
+        // comparison) to pay unconditionally rather than only on the
+        // (unknown-until-locked) insert path.
+        if param_bytes.len() > u16::MAX as usize {
+            return Err(CompError::Failed(format!(
+                "computation `{}`: parameter serializes to {} bytes, exceeding this engine's {}-byte \
+                 per-node limit (see `crate::engine::DefTable`'s param arena)",
+                key.def(),
+                param_bytes.len(),
+                u16::MAX
+            )));
+        }
+
         let mut nodes = self.nodes.lock().unwrap();
 
         if let Some(r) = nodes.id_of(key) {
             if nodes.state(r) == NodeState::Clean
                 && let Some(v) = def.read_value(r.row)
             {
-                return Action::CacheHit(v);
+                return Ok(Action::CacheHit(v));
             }
             if let Some(shared) = nodes.inflight_get(r) {
-                return Action::Join(shared);
+                return Ok(Action::Join(shared));
             }
+        } else {
+            // A genuinely new node: this is the one point `param_bytes` was
+            // "first serialized" for it (`Self::eval` serializes on every
+            // call, cache hit or not, but only a first-sight `param` ever
+            // reaches this branch and actually gets stored) — see
+            // `debug_check_param_determinism`'s docs for what this checks
+            // and why. Debug-only, so a release build pays nothing here.
+            #[cfg(debug_assertions)]
+            debug_check_param_determinism::<P>(key, param_bytes);
         }
 
-        let r = nodes.get_or_insert(key, || {
-            postcard::to_stdvec(param).expect("postcard serialization of a well-formed value should not fail")
-        });
+        let r = nodes.get_or_insert(key, || param_bytes.to_vec());
 
         let old_hash = nodes.result_hash(r);
         nodes.set_state(r, NodeState::Running);
@@ -850,14 +946,14 @@ impl EngineInner {
         let old_outputs = nodes.take_outputs(r);
         let old_source_deps = nodes.take_source_deps(r);
 
-        Action::Run(
+        Ok(Action::Run(
             r,
             PreRunSnapshot {
                 old_hash,
                 old_outputs,
                 old_source_deps,
             },
-        )
+        ))
     }
 
     /// Actually runs the computation for `key`/`node_ref`, building its
@@ -898,6 +994,10 @@ impl EngineInner {
         let param_for_trace = if tracing::enabled!(tracing::Level::DEBUG) { Some(param.clone()) } else { None };
 
         let body = def.body.clone();
+        // Cloned in for the error message below only: `key` itself isn't
+        // moved into the future (`ctx`/`param` are), and this is cheap (a
+        // `DefId` is a `&'static str`, `Hash128` is 16 bytes).
+        let key_for_err = key.clone();
         let fut: BoxFuture<'static, ExecResult> = Box::pin(async move {
             let start = Instant::now();
             let result = (body)(ctx, param).await?;
@@ -906,8 +1006,25 @@ impl EngineInner {
             // content hash below (early cutoff) — it is never returned or
             // stored anywhere; `crate::persist` re-derives its own copy,
             // lazily, only for a node that actually needs to be flushed.
-            let value_bytes = postcard::to_stdvec(&result)
-                .expect("postcard serialization of a well-formed value should not fail");
+            //
+            // A failure here used to `.expect()` (panic): that panic
+            // propagates through this `Shared` future's `join_all` in
+            // `crate::driver::run_wave`, up into the task running
+            // `Engine::run` — a caller that (per this crate's own examples)
+            // `tokio::spawn`s that task and never inspects its `JoinHandle`
+            // would simply lose the whole driver forever, silently (see
+            // Stage 7 of `docs/persistence-benchmark-notes.md`). Returning a
+            // `CompError` instead means only *this* node fails: it's logged
+            // via the existing error path below, stays `Dirty`, and the
+            // driver keeps running everything else.
+            let value_bytes = match postcard::to_stdvec(&result) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(CompError::Failed(format!(
+                        "computation {key_for_err:?}: result failed to serialize for its content hash: {e}"
+                    )));
+                }
+            };
             let hash = Hash128::from_blake3(blake3::hash(&value_bytes));
             let value: Arc<dyn Any + Send + Sync> = Arc::new(result);
             Ok((value, hash, elapsed))
@@ -1061,7 +1178,21 @@ impl EngineInner {
         param: P,
         chain: Arc<Vec<CompKey>>,
     ) -> Result<(R, CompKey), CompError> {
-        let key = CompKey::new(def_id, &param);
+        // Serialized once, up front, entirely outside the node-table lock:
+        // this call's own `CompKey` (a content hash of these bytes, exactly
+        // as `CompKey::new`/`StableHash` would compute it) and, on the
+        // insert path, `prepare`'s stored `param_bytes` are both derived
+        // from this single encoding — see `Self::prepare`'s docs on why
+        // that matters (no fallible serialization ever happens while
+        // `self.nodes` is locked; see Stage 7 of
+        // `docs/persistence-benchmark-notes.md`).
+        let param_bytes = match postcard::to_stdvec(&param) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(CompError::Failed(format!("computation `{def_id}`: parameter failed to serialize: {e}")));
+            }
+        };
+        let key = CompKey::from_parts(def_id, Hash128::from_blake3(blake3::hash(&param_bytes)));
         let span = tracing::debug_span!(
             "comp.eval",
             comp = %def_id.name(),
@@ -1086,7 +1217,13 @@ impl EngineInner {
                 }
             };
 
-            let action = self.prepare::<P, R>(&def, &key, &param);
+            let action = match self.prepare::<P, R>(&def, &key, &param_bytes) {
+                Ok(action) => action,
+                Err(e) => {
+                    tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                    return Err(e);
+                }
+            };
 
             let value = match action {
                 Action::CacheHit(v) => {
@@ -1387,8 +1524,8 @@ impl EngineBuilder {
     ///
     /// Equivalent to (and implemented via) [`Registry::register_source`] on
     /// the builder's internal registry; see that method for panic behavior.
-    /// See [`EngineBuilder::registry`] for how this interacts with a
-    /// wholesale `registry(...)` call.
+    /// Composes freely with [`EngineBuilder::registry`] in any order — see
+    /// that method's docs.
     pub fn source<S: SourceBase>(&mut self, src: Arc<S>) -> &mut Self {
         self.registry.register_source(src);
         self
@@ -1399,29 +1536,38 @@ impl EngineBuilder {
     ///
     /// Equivalent to (and implemented via) [`Registry::register_sink`] on
     /// the builder's internal registry; see that method for panic behavior.
-    /// See [`EngineBuilder::registry`] for how this interacts with a
-    /// wholesale `registry(...)` call.
+    /// Composes freely with [`EngineBuilder::registry`] in any order — see
+    /// that method's docs.
     pub fn sink<S: SinkBase>(&mut self, sink: Arc<S>) -> &mut Self {
         self.registry.register_sink(sink);
         self
     }
 
-    /// Attaches the sources/sinks [`crate::driver`] will use, *replacing*
-    /// whatever registry the builder currently holds (including anything
-    /// added via [`EngineBuilder::source`]/[`EngineBuilder::sink`] before
-    /// this call). An engine built without ever calling `registry`,
-    /// `source`, or `sink` has an empty registry, which is fine for tests
-    /// that never write to a real sink.
+    /// Merges `registry`'s sources/sinks into the builder's own registry
+    /// (via [`Registry::merge`]), on top of anything already registered via
+    /// [`EngineBuilder::source`]/[`EngineBuilder::sink`]/an earlier call to
+    /// this same method. Call order across `source`/`sink`/`registry` never
+    /// matters: every registration this builder ever sees ends up attached,
+    /// regardless of which of the three methods added it or in what order.
     ///
-    /// Prefer `source`/`sink` for new code — they merge into the existing
-    /// registry rather than replacing it, so call order doesn't matter. This
-    /// method still exists for callers that already build a [`Registry`]
-    /// separately (or want to reset the builder's registry to a specific
-    /// one); mixing it with `source`/`sink` is fine as long as you keep in
-    /// mind that `registry(...)` wins over anything registered before it,
-    /// while `source`/`sink` called after it add to what it set.
+    /// An engine built without ever calling `registry`, `source`, or `sink`
+    /// has an empty registry, which is fine for tests that never write to a
+    /// real sink.
+    ///
+    /// This used to *replace* the builder's registry outright, which meant a
+    /// `registry(...)` call silently discarded any `source`/`sink`
+    /// registrations that preceded it — a real hazard: `Ctx::src_req`/
+    /// `sink_req` execute directly against the caller's `Arc` regardless of
+    /// the registry, so a dropped registration produced *correct* results
+    /// while the driver simply never learned to watch that source or GC that
+    /// sink's outputs, both silently. Merging instead makes call order
+    /// irrelevant.
+    ///
+    /// # Panics
+    /// Panics if `registry` registers a source or sink id already present in
+    /// the builder's registry — see [`Registry::merge`].
     pub fn registry(&mut self, registry: Registry) -> &mut Self {
-        self.registry = registry;
+        self.registry.merge(registry);
         self
     }
 
@@ -1673,5 +1819,153 @@ mod tests {
             vec!["a".to_string()],
             "dropped output 'b' should have been deleted from the sink"
         );
+    }
+
+    /// Fix 3(b)'s debug-only round-trip check must actually trip for a
+    /// `HashMap` parameter — the case it exists to catch. Not a naive
+    /// "serialize the same value twice" (see `debug_check_param_determinism`'s
+    /// docs on why that would never catch anything): this builds one
+    /// `HashMap`, serializes it once, decodes that back into a *fresh*
+    /// `HashMap` (a new instance, with its own random hasher seed — exactly
+    /// what `crate::def::ErasedDef::revive_key` does at persisted-load
+    /// time), and calls the checker with the original bytes. Verified during
+    /// development to reproduce reliably (10/10 trials) for an 8-entry
+    /// `HashMap<i32, i32>` — `std`'s default `RandomState` draws fresh keys
+    /// per instance, so two differently-seeded maps holding the same
+    /// entries almost never share a bucket layout.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "re-serializes to different bytes")]
+    fn debug_check_param_determinism_panics_on_a_hashmap_param() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        for i in 0..8 {
+            map.insert(i, i * 10);
+        }
+        let param_bytes = postcard::to_stdvec(&map).expect("serializes fine");
+        let key = CompKey::new(DefId::new("det_check_probe"), &map);
+        debug_check_param_determinism::<HashMap<i32, i32>>(&key, &param_bytes);
+    }
+
+    /// The same check must be a silent no-op for a deterministic parameter
+    /// type (a `BTreeMap`, the documented fix for the `HashMap` case above) —
+    /// proof this isn't a check that just always fires.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_check_param_determinism_accepts_a_btreemap_param() {
+        use std::collections::BTreeMap;
+        let mut map: BTreeMap<i32, i32> = BTreeMap::new();
+        for i in 0..8 {
+            map.insert(i, i * 10);
+        }
+        let param_bytes = postcard::to_stdvec(&map).expect("serializes fine");
+        let key = CompKey::new(DefId::new("det_check_probe"), &map);
+        debug_check_param_determinism::<BTreeMap<i32, i32>>(&key, &param_bytes);
+    }
+
+    /// Fix 4: an oversized param (over this engine's `u16::MAX`-byte
+    /// per-node arena span) must return a `CompError`, never panic — and,
+    /// critically, the engine must keep working afterward. Before the fix,
+    /// this panicked inside `DefTable::insert` while `EngineInner::nodes`
+    /// was locked, poisoning that `std::sync::Mutex` for the rest of the
+    /// process; the real assertion here is the *second* `eval_root`
+    /// succeeding, not just the first one erroring.
+    #[tokio::test]
+    async fn oversized_param_errors_without_poisoning_the_engine() {
+        let mut builder = Engine::builder();
+        let big: Comp<Vec<u8>, usize> =
+            builder.define("oversized_param_probe", |_ctx, p: Vec<u8>| async move { Ok(p.len()) });
+        let followup: Comp<(), ()> = builder.define("oversized_param_followup", |_ctx, _: ()| async move { Ok(()) });
+        let engine = builder.build();
+
+        let oversized = vec![0u8; 100_000]; // postcard-encodes past u16::MAX
+        let result = engine.eval_root(&big, oversized).await;
+        assert!(
+            matches!(result, Err(CompError::Failed(_))),
+            "expected a Failed error for an oversized param, got {result:?}"
+        );
+
+        let ok = engine.eval_root(&followup, ()).await;
+        assert!(
+            ok.is_ok(),
+            "the node-table mutex must not be poisoned by an oversized-param error: {ok:?}"
+        );
+    }
+
+    /// A param type whose `Serialize` impl unconditionally fails must also
+    /// return a `CompError` rather than panicking (this one never even
+    /// reaches `prepare`/the node-table lock — it fails inside `eval`'s own
+    /// up-front serialization), and the engine must likewise keep working
+    /// afterward.
+    #[derive(Debug, Clone)]
+    struct UnserializableParam;
+
+    impl serde::Serialize for UnserializableParam {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("deliberately broken Serialize for testing"))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for UnserializableParam {
+        fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+            Ok(UnserializableParam)
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_param_serialize_errors_without_poisoning_the_engine() {
+        let mut builder = Engine::builder();
+        let broken: Comp<UnserializableParam, ()> =
+            builder.define("broken_param_probe", |_ctx, _: UnserializableParam| async move { Ok(()) });
+        let followup: Comp<(), ()> = builder.define("broken_param_followup", |_ctx, _: ()| async move { Ok(()) });
+        let engine = builder.build();
+
+        let result = engine.eval_root(&broken, UnserializableParam).await;
+        assert!(
+            matches!(result, Err(CompError::Failed(_))),
+            "expected a Failed error for a param that fails to serialize, got {result:?}"
+        );
+
+        let ok = engine.eval_root(&followup, ()).await;
+        assert!(ok.is_ok(), "the engine must keep working after a param-serialize failure: {ok:?}");
+    }
+
+    /// Fix 5: a result type whose `Serialize` impl fails must fail just that
+    /// node (`CompError`, stays dirty) rather than panicking inside the
+    /// shared execution future — a panic there used to propagate through
+    /// `Shared`/`join_all` all the way up into whatever task ran
+    /// `Engine::run`. Exercised here directly via `eval_root` (the
+    /// `Engine::run`-level, driver-survives version of this same fix lives
+    /// in `tests/driver.rs`).
+    #[derive(Debug, Clone, Default)]
+    struct UnserializableResult;
+
+    impl serde::Serialize for UnserializableResult {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("deliberately broken Serialize for testing"))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for UnserializableResult {
+        fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+            Ok(UnserializableResult)
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_result_serialize_errors_without_panicking() {
+        let mut builder = Engine::builder();
+        let broken: Comp<(), UnserializableResult> =
+            builder.define("broken_result_probe", |_ctx, _: ()| async move { Ok(UnserializableResult) });
+        let followup: Comp<(), ()> = builder.define("broken_result_followup", |_ctx, _: ()| async move { Ok(()) });
+        let engine = builder.build();
+
+        let result = engine.eval_root(&broken, ()).await;
+        assert!(
+            matches!(result, Err(CompError::Failed(_))),
+            "expected a Failed error for a result that fails to serialize, got {result:?}"
+        );
+
+        let ok = engine.eval_root(&followup, ()).await;
+        assert!(ok.is_ok(), "the engine must keep working after a result-serialize failure: {ok:?}");
     }
 }

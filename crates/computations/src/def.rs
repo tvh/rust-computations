@@ -139,13 +139,23 @@ pub(crate) trait ErasedDef: Send + Sync {
     /// `nodes` table, deferred to actual flush time so a coalesced-away
     /// enqueue never pays the encoding cost at all.
     ///
+    /// Returns `Err` (rather than panicking) if the postcard encoding
+    /// itself fails — a failing `R: Serialize` impl is user-supplied
+    /// behavior, not an engine bug, so it must not be able to panic the
+    /// background persister task that calls this (see
+    /// `crate::persist::PersistHandle::flush`, the same class of hazard
+    /// `crate::engine::EngineInner::run`'s own result-serialize-for-hashing
+    /// step used to have — see Stage 7 of
+    /// `docs/persistence-benchmark-notes.md`). The caller drops just this
+    /// one pending entry rather than persisting it.
+    ///
     /// # Panics
     /// Panics if `value`'s concrete type doesn't match this definition's
     /// result type `R`. This is never a data-integrity concern in practice:
     /// every `value` this is called with was itself produced by
     /// [`Self::value_any`] on this same definition, so the downcast can only
     /// fail from an engine bug, not from untrusted input.
-    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Vec<u8>;
+    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Result<Vec<u8>, String>;
 
     /// Decodes `param_bytes` as this definition's param type and, on
     /// success, returns a future that re-runs this definition applied to
@@ -187,11 +197,11 @@ impl<P: CompParam, R: CompResult> ErasedDef for DefAdapter<P, R> {
         }
     }
 
-    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Vec<u8> {
+    fn serialize_value(&self, value: &Arc<dyn Any + Send + Sync>) -> Result<Vec<u8>, String> {
         let typed: &R = value
             .downcast_ref::<R>()
             .expect("serialize_value: value's concrete type must match this definition's result type");
-        postcard::to_stdvec(typed).expect("postcard serialization of a well-formed value should not fail")
+        postcard::to_stdvec(typed).map_err(|e| e.to_string())
     }
 
     fn rerun(&self, engine: Arc<EngineInner>, param_bytes: &[u8]) -> Option<BoxFuture<'static, Result<(), CompError>>> {

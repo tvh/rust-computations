@@ -172,9 +172,11 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
   instances the driver polls and writes through. `EngineBuilder::source`/
   `EngineBuilder::sink` register directly into the builder's own registry
   (as seen in the quick example above); `EngineBuilder::registry` remains
-  for callers that already assemble a `Registry` value separately (it
-  *replaces* the builder's registry outright, so call it before any
-  `source`/`sink` calls whose registrations should survive).
+  for callers that already assemble a `Registry` value separately — it
+  *merges* that registry's sources/sinks into the builder's own, so call
+  order across `source`/`sink`/`registry` never matters (a duplicate
+  instance id across any of them panics, the same startup-configuration-error
+  stance `register_source`/`register_sink` already take).
 - **Driver** (`driver.rs`): the top-level loop (`Engine::run`). Initial
   evaluation, a startup GC pass (deleting any sink outputs nothing live
   produces), then forever: wait for a source-change batch, map it to
@@ -285,11 +287,21 @@ test simulating a restart).
 
 **Fingerprint.** A `Fingerprint` identifies "the code that produced these
 results" — `Fingerprint::current_exe()` hashes the running binary (the
-common case: did the executable change since this graph was saved);
-`Fingerprint::custom(data)` lets a caller fingerprint anything else that
-should invalidate trust in a persisted graph (a version string, a config
-hash, ...). A mismatch at load time never discards the graph — it marks
-every restored node for background revalidation instead (see below).
+common case: did the executable change since this graph was saved), and
+self-corrects automatically: any code change changes the hash, nothing to
+remember to bump by hand. `Fingerprint::current_exe_with(extra)` mixes the
+binary hash with caller-chosen `extra` data (a config hash, a feature-flag
+set, ...) when a config change should *also* invalidate trust, without
+giving up that self-correcting property. `Fingerprint::custom(data)`
+fingerprints `data` alone, with no binary hash mixed in — it trusts `data`
+completely, so it silently serves stale results forever if you change a
+computation's logic without also bumping whatever you pass here (a stale
+`custom` fingerprint looks exactly like a legitimate cache hit; there is no
+detection for it). Prefer `current_exe`/`current_exe_with`; reach for
+`custom` alone only when the running binary genuinely isn't a meaningful
+proxy for "the code that produced these results". A mismatch at load time
+never discards the graph — it marks every restored node for background
+revalidation instead (see below).
 
 **Load-anyway, then verify.** On restart, every persisted node whose
 definition is still registered is restored as a cache hit — no

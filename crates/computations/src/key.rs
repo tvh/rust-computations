@@ -240,6 +240,32 @@ pub(crate) type CompKeyMap<V> = HashMap<CompKey, V, IdentityBuildHasher>;
 /// `DeserializeOwned` (in addition to `Serialize`) is required so a param
 /// can be revived from its persisted postcard bytes when restoring a node
 /// from a previous run (see `crate::persist`).
+///
+/// # Determinism requirement
+///
+/// A param's `Serialize` implementation **must be deterministic**: encoding
+/// the same logical value must always produce the same bytes, in every
+/// process and every in-memory instance. This byte encoding is exactly what
+/// a [`CompKey`]'s identity is hashed from (see [`CompKey::new`] /
+/// [`StableHash`]), so non-determinism here silently corrupts identity, not
+/// just performance.
+///
+/// `HashMap`/`HashSet` are the classic trap: their iteration order depends
+/// on a per-instance random hasher seed (`std`'s default `RandomState`), so
+/// two logically-equal maps — even two built in the very same process — can
+/// serialize to different bytes. This can split one logical computation
+/// application into two unrelated node identities live, and is worse across
+/// a persisted restart: reviving a stored param means decoding it and then
+/// re-serializing it to recompute its key (see
+/// `crate::def::ErasedDef::revive_key`), which can then land on a
+/// *different* key than the one the record was actually saved under —
+/// `crate::persist`'s load-time key verification detects this mismatch and
+/// drops the record (loud, safe, recomputed cold) rather than silently
+/// misattaching it, but the clean fix is to never produce the mismatch in
+/// the first place.
+///
+/// Prefer `BTreeMap`/`BTreeSet` (or any other deterministically-ordered
+/// container) for anything that feeds a computation's parameter.
 pub trait CompParam: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
 impl<T> CompParam for T where T: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
@@ -249,6 +275,18 @@ impl<T> CompParam for T where T: serde::Serialize + DeserializeOwned + Clone + f
 /// `DeserializeOwned` (in addition to `Serialize`) is required so a cached
 /// value can be revived from its persisted postcard bytes when restoring a
 /// node from a previous run (see `crate::persist`).
+///
+/// # Determinism requirement
+///
+/// The same determinism requirement documented on [`CompParam`] applies
+/// here too, though the consequence is milder: a result's postcard encoding
+/// feeds `crate::engine`'s content-hash early cutoff (see
+/// `crate::engine::NodeTable::result_hash`), not identity. A
+/// non-deterministic `Serialize` impl (again, most often a stray
+/// `HashMap`/`HashSet`) can make a logically-unchanged result look
+/// "changed" across two runs, defeating early cutoff and causing
+/// unnecessary re-propagation to dependents — never an incorrect value,
+/// just wasted work. Prefer `BTreeMap`/`BTreeSet` here as well.
 pub trait CompResult: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}
 
 impl<T> CompResult for T where T: serde::Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync + 'static {}

@@ -389,6 +389,93 @@ async fn failure_resilience_recovers_after_value_is_fixed() {
     handle.abort();
 }
 
+/// A result type whose `Serialize` impl always fails, for exercising Fix
+/// 5's "a failing result `Serialize` must not panic the driver task" —
+/// `Deserialize` is a required `CompResult` bound but is never actually
+/// exercised here (this type's value is never successfully persisted).
+#[derive(Debug, Clone, Default)]
+struct UnserializableResult;
+
+impl serde::Serialize for UnserializableResult {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("deliberately broken Serialize for testing"))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UnserializableResult {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Ok(UnserializableResult)
+    }
+}
+
+/// Fix 5: a computation whose result fails to serialize (for the early-cutoff
+/// content hash) must fail just that one node — logged, left dirty — rather
+/// than panicking inside the shared execution future. Before the fix, that
+/// panic propagated through `Shared`/`join_all` straight into the task
+/// running `Engine::run`; since this crate's own examples spawn that task
+/// and never inspect its `JoinHandle`, the whole driver would die silently,
+/// forever, with no trace beyond the panic message on stderr.
+///
+/// `root` deliberately swallows `broken`'s error (`let _ = ...`, not `?`) —
+/// exactly the shape a real caller gets by accident whenever a node several
+/// layers down a call chain fails and the immediate caller doesn't
+/// specifically handle it — and a wholly independent `healthy` chain proves
+/// the driver keeps propagating everything else normally afterward.
+#[tokio::test]
+async fn driver_survives_a_failing_result_serialize_and_keeps_propagating() {
+    let kv = MemKvSource::new("kv");
+    let sink = VecSink::new("docs");
+    kv.set("healthy", "v1").await;
+
+    let mut registry = Registry::default();
+    registry.register_source(kv.clone());
+    registry.register_sink(sink.clone());
+
+    let mut builder = Engine::builder();
+    builder.registry(registry);
+
+    let broken: Comp<(), UnserializableResult> =
+        builder.define("broken_result_chain", |_ctx, _: ()| async move { Ok(UnserializableResult) });
+
+    let healthy: Comp<(), ()> = builder.define("healthy_chain", {
+        let kv = kv.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("healthy".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(&sink, WriteDoc { name: "doc".to_string(), content: val }).await?;
+                Ok(())
+            }
+        }
+    });
+
+    let root: Comp<(), ()> = builder.define("broken_result_root", move |ctx, _: ()| async move {
+        let _ = ctx.eval(broken, ()).await;
+        ctx.eval(healthy, ()).await?;
+        Ok(())
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| sink.get("doc") == Some("v1".to_string())).await;
+    assert!(!handle.is_finished(), "the driver task must survive a result-serialize failure");
+
+    // Other computations must keep propagating normally afterward -- the
+    // driver loop itself is still alive and healthy, not just the initial
+    // evaluation.
+    kv.set("healthy", "v2").await;
+    wait_until(|| sink.get("doc") == Some("v2".to_string())).await;
+    assert!(!handle.is_finished());
+
+    handle.abort();
+}
+
 /// A shared, ordered event log: each `record` call appends `label` tagged
 /// with a fresh, monotonically increasing sequence number, so tests can
 /// assert *relative* ordering between events from independent tasks
@@ -818,6 +905,94 @@ async fn gc_collects_a_directly_source_dependent_node_once_unreachable() {
     // Now make `leaf` unreachable: `root` stops calling it.
     kv.set("mode", "off").await;
     wait_until(|| sink.get("leaf_doc").is_none()).await;
+
+    handle.abort();
+}
+
+/// `EngineBuilder::registry` must *merge* into the builder's existing
+/// registry rather than replacing it wholesale: a source registered via
+/// `.source()` before a later `.registry(other)` call must survive, and the
+/// driver must actually react to changes from both — proof this isn't just
+/// "the map still contains the id" but that the live wiring (source polling,
+/// GC) sees both. Regression test for the hazard described in
+/// `EngineBuilder::registry`'s docs: the old "replace wholesale" behavior
+/// silently dropped the first registration, so its source's changes never
+/// woke the driver and its sink's outputs were never GC'd, while still
+/// producing individually-correct results up to that point -- exactly the
+/// kind of bug that doesn't show up until much later.
+#[tokio::test]
+async fn builder_registry_merges_with_earlier_source_and_sink_registrations() {
+    let kv_early = MemKvSource::new("kv_early");
+    let kv_late = MemKvSource::new("kv_late");
+    let sink = VecSink::new("docs");
+    kv_early.set("a", "1").await;
+    kv_late.set("b", "2").await;
+
+    let mut builder = Engine::builder();
+    // Registered directly on the builder *before* the `.registry(...)` call
+    // below -- under the old "replace wholesale" semantics, this would be
+    // silently discarded the moment `.registry()` ran.
+    builder.source(kv_early.clone());
+
+    let mut other_registry = Registry::default();
+    other_registry.register_source(kv_late.clone());
+    other_registry.register_sink(sink.clone());
+    builder.registry(other_registry);
+
+    let chain_early: Comp<(), ()> = builder.define("merge_chain_early", {
+        let kv = kv_early.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("a".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(&sink, WriteDoc { name: "doc_a".to_string(), content: val }).await?;
+                Ok(())
+            }
+        }
+    });
+    let chain_late: Comp<(), ()> = builder.define("merge_chain_late", {
+        let kv = kv_late.clone();
+        let sink = sink.clone();
+        move |ctx, _: ()| {
+            let kv = kv.clone();
+            let sink = sink.clone();
+            async move {
+                let val = ctx.src_req(&kv, GetKey("b".to_string())).await?.unwrap_or_default();
+                ctx.sink_req(&sink, WriteDoc { name: "doc_b".to_string(), content: val }).await?;
+                Ok(())
+            }
+        }
+    });
+    let root: Comp<(), ()> = builder.define("merge_root", move |ctx, _: ()| async move {
+        ctx.eval(chain_early, ()).await?;
+        ctx.eval(chain_late, ()).await?;
+        Ok(())
+    });
+
+    let engine = builder.build();
+    let handle = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(root, ()).await })
+    };
+
+    wait_until(|| sink.get("doc_a").is_some() && sink.get("doc_b").is_some()).await;
+    assert_eq!(sink.get("doc_a"), Some("1".to_string()));
+    assert_eq!(sink.get("doc_b"), Some("2".to_string()));
+
+    // The driver must actually be watching `kv_early` (registered via
+    // `.source()`, *before* the later `.registry()` call) -- if that
+    // registration had been dropped, this change would never wake the
+    // driver and `doc_a` would stay stale forever.
+    kv_early.set("a", "hello").await;
+    wait_until(|| sink.get("doc_a").as_deref() == Some("hello")).await;
+
+    // And `kv_late`/`sink`, registered via the `.registry(...)` call itself,
+    // must also work -- proving the merge is genuinely bidirectional, not
+    // just "the earlier registration happens to survive".
+    kv_late.set("b", "world").await;
+    wait_until(|| sink.get("doc_b").as_deref() == Some("world")).await;
 
     handle.abort();
 }

@@ -1513,3 +1513,205 @@ any single run's absolute number. Worth re-running on an idle box before
 quoting tighter confidence intervals in a public writeup, per Stage 6's
 own standing caveat.
 
+## Stage 7 — hardening against API misuse
+
+An audit of five API-misuse hazards found by reasoning about what a caller
+could get wrong (not by profiling): places where a plausible mistake —
+wrong call order, a slightly-too-clever parameter type, an oversized
+value, a broken `Serialize` impl — produces *silent* staleness, data loss,
+or a dead-but-still-"running" process, rather than a loud, diagnosable
+failure. All five are fixed; each closes a distinct hazard, and none
+touches the disk format (still `FORMAT_VERSION = 2`) or the hot `eval`
+path's steady-state cost (see the benchmark below).
+
+- **`EngineBuilder::registry` silently discarded earlier `.source()`/
+  `.sink()` registrations.** `Ctx::src_req`/`sink_req` (`ctx.rs`) execute
+  directly against the caller's own `Arc`, never consulting the registry —
+  so a registration a later `registry(...)` call dropped still produced
+  *correct* computed results, while the driver simply never learned to
+  poll that source for changes or GC that sink's dead outputs. Individually
+  correct, silently stale/leaking overall; nothing in the type system or a
+  test failure would ever point at the cause. Fixed by making `Registry`
+  mergeable (`Registry::merge`, `registry.rs`) and changing
+  `EngineBuilder::registry` (`engine.rs`) to merge into the builder's
+  existing registry instead of replacing it — call order across
+  `source`/`sink`/`registry` no longer matters. A duplicate instance id
+  across the merge panics, the same startup-configuration-error stance
+  `register_source`/`register_sink` already took for a duplicate within a
+  single `Registry`. README §4's Registry bullet updated to match.
+- **`Fingerprint::custom(data)` trusts `data` completely.**
+  `Fingerprint::current_exe()` self-corrects (it hashes the running
+  binary, so *any* code change is automatically caught); `custom` has no
+  such property — change a computation's logic without also bumping
+  whatever string you pass to `custom`, and every persisted result for
+  that computation is served as a `Clean` cache hit forever, indistinguishable
+  from a legitimate one. Added `Fingerprint::current_exe_with(extra)`
+  (`persist.rs`) — the binary hash mixed with caller data via
+  `blake3::Hasher` — so the common "invalidate on binary change *and* on
+  config change" case keeps the self-correcting property; `current_exe()`
+  is now exactly `current_exe_with(&[])`, so no persisted fingerprint from
+  before this change stops matching. `custom`'s doc comment now states the
+  hazard bluntly rather than just describing the mechanism. README §8
+  updated to steer callers toward `current_exe`/`current_exe_with`.
+- **Non-deterministic param serialization (`HashMap`/`HashSet`) silently
+  splits or misattaches identity.** `CompKey` identity is
+  `blake3(postcard(param))`; `HashMap`/`HashSet` iteration order depends on
+  a per-instance random hasher seed (`std`'s default `RandomState`), so two
+  logically-equal maps — even two built in the same process — can
+  serialize to different bytes. Live, this silently splits one logical
+  computation application into two node identities. Across a persisted
+  restart it's worse: `ErasedDef::revive_key` (`def.rs`) never reads the
+  stored key, only `param_bytes` — it decodes the param and *recomputes*
+  `CompKey::new(id, &param)`, so a restored record can attach to a
+  different identity than it was saved under, get orphaned, and be swept
+  by liveness GC (deleting its sink outputs) while the live graph
+  recomputes that subtree cold. Three-part fix:
+  - **Load-time key verification** (`persist.rs::restore_nodes`): redb's
+    own table key *is* the persisted `CompKey` bytes (`encode_key`), now
+    threaded all the way through `open_and_read`/`open_db`/`persist_load`
+    (`StoredRecord = (Vec<u8>, NodeRecord)`, replacing a bare
+    `Vec<NodeRecord>`). After `revive_key` recomputes a key, it's compared
+    against the record's actual stored key; a mismatch drops the record
+    with a loud `tracing::warn!` naming the def and pointing at
+    non-deterministic serialization, instead of silently trusting it. A
+    silent orphan-and-GC-delete becomes a diagnosable cold start.
+  - **Debug-build determinism check** (`engine.rs::debug_check_param_determinism`,
+    `#[cfg(debug_assertions)]`): when a param is first serialized for a
+    brand-new node, its `param_bytes` are decoded back into `P` and
+    re-encoded, `debug_assert_eq!`-checked against the original bytes —
+    exactly mirroring what `revive_key` does at load time, so it catches
+    the same hazard on the developer's very first run rather than only at
+    a persisted restart. Deliberately *not* "serialize the same in-memory
+    value twice": that would never trip (a live object's iteration order
+    is already fixed for its own lifetime; only a *fresh* instance, like
+    the one a decode produces, gets a new random seed). Verified during
+    development to reproduce reliably (10/10 trials) for an 8-entry
+    `HashMap<i32, i32>`; committed as two unit tests (`engine.rs`) — one
+    proving it fires for `HashMap`, one proving it stays silent for the
+    deterministic `BTreeMap` fix. Zero cost in release builds.
+  - **Docs**: `CompParam`/`CompResult` (`key.rs`) now state the determinism
+    requirement explicitly and point at `BTreeMap`/`BTreeSet`.
+  - **Not fully closed**: `revive_key`'s own `CompKey::new(id, &param)`
+    call (and, live, `EngineInner::eval`'s own up-front param hashing) can
+    itself panic if `P`'s `Serialize` impl fails outright — `CompKey::new`/
+    `StableHash` (`key.rs`) is public API with a non-fallible signature
+    used pervasively (including by tests and by `crate::persist` itself),
+    so making param-hashing fallible everywhere would be a much larger,
+    separate API change. `EngineInner::eval`'s own hot-path hashing
+    (`engine.rs`) was rewritten to serialize once, inline, with a
+    `CompError` on failure — see Fix 4 below — but `revive_key`'s call
+    (`persist_load`, before `EngineInner::nodes` is ever locked) still
+    goes through `CompKey::new` and isn't covered. This can't poison
+    anything (it runs before the node-table lock is taken) and only
+    matters for a hand-broken `Serialize` impl that fails unconditionally
+    — a case Fix 4's own debug/oversized checks don't cover either, since
+    it fails before ever producing bytes to check. Left as a known gap.
+- **A panic under the node-table mutex poisons the whole engine.**
+  `DefTable::insert` (`engine.rs`) used to `assert!(param_bytes.len() <=
+  u16::MAX)`, and `prepare` used to `postcard::to_stdvec(param).expect(...)`
+  — both while `EngineInner::nodes`'s `std::sync::Mutex` was held. A panic
+  there poisons that `Mutex` for the rest of the process: every subsequent
+  `.lock().unwrap()` anywhere (including on a completely unrelated node)
+  panics too. One oversized param (>64 KB of postcard bytes — easy with an
+  embedded blob) or one node whose param type has a failing `Serialize`
+  impl would kill *every* concurrent computation, not just its own.
+  Fixed by moving all fallible param work before the lock: `EngineInner::eval`
+  now serializes the param once, up front (`postcard::to_stdvec`, mapped to
+  `CompError::Failed` on failure — this also removes the redundant *second*
+  serialization `prepare` used to do for a brand-new node, since both the
+  `CompKey`'s hash and the stored `param_bytes` now come from the same
+  encoding), and `prepare` checks the `u16::MAX` size bound before ever
+  calling `self.nodes.lock()`. **Kept the `u16` arena span** rather than
+  widening it to `u32`: per Stage 5's per-row accounting, `param_len` is a
+  per-row column, so `u16 -> u32` would cost 2 B/node — only 2 MB at this
+  benchmark's 1M-node scale, genuinely cheap — but the real reason to keep
+  `u16` is that 64 KB is already a generous parameter size for this
+  engine's stated use case (a lookup key, per `crate::engine::Node`'s
+  original design note); a param that large is much more likely to be a
+  mistake (an embedded blob that belongs in a source/sink, not a param)
+  than a legitimate need, and a loud `CompError` at the boundary catches
+  that mistake immediately rather than quietly paying more memory forever.
+  `DefTable::insert`'s bound is now a `debug_assert!` (its callers already
+  guarantee it holds before ever reaching `insert`, so it documents an
+  established invariant rather than validating untrusted input).
+  `persist.rs::restore_nodes` got the same size check, since it also calls
+  into the node table while `EngineInner::nodes` is locked, on records read
+  from disk.
+  - **Grep for other panics under a lock** (`engine.rs`/`driver.rs`/
+    `persist.rs`, as instructed): `driver.rs`'s several `nodes.lock()`
+    critical sections only ever call plain column reads/writes (no
+    serde, no `assert!`) — nothing to fix. `engine.rs`'s
+    `NodeTable::insert_new`'s `.expect("...must be registered...")` also
+    runs under the lock, but is unreachable from user data (every caller —
+    the live `eval` path via `get_def`, and `persist.rs::restore_nodes` via
+    `self.def_names`/`self.erased_defs` — only ever calls it with a key
+    whose definition is already known-registered); left as-is with its
+    existing doc justification. While auditing, also found and fixed a
+    *related* but not-under-a-lock panic: `def.rs::ErasedDef::serialize_value`'s
+    `postcard::to_stdvec(typed).expect(...)` — reachable from the same
+    "failing `R: Serialize` impl" hazard, but on the persister task's flush
+    path (`persist.rs::PersistHandle::flush`), under the async `flushing`
+    lock (a `tokio::sync::Mutex`, which does not poison on panic the way
+    `std::sync::Mutex` does). Not a mutex-poisoning risk, but still an
+    unnecessary panic reachable from user data — changed to return
+    `Result<Vec<u8>, String>`; a failure now drops just that one pending
+    upsert with a `tracing::warn!` instead of killing the persister task.
+- **A failing result `Serialize` panics the driver task, near-silently.**
+  `EngineInner::run`'s boxed execution future used to
+  `postcard::to_stdvec(&result).expect(...)` for the early-cutoff content
+  hash. A panic there propagates through `Shared` -> `join_all`
+  (`driver.rs::run_wave`) -> whatever task is running `Engine::run`; since
+  this crate's own examples `tokio::spawn` that task and never inspect its
+  `JoinHandle`, the entire driver dies forever, with nothing but a panic
+  message on stderr — no `tracing::warn!`, no retry, no trace in the
+  engine's own error-reporting path at all. Fixed by returning a
+  `CompError` instead: the offending node fails loudly through the
+  existing error path (logged, stays `Dirty`, retried on the next relevant
+  change) and the driver keeps running everything else.
+
+**Correctness.** `cargo test --workspace --all-features` green: 104 passed
+(up from 92 — the +12 are this stage's own: 2 unit tests for
+`Registry::merge` (combines, panics on a duplicate id) plus 1 end-to-end
+test for `EngineBuilder::registry` merging with an earlier `.source()`
+registration; 2 for `Fingerprint::current_exe_with`/`custom`; 1 for the
+load-time key-mismatch drop; 2 for the debug determinism check (fires for
+`HashMap`, stays silent for `BTreeMap`); 2 for Fix 4's no-poisoning
+guarantee (an oversized param, a failing param `Serialize`, each also
+asserting a followup `eval_root` still succeeds); 2 for Fix 5's
+failing-result-`Serialize` behavior, one at the `eval_root` level and one
+proving the `Engine::run` driver task itself survives and keeps
+propagating other computations). `cargo clippy --workspace --all-targets
+--all-features -D warnings` clean.
+
+**Benchmark.** Machine load was elevated during this run (`uptime` load
+average **19.64** on a 14-core box, above Stage 6's already-flagged
+12–30 range) — absolute numbers below are read against that, not against
+an idle box. `cargo run -p computations --release --example persist_bench
+--features testutil`, full 1M scale:
+
+| phase | Stage 5/6 baseline (clean box) | this run (loaded box) | direction |
+|---|---|---|---|
+| 1. cold eval (persistence configured) | 3.69–3.73 s | 3.567 s | faster |
+| 2. persist_now / db size | 2.24–2.49 s / 269.49 MB | 2.529 s / **269.49 MB** | flat / unchanged |
+| 3. warm restart, no changes | 1.36–1.44 s | 1.374–1.386 s | flat |
+| 4. restart, 1 changed input | 1.83–2.09 s | 1.818–1.991 s | flat |
+| 5. cold restart, no persistence | 2.91–2.96 s | 2.748–2.781 s | faster |
+| 6. fingerprint mismatch (full revalidation) | 4.96–5.13 s | 4.839 s | faster |
+| 7. live incremental, no persistence | 502–509 ms | 501 ms | flat |
+| 8. live incremental, with persistence | 650–704 ms | 677 ms | flat |
+| engine-only RSS (phase 5, no persistence) | 328.1–330.5 MB | 338.3–340.7 MB | **+3%** |
+
+Every timing phase came out at or below the clean-box baseline *despite*
+the box being under roughly 40% heavier load than Stage 6's own
+already-elevated range — no phase is within shouting distance of the 15%
+regression threshold this task asked to watch for. The persisted db size
+(269.49 MB, byte-identical to Stage 5) confirms `FORMAT_VERSION` truly
+didn't move despite `StoredRecord` threading an extra `Vec<u8>` through the
+*load* path — that extra field never touches what's written to disk, only
+what's read back and compared in memory. Engine-only RSS is ~3% higher
+than the Stage 5 baseline, comfortably inside the load-driven noise band
+(Stage 6 measured similar-magnitude run-to-run swings on this same box);
+nothing in this stage's changes adds any steady-state per-node memory (the
+`Vec<u8>` `StoredRecord` key is a transient, load-time-only allocation,
+freed once `restore_nodes` returns).
+

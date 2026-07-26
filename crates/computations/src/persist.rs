@@ -134,12 +134,33 @@ impl Fingerprint {
     /// (just occasionally more conservative than necessary), never
     /// incorrect.
     pub fn current_exe() -> Self {
+        Self::current_exe_with([])
+    }
+
+    /// Fingerprints the current process's own executable, mixed with
+    /// caller-chosen `extra` data (a config hash, a version string, a
+    /// feature-flag set, ...) — the common "I want to invalidate on a
+    /// binary change *and* on a config change" case, without giving up
+    /// [`Self::current_exe`]'s self-correcting property (see
+    /// [`Self::custom`]'s docs for what that property is and why giving it
+    /// up is a real hazard).
+    ///
+    /// Falls back to [`Self::current_exe`]'s same random-fingerprint
+    /// behavior (and the same warning) if the executable can't be read;
+    /// `extra` is simply not mixed in in that case, since a random
+    /// fingerprint already can never match a previously stored one.
+    pub fn current_exe_with(extra: impl AsRef<[u8]>) -> Self {
         match std::env::current_exe().and_then(std::fs::read) {
-            Ok(bytes) => Fingerprint::custom(bytes),
+            Ok(bytes) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&bytes);
+                hasher.update(extra.as_ref());
+                Fingerprint(*hasher.finalize().as_bytes())
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Fingerprint::current_exe: failed to read the current executable; \
+                    "Fingerprint::current_exe_with: failed to read the current executable; \
                      using a random fingerprint (always mismatches, so the restored graph \
                      will always be revalidated in the background)"
                 );
@@ -151,6 +172,28 @@ impl Fingerprint {
     /// Fingerprints arbitrary caller-chosen data — a build id, a version
     /// string, a config hash, or anything else that should invalidate the
     /// trust placed in a persisted graph when it changes.
+    ///
+    /// **Hazard: this is only as trustworthy as `data` itself.**
+    /// [`Self::current_exe`] is self-correcting — it hashes the actual
+    /// running binary, so *any* code change automatically produces a
+    /// different fingerprint, with nothing for the caller to remember to
+    /// update. `custom` has no such guarantee: it trusts `data` completely.
+    /// Change a computation body's logic without also bumping whatever
+    /// string or hash you pass here, and every persisted result for that
+    /// computation is silently served as a `Clean` cache hit forever —
+    /// indistinguishable, at load time, from a legitimate one (see
+    /// `crate::persist`'s module docs on how little a fingerprint match is
+    /// actually trusted to mean). There is no detection for this: a stale
+    /// `custom` fingerprint is not corruption, not a decode failure, not
+    /// anything this module's "always safe to drop and recompute" story
+    /// covers — it looks exactly like a correct cache hit.
+    ///
+    /// Prefer [`Self::current_exe`] (or [`Self::current_exe_with`] if a
+    /// config value should *also* invalidate the cache) whenever possible;
+    /// reach for `custom` alone only when the running binary genuinely
+    /// isn't a meaningful proxy for "the code that produced these results"
+    /// (e.g. a stable long-running host process that reloads computation
+    /// logic without restarting).
     pub fn custom(data: impl AsRef<[u8]>) -> Self {
         Fingerprint(*blake3::hash(data.as_ref()).as_bytes())
     }
@@ -608,7 +651,21 @@ impl PersistHandle {
                         );
                         continue;
                     };
-                    let value_bytes = erased_def.serialize_value(&pending.value);
+                    let value_bytes = match erased_def.serialize_value(&pending.value) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            // A failing `R: Serialize` impl, not an engine
+                            // bug (see `ErasedDef::serialize_value`'s docs)
+                            // -- drop just this one pending upsert rather
+                            // than letting it panic the persister task.
+                            tracing::warn!(
+                                def = %key.def().name(),
+                                error = %e,
+                                "persistence: flush: value failed to serialize; dropping this pending upsert"
+                            );
+                            continue;
+                        }
+                    };
                     let record = NodeRecord {
                         def_name: pending.def_name.clone(),
                         param_bytes: pending.param_bytes.clone(),
@@ -897,7 +954,32 @@ impl EngineInner {
     /// dependency that itself appears later in the same batch, or not at
     /// all — see the second pass's handling of a dangling `comp_deps`
     /// entry).
-    fn restore_nodes(&self, records: Vec<NodeRecord>) -> usize {
+    ///
+    /// ## Load-time key verification
+    ///
+    /// `record.param_bytes` was decoded, then re-serialized by
+    /// [`crate::def::ErasedDef::revive_key`] to recompute this record's
+    /// `CompKey` (the on-disk record itself never stores the key directly —
+    /// only the definition name and the param bytes). If that recomputed
+    /// key doesn't match `stored_key_bytes` (the actual primary key this
+    /// record was filed under — redb's own table key, threaded through from
+    /// [`open_and_read`]), the record is dropped with a loud warning rather
+    /// than trusted.
+    ///
+    /// This is not a defensive nicety: a mismatch here means
+    /// `record.param_bytes` re-serializes to different bytes than it did
+    /// when this record was written — in practice, almost always a
+    /// non-deterministic param `Serialize` impl (see [`CompParam`]'s docs).
+    /// Trusting the recomputed key anyway would silently attach this
+    /// record's value/deps/outputs to the *wrong* live identity: the record
+    /// can never be found again under the key it actually holds, so it
+    /// looks unreachable to the driver's liveness GC, which then deletes
+    /// its sink outputs — while the real, still-live identity recomputes
+    /// cold, having lost nothing from *its* perspective. Dropping the
+    /// record here instead means exactly one node recomputes cold on this
+    /// restart, with a warning naming the culprit definition — a diagnosable
+    /// cold start instead of a silent orphan-and-delete.
+    fn restore_nodes(&self, records: Vec<StoredRecord>) -> usize {
         struct PendingNode {
             key: CompKey,
             param_bytes: Vec<u8>,
@@ -911,7 +993,7 @@ impl EngineInner {
 
         let mut pending: Vec<PendingNode> = Vec::with_capacity(records.len());
 
-        for record in records {
+        for (stored_key_bytes, record) in records {
             let Some(&def_id) = self.def_names.get(&record.def_name) else {
                 tracing::debug!(
                     def = %record.def_name,
@@ -926,6 +1008,33 @@ impl EngineInner {
                 tracing::debug!(def = %record.def_name, "persistence: dropping a record whose param bytes failed to decode");
                 continue;
             };
+
+            // Load-time key verification -- see this method's docs.
+            if encode_key(&key) != stored_key_bytes {
+                tracing::warn!(
+                    def = %record.def_name,
+                    "persistence: dropping a record whose recomputed key does not match the key it was \
+                     stored under -- almost always a non-deterministic parameter Serialize impl (e.g. a \
+                     HashMap/HashSet field; see `computations::CompParam`'s docs). This node will simply \
+                     recompute cold rather than risk attaching to the wrong live identity."
+                );
+                continue;
+            }
+
+            // The engine's node table caps a single row's param span at
+            // `u16::MAX` bytes (see `engine::DefTable::insert`); checked
+            // here, before this record ever reaches that table, for the
+            // same reason `EngineInner::prepare` checks it before taking
+            // the node-table lock on the live-eval path -- see Stage 7 of
+            // `docs/persistence-benchmark-notes.md`.
+            if record.param_bytes.len() > u16::MAX as usize {
+                tracing::warn!(
+                    def = %record.def_name,
+                    len = record.param_bytes.len(),
+                    "persistence: dropping a record whose param bytes exceed this engine's per-node size limit"
+                );
+                continue;
+            }
 
             let comp_dep_keys: Vec<CompKey> =
                 record.comp_deps.iter().filter_map(|dep| dep.to_key(&self.def_names)).collect();
@@ -1163,7 +1272,7 @@ pub(crate) fn mark_removed(engine: &EngineInner, key: CompKey) {
 /// tries once more against a fresh database; if even that fails,
 /// persistence is disabled for this run (`None`) rather than the engine
 /// ever failing to start.
-fn open_db(path: &Path) -> (Option<Database>, Option<Fingerprint>, Vec<NodeRecord>) {
+fn open_db(path: &Path) -> OpenOutcome {
     match open_and_read(path) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -1188,7 +1297,15 @@ fn open_db(path: &Path) -> (Option<Database>, Option<Fingerprint>, Vec<NodeRecor
     }
 }
 
-type OpenOutcome = (Option<Database>, Option<Fingerprint>, Vec<NodeRecord>);
+/// A raw `nodes` table row as read off disk: its primary key bytes (see
+/// [`encode_key`]) alongside the decoded record — [`EngineInner::restore_nodes`]
+/// needs the raw key bytes too, not just the record, to verify a revived
+/// record's *recomputed* key actually matches the key it was stored under
+/// (see that method's docs on why: a non-deterministic param `Serialize`
+/// impl can make them disagree).
+type StoredRecord = (Vec<u8>, NodeRecord);
+
+type OpenOutcome = (Option<Database>, Option<Fingerprint>, Vec<StoredRecord>);
 
 fn open_and_read(path: &Path) -> Result<OpenOutcome, redb::Error> {
     let db = Database::create(path)?;
@@ -1222,9 +1339,10 @@ fn open_and_read(path: &Path) -> Result<OpenOutcome, redb::Error> {
         };
         let mut records = Vec::new();
         for entry in nodes_table.iter()? {
-            let (_key, value) = entry?;
+            let (key, value) = entry?;
+            let key_bytes = key.value().to_vec();
             match postcard::from_bytes::<NodeRecord>(value.value()) {
-                Ok(record) => records.push(record),
+                Ok(record) => records.push((key_bytes, record)),
                 Err(e) => tracing::debug!(error = %e, "persistence: dropping a node record that failed to decode"),
             }
         }
@@ -1264,4 +1382,146 @@ fn write_batch(
     }
     write_txn.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::def::{Comp, define_comp};
+    use crate::engine::Engine;
+
+    #[test]
+    fn current_exe_with_mixes_in_extra_data() {
+        // `extra` changes the fingerprint even though the binary hash half
+        // is identical both times.
+        let a = Fingerprint::current_exe_with("config-v1");
+        let b = Fingerprint::current_exe_with("config-v2");
+        assert_ne!(a, b, "different `extra` must produce different fingerprints");
+
+        // Same binary, same `extra` -> stable (deterministic) fingerprint.
+        let a_again = Fingerprint::current_exe_with("config-v1");
+        assert_eq!(a, a_again, "same binary + same extra must reproduce the same fingerprint");
+
+        // `current_exe()` is exactly `current_exe_with(&[])`.
+        assert_eq!(Fingerprint::current_exe(), Fingerprint::current_exe_with([]));
+    }
+
+    #[test]
+    fn custom_ignores_the_binary_entirely() {
+        // `custom` never mixes in the running binary at all, unlike
+        // `current_exe_with` -- two different `custom` payloads that happen
+        // to collide with `current_exe`'s output would be a documentation
+        // bug, not something to assert on; what matters here is that
+        // `custom` is a pure function of its input.
+        assert_eq!(Fingerprint::custom("same"), Fingerprint::custom("same"));
+        assert_ne!(Fingerprint::custom("a"), Fingerprint::custom("b"));
+    }
+
+    /// Writes a single raw `nodes` table row directly (bypassing
+    /// [`PersistHandle`] entirely) under `key_bytes`, plus a matching meta
+    /// row — the low-level tool the key-verification test below uses to
+    /// construct a record stored under a key that doesn't match what it
+    /// actually decodes to.
+    fn write_raw_record(path: &Path, fingerprint: Fingerprint, key_bytes: &[u8], record: &NodeRecord) {
+        let db = Database::create(path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta_table = write_txn.open_table(META_TABLE).unwrap();
+            let meta = MetaRecord {
+                format_version: FORMAT_VERSION,
+                fingerprint: fingerprint.0,
+            };
+            let meta_bytes = postcard::to_stdvec(&meta).unwrap();
+            meta_table.insert(META_KEY, meta_bytes.as_slice()).unwrap();
+        }
+        {
+            let mut nodes_table = write_txn.open_table(NODES_TABLE).unwrap();
+            let bytes = postcard::to_stdvec(record).unwrap();
+            nodes_table.insert(key_bytes, bytes.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    /// Fix 3(a): a record whose param bytes decode to (and therefore
+    /// recompute) a *different* `CompKey` than the raw key it was actually
+    /// filed under — exactly what a non-deterministic param `Serialize`
+    /// impl produces across two instances — must be dropped at load time
+    /// rather than trusted, with no panic. Constructed directly (rather
+    /// than via a real non-deterministic type) by writing a record whose
+    /// param decodes to `5` under the raw key for `999`: `revive_key`
+    /// (which only ever looks at `param_bytes`, never the stored key) would
+    /// recompute the key for `5` regardless of what it was filed under, so
+    /// this exercises exactly the mismatch the load-time check exists to
+    /// catch.
+    ///
+    /// Proven via the computation's own run counter: if the mismatched
+    /// record were wrongly trusted, it would be restored as a `Clean` cache
+    /// hit for key `5` and the body would never run at all (and the
+    /// engine would return the record's stale, deliberately-wrong stored
+    /// value `5` instead of the correct `10`). With the check in place, the
+    /// record is dropped, the node starts absent, and the initial
+    /// evaluation runs the body fresh.
+    #[tokio::test]
+    async fn restore_drops_a_record_whose_recomputed_key_does_not_match_its_stored_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.redb");
+
+        let def_id = DefId::new("key_mismatch_probe");
+        let fingerprint = Fingerprint::custom("fp-key-mismatch");
+
+        let real_param_bytes = postcard::to_stdvec(&5i32).unwrap();
+        let wrong_key = CompKey::new(def_id, &999i32);
+        let wrong_key_bytes = encode_key(&wrong_key);
+
+        let record = NodeRecord {
+            def_name: "key_mismatch_probe".to_string(),
+            param_bytes: real_param_bytes,
+            comp_deps: Vec::new(),
+            source_deps: Vec::new(),
+            result_hash: [0; 16],
+            // Deliberately the *wrong* answer (`5`, not `5 * 2 = 10`) so a
+            // wrongly-trusted restore is observable through the returned
+            // value, not just through the run counter.
+            value_bytes: postcard::to_stdvec(&5i32).unwrap(),
+            outputs: Vec::new(),
+        };
+        write_raw_record(&db_path, fingerprint, &wrong_key_bytes, &record);
+
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut builder = Engine::builder();
+        builder.persistence(PersistOptions::new(db_path.clone(), fingerprint));
+        let comp: Comp<i32, i32> = builder.register(define_comp("key_mismatch_probe", {
+            let run_count = run_count.clone();
+            move |_ctx, n: i32| {
+                let run_count = run_count.clone();
+                async move {
+                    run_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(n * 2)
+                }
+            }
+        }));
+        let engine = builder.build();
+
+        let handle = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.run(comp, 5).await })
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if run_count.load(Ordering::SeqCst) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the body must actually run -- the mismatched-key record must not be trusted as a cache hit");
+
+        assert!(!handle.is_finished(), "a mismatched-key record must not crash the engine");
+        handle.abort();
+    }
 }
