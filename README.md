@@ -1,6 +1,6 @@
 # computations
 
-A coarse-grained, push-based self-adjusting computation (SAC) engine for Rust.
+A coarse-grained, push-based self-adjusting computation engine for Rust.
 
 ## 1. What this is
 
@@ -32,8 +32,7 @@ is modeled directly on the reference Haskell implementation at
 [github.com/skogsbaer/computations](https://github.com/skogsbaer/computations).
 See [§5](#5-api-mapping) for how the two map onto each other name-for-name.
 
-Deliberate simplifications relative to the paper (this is a from-scratch
-Rust port, not a full port of every feature):
+Deliberate simplifications relative to the paper:
 
 - **One caching strategy.** The paper offers a choice of caching
   strategies (full memoization, hash-based cutoff only, no caching); this
@@ -55,15 +54,13 @@ Rust port, not a full port of every feature):
   to a local file and restoring it on the next run. See [§8](#8-persistence).
 
 Two `Source` backends ship in this workspace: `computations-fs`
-(filesystem — §3 below) and `computations-time`, a wall-clock time source
-with no polling loop of its own. `computations_time::TimeSource` answers
-two requests — `RoundedTime(bucket)` (current time rounded down to a
+(filesystem — §3 below) and `computations-time` ([§7](#7-status-and-limitations)),
+a wall-clock time source. `computations_time::TimeSource` answers two
+requests — `RoundedTime(bucket)` (current time rounded down to a
 granularity like `Bucket::MINUTE` or `Bucket::FIVE_MINUTES`) and
 `IsAfter(t)` (has wall-clock time passed `t`, flipping `false` to `true`
-exactly once) — via one background task that sleeps until the next bucket
-boundary or deadline actually due, recomputed fresh from the wall clock on
-every wakeup. This is the analogue of the paper's built-in `compGetTime`
-source (see [§5](#5-api-mapping)).
+exactly once) — the analogue of the paper's built-in `compGetTime` source
+(see [§5](#5-api-mapping)).
 
 ## 2. Quick example
 
@@ -105,11 +102,16 @@ This is illustrative (marked `ignore` since it depends on real paths at
 `/tmp`) rather than doc-tested; see `crates/computations-fs/examples/dirsync.rs`
 for a complete, runnable version with two mutually-recursive computations.
 
-`define_with`/`define_rec_with` (this section's flagship pattern) are the
-environment-passing variants of `define`/`define_rec`: reach for the plain
-`define`/`define_rec` instead when a computation's body needs no captured
-environment at all (see the `sum`/`store` computations in
-`crates/computations/tests/engine.rs` for that no-env case).
+`EngineBuilder::define` and its variants are the preferred way to define a
+computation (`define_comp` + `register` stays public for callers that build
+a `CompDef` elsewhere). Use plain `define`/`define_rec` when a body needs no
+captured environment (see the `sum`/`store` computations in
+`crates/computations/tests/engine.rs`), and `define_rec`/`define_rec_with`
+when a computation calls itself: they hand the body a `Comp` handle to its
+own definition, so the name isn't repeated — and can't drift — across two
+call sites. Mutual recursion between two or more definitions still goes
+through `Comp::named` directly (see the `cycle_a`/`cycle_b` test in the same
+file).
 
 ## 3. The dirsync demo
 
@@ -120,10 +122,9 @@ keeps a target directory an exact, live copy of a source directory.
 cargo run -p computations-fs --example dirsync -- --source <A> --target <B>
 ```
 
-It watches `<A>` and keeps `<B>` in sync: files are copied over,
-directories are recreated, and anything removed from `<A>` — or present in
-`<B>` before startup but not produced by any live computation — is deleted.
-It runs forever; stop it with Ctrl-C.
+Files are copied over, directories are recreated, and anything removed from
+`<A>` — or present in `<B>` before startup but not produced by any live
+computation — is deleted. It runs forever; stop it with Ctrl-C.
 
 Things worth trying while it runs:
 
@@ -156,14 +157,7 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
   (the paper's `CompM` monad). Every effect a computation can have —
   calling another computation, reading a source, writing a sink — goes
   through `Ctx`, which is what lets the engine record it as a dependency of
-  whichever application is currently executing. A computation that needs to
-  call itself recursively should be built with `define_comp_rec` rather than
-  `define_comp`: it hands the body a working `Comp` handle to its own
-  definition, so there's no separate `Comp::named("x")` / `define_comp("x",
-  ...)` pair with the name `"x"` repeated (and possibly drifting) between
-  the two. Mutual recursion between two or more definitions still goes
-  through `Comp::named` directly (see the `cycle_a`/`cycle_b` test in
-  `crates/computations/tests/engine.rs`).
+  whichever application is currently executing.
 - **Sources** (`source.rs`): a plugin trait pair (`SourceBase` + `Source<R>`
   per request type `R`) for external inputs. Each read reports the
   `Dep`s (key + version) it touched; the version is opaque to the engine,
@@ -199,7 +193,7 @@ RUST_LOG=computations=debug cargo run -p computations-fs --example dirsync -- --
 
 | Rust (this crate) | Paper / Haskell (`skogsbaer/computations`) |
 |---|---|
-| `define_comp` (or `EngineBuilder::define`, which is `define_comp` + `register` in one step — the preferred way to define a computation) | `defineComp` |
+| `define_comp` (or `EngineBuilder::define`, the one-step equivalent) | `defineComp` |
 | `define_comp_rec` (or `EngineBuilder::define_rec`, the one-step equivalent) | *(not in the paper; a convenience over `define_comp` + `Comp::named` for self-recursive bodies)* |
 | `Comp<P, R>` | `Comp` |
 | `Ctx::eval` | `evalComp` |
@@ -268,8 +262,7 @@ cargo test --workspace --all-features
 ## 8. Persistence
 
 Persistence is opt-in, per-`Engine`, and exists purely as a warm-start
-cache — nothing about it is a source of truth, and nothing about it can
-fail the engine.
+cache.
 
 ```rust
 use computations::{Engine, Fingerprint, PersistOptions};
