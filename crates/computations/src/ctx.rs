@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::def::Comp;
 use crate::engine::EngineInner;
 use crate::error::CompError;
+use crate::flow::FlowId;
 use crate::key::{CompKey, CompParam, CompResult};
 use crate::sink::{RawOutput, Sink};
 use crate::source::{Request, Source, raw_deps};
@@ -54,6 +55,41 @@ impl Ctx {
             .engine
             .eval::<P, R>(*comp.def_id(), param, self.chain.clone())
             .await?;
+
+        match &self.caller {
+            Some(caller_key) => self.engine.record_call_dep(caller_key, &callee_key),
+            None => self.engine.mark_root(callee_key),
+        }
+
+        Ok(value)
+    }
+
+    /// Calls the flow-argument computation named `name`, applied to
+    /// `flows`/`param` (Stage 9 — see `docs/persistence-benchmark-notes.md`'s
+    /// design rationale in full). This is what a `#[computation]`-generated
+    /// wrapper function will call internally, and what this crate's own
+    /// hand-written flow tests call directly to exercise the same shape by
+    /// hand.
+    ///
+    /// Identical memoization/single-flight/dependency-recording contract as
+    /// [`Self::eval`] — same cache-hit/join/run algorithm, same call-dep
+    /// recording against the currently executing computation (or
+    /// [`crate::engine::EngineInner::mark_root`] for a root call) — the only
+    /// difference is that identity here is named by string plus an ordered
+    /// [`FlowId`] list rather than by a registration-backed [`Comp<P, R>`]
+    /// handle, since a flow-argument computation's parameter type is never
+    /// attached to a handle in the first place (see
+    /// [`crate::flow::FlowCompDef`]'s docs). `flows`' ids (not their
+    /// contents) participate in this call's identity — see
+    /// [`crate::flow`]'s module docs for why that is a correctness
+    /// requirement, not an optimization.
+    pub async fn eval_flows<P: CompParam, R: CompResult>(
+        &self,
+        name: &'static str,
+        flows: &[FlowId],
+        param: P,
+    ) -> Result<R, CompError> {
+        let (value, callee_key) = self.engine.eval_flows::<P, R>(name, flows, param, self.chain.clone()).await?;
 
         match &self.caller {
             Some(caller_key) => self.engine.record_call_dep(caller_key, &callee_key),

@@ -1715,3 +1715,345 @@ nothing in this stage's changes adds any steady-state per-node memory (the
 `Vec<u8>` `StoredRecord` key is a transient, load-time-only allocation,
 freed once `restore_nodes` returns).
 
+## Stage 9 — flow-argument computations (macro foundation)
+
+Phase A of a future `#[computation]` proc-macro: made the macro's target
+shape — `async fn sync_file(ctx: &Ctx, #[flow] source: &Arc<FsSource>,
+#[flow] sink: &Arc<FsSink>, rel: PathBuf) -> Result<(), CompError>`, called
+as a plain `sync_file(ctx, &source, &sink, rel).await`, no builder
+registration, no captures — work *by hand*, so the macro (not built here)
+only has to generate the shapes this stage wrote out explicitly:
+`concat!(module_path!(), "::sync_file")`, the real body, a public wrapper
+calling `Ctx::eval_flows`, and a `FlowThunk` registered via
+`EngineBuilder::define_flows`. Entirely additive: every existing
+`define`/`define_with`/`Comp<P, R>` builder-path API is unchanged, and the
+two paths share one engine core (`prepare`/`run`, the node table, GC,
+persistence) rather than forking it.
+
+### Identity: why a flow's instance id has to enter `CompKey`
+
+A flow argument (a source or sink) is read/written through
+`Ctx::src_req`/`sink_req` exactly as today — its *contents* are never
+hashed, dependency-tracked the same way as any other source/sink access.
+But its *instance* still has to distinguish two calls: `sync_file(src_a,
+sink, rel)` and `sync_file(src_b, sink, rel)` must be two different nodes,
+never one. Without that, they'd collide on one `CompKey` (same def name,
+same `rel` param) and silently serve each other's cached values — wrong
+output, not a crash, and the kind of bug that only shows up as "the file
+synced from the wrong source" days later.
+
+- **`FlowId`** (`flow.rs`) unifies a source or sink's stable id:
+  `enum FlowId { Source(SourceId), Sink(SinkId) }`, `Clone + Eq + Hash +
+  Serialize + Deserialize`. Getting it `Serialize`/`Deserialize` required
+  giving `SourceId`/`SinkId` themselves hand-written impls first (`source.rs`/
+  `sink.rs`) — both just wrap an `Arc<str>`, and deriving through `Arc`
+  needs serde's `rc` feature (not enabled in this workspace), so a plain
+  string round-trip was written by hand instead. This is also what let
+  `NodeRecord::flow_ids` (below) store `Vec<FlowId>` directly, with no
+  `*Repr` stand-in type of the kind `RawDepRepr`/`RawOutputRepr` needed
+  before `SourceId`/`SinkId` could serialize on their own.
+- **`flow_aware_param_hash(flows, param_bytes)`** (`flow.rs`) is the one
+  function that actually folds flow identity into `CompKey`. **The
+  empty-flows case is not a degenerate case of the general formula — it's
+  a hard, separately-branched requirement**: with `flows.is_empty()`, it
+  returns *exactly* `blake3(param_bytes)`, truncated to 128 bits — bit-for-
+  bit what `CompKey::new`/`StableHash::stable_hash` already compute for a
+  plain param, with no flow-list contribution at all, not even an
+  empty-list marker byte. Getting this wrong (e.g. always hashing
+  `postcard(flows) ++ param_bytes`, even for an empty `flows`) would
+  silently invalidate every persisted database ever written under the
+  existing builder path the moment this feature shipped: postcard's own
+  length-prefix for an empty `Vec` is a real, non-empty byte sequence, so
+  the "general" formula's zero-flows case does *not* naturally coincide
+  with the old one without this explicit branch. Pinned down directly by
+  `flow::tests::flow_hash_with_no_flows_matches_plain_param_hash`, which
+  asserts the zero-flows output equals both `StableHash::stable_hash` and
+  `CompKey::new`'s own `param_hash()` — not just "an equivalent-looking
+  hash", the literal same `Hash128`. (The builder path itself never calls
+  this function at all — `Comp<P, R>`/`Ctx::eval` are completely untouched
+  — so its hashes are bit-identical to before by construction, not by
+  coincidence; this test is what makes that a checked invariant rather
+  than an assertion in a doc comment.) With a non-empty `flows`,
+  `postcard::to_stdvec(flows)` is self-delimiting (a `Vec`'s own length
+  prefix), so concatenating it with `param_bytes` before hashing can never
+  produce the same bytes for two different (flows, param) splits.
+
+### Registry: typed lookup by instance id
+
+A revived or rerun flow-argument node has only `FlowId`s, never live
+handles — a node's flows have to be resolved fresh from the registry every
+single time, first execution or any later rerun alike (see "no closures
+stored anywhere" below). `Registry` (`registry.rs`) already stored every
+source/sink behind its object-safe `dyn ErasedSource`/`dyn ErasedSink` —
+untyped by design, since the driver only ever needs untyped operations —
+so a second, parallel map was added per side: `source_typed`/`sink_typed:
+HashMap<_, Arc<dyn Any + Send + Sync>>`, holding the *same* `Arc<S>`
+(cloned once at `register_source`/`register_sink`, a refcount bump, not a
+second instance) purely so `Registry::source_typed<S>`/`sink_typed<S>` can
+downcast back to a caller-known concrete type. `Registry::merge` extends
+both new maps alongside the existing ones.
+
+### `FlowResolver`/`FlowThunk`: the uniform, closure-free rerun path
+
+```rust
+pub type FlowThunk =
+    fn(Ctx, FlowResolver<'_>, &[u8]) -> BoxFuture<'static, Result<Arc<dyn Any + Send + Sync>, CompError>>;
+```
+
+A plain `fn` pointer, not a closure — it captures nothing, so both the
+first execution and every later rerun call the exact same value; nothing
+about a node's flows or param is ever stored in a stored closure anywhere
+(mirroring the closure-kill already done for the builder path's own rerun,
+Stage 4). This is also deliberately a plain, `Copy`, `'static` value
+because Phase B's macro is expected to collect `(name, thunk)` pairs via
+`inventory::submit!` and hand each to `EngineBuilder::define_flows` at
+link time — a plain value is exactly what that needs.
+
+`FlowResolver` (`flow.rs`) wraps a `&Registry` plus a node's ordered
+`&[FlowId]`, and offers `source::<S>(idx)`/`sink::<S>(idx)` returning
+`Result<Arc<S>, CompError>`. Every failure mode is a loud, named
+`CompError::Failed` rather than a panic or a silent `None`: `idx` out of
+range, the flow at `idx` is a sink where a source was expected (or vice
+versa), the id isn't registered in this engine's `Registry` at all, or
+it's registered under a different concrete type than `S` expects — each
+message names the flow index and (where known) the id/kind, so a
+misconfigured engine fails with something actually debuggable rather than
+a generic "computation failed".
+
+### Making `prepare`/`run` serve two kinds of definition without forking
+
+The whole point was to reuse the existing cache-hit / single-flight-join /
+run algorithm, not fork a second copy of it for flows. The one thing
+`prepare`/`run` actually needed from a `CompDef<P, R>` was its typed value
+column (`read_value`/`write_value`) and, for `run`, its body — both now
+factored out:
+
+- **`ValueColumn<R>`** (`def.rs`): `{ read_value(row) -> Option<R>;
+  write_value(row, R) }`, implemented by both `CompDef<P, R>` (unchanged
+  behavior, just moved behind a trait) and the new `FlowCompDef<R>`
+  (`flow.rs` — generic over `R` alone, deliberately *not* `P`: a
+  flow-argument def's parameter type is never named at the engine level at
+  all, since `FlowThunk` decodes `param_bytes` itself; `P` only ever
+  appears one layer up, at `Ctx::eval_flows`'s macro-generated call sites,
+  purely to serialize what the caller already has in hand). Both defs'
+  `Mutex<Vec<Option<R>>>` growth/read/write logic is the exact same code
+  now (`column_read`/`column_write`, `def.rs`) rather than duplicated —
+  "reuse `CompDef<P, R>`'s typed value column" is true of the actual code,
+  not just the shape. `prepare`/`run` are now generic over `D: ValueColumn<R>
+  + ?Sized` instead of a concrete `Arc<CompDef<P, R>>`.
+- **`run`'s body** is now an explicit `BodyFn<P, R>` parameter instead of
+  read off `def.body` internally. The builder path's call site passes
+  `def.body.clone()` (exactly what `run` used to do itself); the
+  flow-argument path (`EngineInner::eval_flows_core`) builds a one-off
+  `BodyFn` (`engine.rs::build_flow_body`) that ignores the `_param: P` `run`
+  hands it and instead resolves `thunk`'s flows fresh from the registry via
+  a `FlowResolver`, calls the registered `FlowThunk`, and downcasts its
+  erased result to `R` — from `run`'s point of view, indistinguishable from
+  an ordinary builder-path body.
+- **`EngineInner::eval_flows`/`eval_flows_core`/`eval_flows_erased`**
+  (`engine.rs`) are the flow-argument mirror of `eval`: `eval_flows<P, R>`
+  is the typed entry point `Ctx::eval_flows` calls; `eval_flows_erased<R>`
+  is what a rerun/revival goes through, with no compile-time `P` at all —
+  it instantiates the shared `eval_flows_core` at `P = ()`, which is sound
+  (not a hack) because a flow-argument def's identity and execution never
+  actually depend on `P`: `FlowThunk` decodes bytes itself, and the one
+  place `P` matters at runtime (`prepare`'s debug-only param-determinism
+  check) only ever fires for a node this engine has never seen before,
+  which a rerun/revival can't be by construction (the node already
+  exists). The one visible cost is diagnostic, not correctness: a
+  flow-argument node's rerun trace event renders `param = ()` rather than
+  the real value, since that value is genuinely never reconstructed on
+  that path.
+- **`EngineInner::rerun_node`** now takes the node's `&[FlowId]` alongside
+  `param_bytes`, and tries `ErasedDef::rerun` first, falling back to the
+  new `ErasedDef::rerun_flows` only when that reports "not applicable"
+  (`None` — always true for a flow-argument def, whose `param_bytes` alone
+  can't reconstruct its identity; never true for a builder-path def with
+  well-formed bytes). Same try-then-fall-back ordering in
+  `persist.rs::restore_nodes` between `ErasedDef::revive_key` and the new
+  `revive_key_flows`. Neither caller has to know in advance which kind of
+  def a `CompKey`/record names — both new `ErasedDef` methods default to
+  `None`, so every pre-Stage-9 (builder-path) `ErasedDef` impl is
+  unaffected without writing a single line at any existing call site.
+- **`Engine::run_flows`** (`driver.rs`) is the flow-argument counterpart of
+  `Engine::run`: same initial-evaluation / startup-GC / infinite
+  propagation loop, factored into a shared `startup_gc_then_loop` so the
+  only thing that actually differs is which of `eval_root`/`eval_root_flows`
+  performs the initial evaluation — `propagate`/`liveness_gc`/`rerun_node`
+  were already flow-agnostic (`CompKey`/`NodeRef`-only), so the driver
+  needed no other change to rerun a dirtied flow-argument node under a live
+  propagation round. `driver.rs::run_wave`'s job-building step now also
+  reads each node's `flow_ids_clone(r)` (empty for a builder-path node)
+  alongside its `param_bytes`, purely to hand it through to `rerun_node`.
+
+### A new sparse side table, and why the node table itself needed no changes
+
+The columnar node table (`DefTable`/`NodeRef`/`DefIndex`, Stage 5) needed
+**zero changes**: it already stores rows keyed by a `Hash128` param hash
+regardless of how that hash was computed, and a flow-argument def is
+registered into the exact same `def_order`/`DefIndex` machinery as a
+builder-path one (`EngineBuilder::define_flows` pushes onto `def_order`
+exactly like `register` does) — so a flow-argument node is, as far as
+`NodeTable` is concerned, just another row.
+
+The one genuinely new piece of per-node state is a node's ordered
+`Vec<FlowId>` itself, needed at rerun/persist/restore time (a node's
+identity hash doesn't preserve the original flow list — hashing is
+one-way). Added as a fourth sparse side table on `NodeTable`
+(`flow_ids: HashMap<NodeRef, Vec<FlowId>>`), alongside the existing
+`source_deps`/`outputs`/`inflight`: absent, not merely empty, for every
+ordinary builder-path node, which never touches it at all. Purged in
+`remove_by_id` alongside the other three, so a GC'd node never leaves one
+behind.
+
+### Persistence: format bump, and the restore-time fallback chain
+
+`NodeRecord` gained `flow_ids: Vec<FlowId>` (stored directly, no `*Repr`
+adapter needed — see the `FlowId`/`SourceId`/`SinkId` note above), and
+`FORMAT_VERSION` bumped 2 -> 3: an older database's records don't have
+that field at all, so rather than guess a default for every existing row,
+the existing mismatch path wipes and recomputes cold — exactly the same
+path a corrupt file or an unrecognized format already took, now also
+covered by a dedicated test
+(`persist::tests::old_format_version_is_wiped_and_starts_cold`, which
+writes a stale `format_version` byte directly and asserts `open_db`
+returns a fresh, empty database rather than trusting a partially-decodable
+one). `PendingRecord::snapshot` reads a node's flow ids via the same
+`nodes.flow_ids_clone(r)` the driver's rerun path uses.
+
+The Stage-7 load-time key verification (a record's *recomputed* key must
+match the raw key bytes it was actually filed under, or it's dropped
+rather than trusted — see Stage 7 above) keeps working unmodified for both
+paths: `restore_nodes` now tries `revive_key` first and falls back to
+`revive_key_flows(flow_ids, param_bytes)` only when that returns `None`
+(the same fallback-chain shape as `rerun_node`, above), and the resulting
+key — whichever path produced it — is still compared against
+`encode_key(&key) == stored_key_bytes` exactly as before. A flow-argument
+record whose recomputed key doesn't match (e.g. a stale `FlowId` list from
+a differently-shaped rerun) is dropped with the same loud warning and
+diagnosable cold recompute as any other key mismatch, never silently
+misattached.
+
+### Proving it by hand (`tests/flow.rs`)
+
+Wrote out, by hand, exactly what `#[computation]` would generate for a
+two-flow computation (`sync_doc`: a `MemKvSource` reader + `VecSink`
+writer) — the name constant, the real `impl` body, the public wrapper
+calling `Ctx::eval_flows`, and the `FlowThunk` registered via
+`define_flows` — across five scenarios, each in its own module so its name
+constant and run-counter `static` (a `FlowThunk` is a plain `fn` with no
+per-call captures, so counting invocations needs a `static`, not an
+`Arc<AtomicUsize>` closure capture the way `tests/driver.rs` does it) can
+never collide with another scenario's:
+
+- **Evaluates correctly and memoizes**, via a nested builder-path root
+  computation that calls the generated wrapper (exercising the wrapper
+  itself, which needs a `&Ctx` unavailable at a bare root call, and
+  proving the two registration styles interoperate — a builder-path
+  computation calling a flow-argument one looks exactly like calling any
+  other async function).
+- **Re-runs on a source change under the live driver** (`Engine::run_flows`,
+  spawned and polled exactly like every `tests/driver.rs` scenario).
+- **Survives a persisted restart as a cache hit, zero reruns** — two
+  `Engine`s built against the same redb file and the same source/sink
+  `Arc`s (mirroring a real restart), with the second's initial evaluation
+  going through `run_flows` (restoring only ever happens inside
+  `Engine::run`/`run_flows`) asserting the shared run-counter stayed at 1.
+- **The identity test**: the same computation name, called (via two
+  builder-path wrappers) with the same param against two *different*
+  `MemKvSource` instances, must produce two independent values and exactly
+  two runs — the direct regression test for the silent-corruption case
+  this whole stage exists to prevent. Also asserts a third, unchanged call
+  stays a cache hit against its own node rather than colliding with the
+  other instance's.
+- **Mutual recursion** between two hand-written flow computations
+  (`is_even`/`is_odd`, each taking a shared sink flow) calling each other
+  by name through `Ctx::eval_flows` — a capability with no equivalent on
+  the builder path today (`Comp::named`'s mutual-recursion escape hatch was
+  removed; the documented workaround is merging into one self-recursive
+  computation over a sum-type param). Flow-argument computations need no
+  such workaround: since they're called by name rather than through a
+  registration-backed handle, there's no handle that has to already exist
+  before both defs are registered.
+
+Also added three focused unit tests in `flow.rs` itself pinning down
+`flow_aware_param_hash`'s three load-bearing properties directly (matches
+the plain builder hash at zero flows; changes when flows are added; changes
+across two different flow instances).
+
+**Correctness.** `cargo test --workspace --all-features`: 113 passed (up
+from 104 — +1 for the format-version-bump test above, +3 unit tests in
+`flow.rs`, +5 integration tests in the new `tests/flow.rs`), 1 pre-existing
+ignored test unaffected. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean (one `#[allow(clippy::too_many_arguments)]`
+on `EngineInner::run`, whose one new `body` parameter over Tier 2's already
+seven pushed it past the lint's default threshold — documented inline
+rather than restructured, since splitting the rest into a struct purely to
+dodge the lint would cost more clarity at `run`'s two call sites than it
+buys).
+
+**Benchmark.** `uptime` load average **11.66** (1-min; 9.97/12.18 at
+5/15-min) on this same 14-core box — elevated, in the same rough range as
+Stage 7's own flagged 12–30, so read the absolute numbers against that,
+not against an idle box; the comparison that actually matters is
+relative, against this task's stated baselines. `cargo run -p computations
+--release --example persist_bench --features testutil`, full 1M scale (one
+run, not paired trials like Stage 5/7):
+
+| phase | baseline (task-stated) | this run (loaded box) | direction |
+|---|---|---|---|
+| cold eval (persistence configured) | ~3.7 s | 3.646 s | flat |
+| warm restart, no changes | ~1.4 s | 1.399 s / 1.422 s (2 trials) | flat |
+| restart, 1 changed input | (not separately baselined) | 1.813 s / 1.992 s | — |
+| cold restart, no persistence | (not separately baselined) | 2.737 s / 2.744 s | — |
+| fingerprint mismatch (full revalidation) | (not separately baselined) | 4.899 s | — |
+| live incremental, no persistence | ~505 ms | 499 ms | flat |
+| live incremental, with persistence | (not separately baselined) | 603 ms | — |
+| persist_now / db size | (not separately baselined) | 2.424 s / **269.49 MB** | unchanged |
+| engine-only RSS (no persistence) | ~330 MB | 330.8 MB / 338.8 MB (2 trials) | flat |
+
+Every phase this task gave an explicit baseline for landed at or inside
+that baseline despite the elevated load — no phase is anywhere near the
+15% regression threshold this task asked to watch for, so the flow
+machinery this stage added is confirmed to cost the builder path nothing
+at steady state: it sits behind a generic type parameter (`ValueColumn<R>`)
+that monomorphizes away, an `EngineInner::eval_flows*` family the builder
+path's own `eval` never calls, and a `flow_ids` side table that a
+builder-path node never even inserts an entry into. The persisted db size
+(269.49 MB) came out byte-identical to every prior stage's measurement
+despite `NodeRecord` gaining a new `flow_ids` field — every existing
+record's field is an empty `Vec`, and apparently doesn't shift redb's
+page-rounded file size at this scale.
+
+### Left for Phase B
+
+- **The `#[computation]` proc-macro itself.** Everything in this stage is
+  the hand-written target shape; nothing here generates Rust code. The
+  macro's job is mechanical given this foundation: parse `#[flow]`-annotated
+  arguments, emit the name constant, wrapper, and `FlowThunk` this stage's
+  `tests/flow.rs` wrote by hand, and register each via `EngineBuilder::define_flows`.
+- **`inventory`-based collection.** `define_flows` is still called
+  explicitly per definition, exactly like `register`/`define` today.
+  `FlowThunk` was deliberately kept a plain `fn` value (not a closure or
+  boxed trait object) specifically so a macro can `inventory::submit!` a
+  `(name, thunk)` pair at link time and a startup step can walk the
+  inventory calling `define_flows` for each — that wiring itself wasn't
+  built, only the plain-value shape it needs.
+- **Multiple result types behind one `EngineBuilder`.** `define_flows<R>`
+  takes `R` explicitly at the call site (nothing infers it), which will be
+  entirely natural once the macro emits it directly from the user's return
+  type — not attempted as an ergonomics improvement here since there is no
+  hand-written call site that would benefit from inference weight over an
+  explicit turbofish.
+- **A typed `Comp`-like handle for a flow-argument computation.** Today a
+  flow computation is called purely by name string (`Ctx::eval_flows(name,
+  flows, param)`); there is no `Comp<P, R>`-equivalent handle carrying
+  compile-time identity the way the builder path has. This was a
+  deliberate scope cut, not an oversight: a flow computation's `P` is never
+  named at the engine level at all (see `FlowCompDef<R>`'s docs), so a
+  handle would need to either drop the `P` type parameter (weakening the
+  type safety a `Comp<P, R>` call site currently gets from the compiler)
+  or be generated per-macro-invocation with `P` baked in from the parsed
+  signature — squarely Phase B's job, once the macro can see that
+  signature to generate from.
+

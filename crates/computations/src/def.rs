@@ -24,6 +24,7 @@ use futures::future::BoxFuture;
 use crate::ctx::Ctx;
 use crate::engine::EngineInner;
 use crate::error::CompError;
+use crate::flow::FlowId;
 use crate::key::{CompKey, CompParam, CompResult, DefId};
 
 /// The type-erased body of a computation definition.
@@ -76,19 +77,67 @@ impl<P, R: Clone> CompDef<P, R> {
     /// row, but returning `None` here rather than panicking keeps this safe
     /// regardless).
     pub(crate) fn read_value(&self, row: u32) -> Option<R> {
-        self.values.lock().unwrap().get(row as usize).cloned().flatten()
+        column_read(&self.values, row)
     }
 
     /// Writes `value` into row `row`'s slot, growing the column as needed.
     /// Called once per successful execution (a genuine state change) or once
     /// per revived record at persisted-load time — never on a cache hit.
     pub(crate) fn write_value(&self, row: u32, value: R) {
-        let mut values = self.values.lock().unwrap();
-        let idx = row as usize;
-        if idx >= values.len() {
-            values.resize_with(idx + 1, || None);
-        }
-        values[idx] = Some(value);
+        column_write(&self.values, row, value);
+    }
+}
+
+/// The read/write logic behind every typed value column in this crate:
+/// [`CompDef::values`] (the builder path) and
+/// [`crate::flow::FlowCompDef`]'s own `values` (the flow-argument path,
+/// Stage 9 — see `docs/persistence-benchmark-notes.md`) are both plain
+/// `Mutex<Vec<Option<R>>>`s with identical growth/read/write semantics;
+/// factored out here once rather than duplicated so "reuse `CompDef<P,
+/// R>`'s typed value column" is true of the actual code, not just the
+/// shape. See [`ValueColumn`] for the trait both def kinds implement in
+/// terms of these two functions.
+pub(crate) fn column_read<R: Clone>(values: &Mutex<Vec<Option<R>>>, row: u32) -> Option<R> {
+    values.lock().unwrap().get(row as usize).cloned().flatten()
+}
+
+/// See [`column_read`].
+pub(crate) fn column_write<R>(values: &Mutex<Vec<Option<R>>>, row: u32, value: R) {
+    let mut values = values.lock().unwrap();
+    let idx = row as usize;
+    if idx >= values.len() {
+        values.resize_with(idx + 1, || None);
+    }
+    values[idx] = Some(value);
+}
+
+/// A definition that owns a typed value column for `R`, read on a cache hit
+/// and written after a genuine execution — the common capability
+/// `crate::engine::EngineInner::prepare`/`run` need from *either* kind of
+/// definition (`CompDef<P, R>` for the builder path, `crate::flow::FlowCompDef<R>`
+/// for the flow-argument path) without needing to know which one they're
+/// holding, or that def's `P`/thunk at all. This is what lets `prepare`/`run`
+/// stay the single, unforked implementation of the cache-hit/single-flight-
+/// join/run algorithm for both paths — see Stage 9 in
+/// `docs/persistence-benchmark-notes.md`.
+///
+/// `Sync` (not just `Send + Sync` on the concrete types, which both already
+/// are) is required directly on the trait because `prepare`/`run` hold a
+/// `&D` across an `.await` point (`run` calls `def.write_value` after
+/// awaiting the shared execution future), so the containing future can only
+/// be `Send` if that reference is.
+pub(crate) trait ValueColumn<R>: Sync {
+    fn read_value(&self, row: u32) -> Option<R>;
+    fn write_value(&self, row: u32, value: R);
+}
+
+impl<P: Send + Sync, R: Clone + Send + Sync> ValueColumn<R> for CompDef<P, R> {
+    fn read_value(&self, row: u32) -> Option<R> {
+        CompDef::read_value(self, row)
+    }
+
+    fn write_value(&self, row: u32, value: R) {
+        CompDef::write_value(self, row, value);
     }
 }
 
@@ -170,6 +219,39 @@ pub(crate) trait ErasedDef: Send + Sync {
     /// engine itself serialized when the node was created, but handled the
     /// same defensive way as every other decode failure in this trait).
     fn rerun(&self, engine: Arc<EngineInner>, param_bytes: &[u8]) -> Option<BoxFuture<'static, Result<(), CompError>>>;
+
+    /// The flow-argument counterpart of [`Self::revive_key`] (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`): recomputes a record's
+    /// `CompKey` from its ordered [`FlowId`]s *and* its param bytes, since a
+    /// flow-argument node's identity depends on both (see
+    /// `crate::flow::flow_aware_param_hash`).
+    ///
+    /// Defaults to `None` — every builder-path definition (the only kind
+    /// before Stage 9) is flow-less by construction, so
+    /// `crate::persist::restore_nodes` only ever needs this default's "not
+    /// applicable" signal to fall back to [`Self::revive_key`] instead. Only
+    /// `crate::flow::FlowDefAdapter` overrides it.
+    fn revive_key_flows(&self, _flows: &[FlowId], _param_bytes: &[u8]) -> Option<CompKey> {
+        None
+    }
+
+    /// The flow-argument counterpart of [`Self::rerun`]: re-runs a
+    /// flow-argument definition's node via `crate::engine::EngineInner`'s
+    /// flow-aware eval path, resolving `flows` from the registry through a
+    /// `crate::flow::FlowResolver` rather than through any captured handle.
+    ///
+    /// Defaults to `None` for the same reason as [`Self::revive_key_flows`]:
+    /// `crate::engine::EngineInner::rerun_node` tries [`Self::rerun`] first
+    /// and only falls back to this when that returns `None`, so an ordinary
+    /// builder-path definition never needs to override it.
+    fn rerun_flows(
+        &self,
+        _engine: Arc<EngineInner>,
+        _flows: &[FlowId],
+        _param_bytes: &[u8],
+    ) -> Option<BoxFuture<'static, Result<(), CompError>>> {
+        None
+    }
 }
 
 /// Adapts a concrete `CompDef<P, R>` to the erased [`ErasedDef`] interface.

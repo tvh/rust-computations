@@ -36,6 +36,7 @@ use tracing::Instrument;
 use crate::def::Comp;
 use crate::engine::{DirtyPriority, Engine, EngineInner, NodeRef, NodeState};
 use crate::error::CompError;
+use crate::flow::FlowId;
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId};
@@ -81,6 +82,38 @@ impl Engine {
         self.eval_root(&comp, param).await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
+        self.startup_gc_then_loop().await
+    }
+
+    /// The flow-argument counterpart of [`Self::run`] (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`): the same initial-evaluation /
+    /// startup-GC / infinite-propagation-loop shape, except the initial
+    /// evaluation goes through [`Self::eval_root_flows`] (by name plus
+    /// [`crate::flow::FlowId`]s) instead of a registration-backed
+    /// [`Comp<P, R>`] handle — everything past that first call
+    /// (`startup_gc`, `propagate`, `liveness_gc`, `rerun_node`) was already
+    /// flow-agnostic, since it only ever works from `CompKey`s and rows, not
+    /// from any `Comp<P, R>` handle.
+    pub async fn run_flows<P: CompParam, R: CompResult>(
+        &self,
+        name: &'static str,
+        flows: &[crate::flow::FlowId],
+        param: P,
+    ) -> Result<(), CompError> {
+        let start = Instant::now();
+        self.inner.persist_load().await;
+
+        self.eval_root_flows::<P, R>(name, flows, param).await?;
+        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
+
+        self.startup_gc_then_loop().await
+    }
+
+    /// The startup GC pass plus the infinite propagation loop shared by
+    /// [`Self::run`] and [`Self::run_flows`] — everything after "the initial
+    /// evaluation has already happened", which is the one step that differs
+    /// between a builder-path and a flow-argument root call.
+    async fn startup_gc_then_loop(&self) -> Result<(), CompError> {
         let startup_outputs_deleted = self.inner.startup_gc().await;
         if startup_outputs_deleted > 0 {
             tracing::info!(outputs_deleted = startup_outputs_deleted, "startup GC complete");
@@ -557,26 +590,32 @@ impl EngineInner {
     ) -> (usize, CompKeySet) {
         let dirty_count = batch.len();
 
-        let jobs: Vec<(CompKey, Vec<u8>)> = {
+        // `flow_ids` is empty for every ordinary builder-path node (Stage 9
+        // — see `docs/persistence-benchmark-notes.md`) and non-empty only
+        // for a flow-argument node; `rerun_node` itself decides which of
+        // `ErasedDef::rerun`/`rerun_flows` actually applies, so this driver
+        // code stays uniform across both kinds.
+        let jobs: Vec<(CompKey, Vec<u8>, Vec<FlowId>)> = {
             let mut nodes = self.nodes.lock().unwrap();
             batch
                 .iter()
                 .filter_map(|key| {
                     let r = nodes.id_of(key)?;
                     nodes.set_state(r, NodeState::Dirty);
-                    Some((key.clone(), nodes.param_bytes(r).to_vec()))
+                    Some((key.clone(), nodes.param_bytes(r).to_vec(), nodes.flow_ids_clone(r)))
                 })
                 .collect()
         };
 
-        let results = join_all(jobs.iter().map(|(key, param_bytes)| self.rerun_node(key, param_bytes))).await;
+        let results =
+            join_all(jobs.iter().map(|(key, param_bytes, flow_ids)| self.rerun_node(key, flow_ids, param_bytes))).await;
 
         let mut next_frontier = CompKeySet::default();
         let mut reran = 0usize;
         let mut cutoffs = 0usize;
         {
             let nodes = self.nodes.lock().unwrap();
-            for ((key, _), result) in jobs.iter().zip(results.iter()) {
+            for ((key, _, _), result) in jobs.iter().zip(results.iter()) {
                 match result {
                     Ok(()) => {
                         reran += 1;

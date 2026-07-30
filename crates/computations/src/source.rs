@@ -47,6 +47,26 @@ impl fmt::Display for SourceId {
     }
 }
 
+// Hand-written rather than `#[derive(Serialize, Deserialize)]` on the
+// wrapped `Arc<str>`: deriving through `Arc` needs serde's `rc` feature
+// (not enabled in this workspace, see `Cargo.toml`), and a plain string
+// round-trip is all a `SourceId` ever needs. Added so `crate::flow::FlowId`
+// (which embeds a `SourceId`) can itself be `Serialize`/`Deserialize` and
+// therefore feed directly into a flow-argument computation's identity hash
+// and its persisted `NodeRecord`, with no separate `*Repr` stand-in type
+// (unlike `crate::persist::RawDepRepr`, written before this impl existed).
+impl serde::Serialize for SourceId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SourceId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|s| SourceId::new(&s))
+    }
+}
+
 /// The untyped operations every source supports, independent of any
 /// particular [`Request`] type it can execute.
 pub trait SourceBase: Send + Sync + 'static {

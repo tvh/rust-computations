@@ -73,6 +73,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::def::ErasedDef;
 use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable};
+use crate::flow::FlowId;
 use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
@@ -85,7 +86,13 @@ use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
 /// [`Fingerprint`], which is about the *code that produced the values*, not
 /// the *encoding of the store*: a format bump always wipes, a fingerprint
 /// mismatch only ever revalidates in the background.
-const FORMAT_VERSION: u8 = 2;
+///
+/// Bumped 2 -> 3 for Stage 9 (see `docs/persistence-benchmark-notes.md`):
+/// [`NodeRecord`] gained `flow_ids`, so an older v2 database's records don't
+/// have that field at all — rather than guess a default for every existing
+/// row, the mismatch path above wipes and recomputes cold, exactly as it
+/// already does for any other encoding change.
+const FORMAT_VERSION: u8 = 3;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
@@ -403,6 +410,15 @@ struct NodeRecord {
     result_hash: [u8; 16],
     value_bytes: Vec<u8>,
     outputs: Vec<RawOutputRepr>,
+    /// This node's ordered flow ids (Stage 9, format v3 — see
+    /// `docs/persistence-benchmark-notes.md`), empty for an ordinary
+    /// builder-path node. Stored directly as `Vec<FlowId>` rather than
+    /// through a `*Repr` stand-in type (contrast `RawDepRepr`/
+    /// `RawOutputRepr`, both written before `SourceId`/`SinkId` gained
+    /// hand-written `Serialize`/`Deserialize` impls): `FlowId` embeds those
+    /// ids directly and is itself postcard-friendly now, so no adapter is
+    /// needed here.
+    flow_ids: Vec<FlowId>,
 }
 
 /// The in-memory, not-yet-written counterpart of [`NodeRecord`]: everything
@@ -424,6 +440,8 @@ struct PendingRecord {
     result_hash: [u8; 16],
     value: Arc<dyn Any + Send + Sync>,
     outputs: Vec<RawOutputRepr>,
+    /// See [`NodeRecord::flow_ids`].
+    flow_ids: Vec<FlowId>,
 }
 
 impl PendingRecord {
@@ -455,6 +473,7 @@ impl PendingRecord {
             result_hash: result_hash.as_bytes(),
             value,
             outputs: nodes.outputs_iter(r).map(RawOutputRepr::from_output).collect(),
+            flow_ids: nodes.flow_ids_clone(r),
         }
     }
 }
@@ -674,6 +693,7 @@ impl PersistHandle {
                         result_hash: pending.result_hash,
                         value_bytes,
                         outputs: pending.outputs.clone(),
+                        flow_ids: pending.flow_ids.clone(),
                     };
                     let bytes = postcard::to_stdvec(&record)
                         .expect("postcard serialization of a well-formed value should not fail");
@@ -989,6 +1009,7 @@ impl EngineInner {
             comp_dep_keys: Vec<CompKey>,
             source_deps: HashSet<RawDep>,
             outputs: HashSet<RawOutput>,
+            flow_ids: Vec<FlowId>,
         }
 
         let mut pending: Vec<PendingNode> = Vec::with_capacity(records.len());
@@ -1004,7 +1025,19 @@ impl EngineInner {
             let Some(erased_def) = self.erased_defs.get(&def_id) else {
                 continue;
             };
-            let Some(key) = erased_def.revive_key(&record.param_bytes) else {
+            // Try the flow-less revival first (the ordinary builder-path
+            // case), falling back to the flow-aware one only when that
+            // reports "not applicable" (`None` -- always the case for a
+            // flow-argument def, whose `param_bytes` alone can't
+            // reconstruct its identity; see `crate::def::ErasedDef::revive_key`'s
+            // docs). Mirrors `EngineInner::rerun_node`'s identical
+            // try-`rerun`-then-`rerun_flows` ordering, for the same reason:
+            // neither side has to know in advance which kind of def a
+            // record names.
+            let key = erased_def
+                .revive_key(&record.param_bytes)
+                .or_else(|| erased_def.revive_key_flows(&record.flow_ids, &record.param_bytes));
+            let Some(key) = key else {
                 tracing::debug!(def = %record.def_name, "persistence: dropping a record whose param bytes failed to decode");
                 continue;
             };
@@ -1050,6 +1083,7 @@ impl EngineInner {
                 comp_dep_keys,
                 source_deps,
                 outputs,
+                flow_ids: record.flow_ids,
             });
         }
 
@@ -1080,6 +1114,7 @@ impl EngineInner {
             nodes.set_result(r, p.result_hash);
             nodes.extend_source_deps(r, &p.source_deps);
             nodes.extend_outputs(r, &p.outputs);
+            nodes.set_flow_ids(r, p.flow_ids);
             edge_work.push((r, p.comp_dep_keys));
         }
         let restored_count = edge_work.len();
@@ -1420,6 +1455,40 @@ mod tests {
         assert_ne!(Fingerprint::custom("a"), Fingerprint::custom("b"));
     }
 
+    /// Stage 9 bumped `FORMAT_VERSION` 2 -> 3 (for `NodeRecord::flow_ids`,
+    /// see `docs/persistence-benchmark-notes.md`): an older database's meta
+    /// row still claims the old version, and must hit the existing
+    /// "unreadable/unrecognized format" path -- wiped and reopened fresh,
+    /// never panicking, never trusting a v2 record's absent `flow_ids` as
+    /// if it decoded to an empty `Vec`.
+    #[test]
+    fn old_format_version_is_wiped_and_starts_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.redb");
+
+        // A meta row alone is enough: `open_and_read` rejects on the
+        // version check before ever opening `NODES_TABLE`.
+        {
+            let db = Database::create(&db_path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut meta_table = write_txn.open_table(META_TABLE).unwrap();
+                let meta = MetaRecord {
+                    format_version: FORMAT_VERSION - 1,
+                    fingerprint: [0; 32],
+                };
+                let meta_bytes = postcard::to_stdvec(&meta).unwrap();
+                meta_table.insert(META_KEY, meta_bytes.as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let (db, fingerprint, records) = open_db(&db_path);
+        assert!(db.is_some(), "an unrecognized format must still yield a usable (freshly wiped) database");
+        assert_eq!(fingerprint, None, "a freshly wiped database has no stored fingerprint yet");
+        assert!(records.is_empty(), "a freshly wiped database has no restorable records");
+    }
+
     /// Writes a single raw `nodes` table row directly (bypassing
     /// [`PersistHandle`] entirely) under `key_bytes`, plus a matching meta
     /// row — the low-level tool the key-verification test below uses to
@@ -1487,6 +1556,7 @@ mod tests {
             // value, not just through the run counter.
             value_bytes: postcard::to_stdvec(&5i32).unwrap(),
             outputs: Vec::new(),
+            flow_ids: Vec::new(),
         };
         write_raw_record(&db_path, fingerprint, &wrong_key_bytes, &record);
 

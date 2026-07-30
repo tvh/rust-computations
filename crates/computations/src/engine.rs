@@ -40,9 +40,11 @@ use tracing::Instrument;
 
 use crate::ctx::Ctx;
 use crate::def::{
-    Comp, CompDef, DefAdapter, ErasedDef, define_comp, define_comp_rec, define_comp_rec_with, define_comp_with,
+    BodyFn, Comp, CompDef, DefAdapter, ErasedDef, ValueColumn, define_comp, define_comp_rec, define_comp_rec_with,
+    define_comp_with,
 };
 use crate::error::CompError;
+use crate::flow::{FlowCompDef, FlowDefAdapter, FlowId, FlowResolver, FlowThunk, flow_aware_param_hash};
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult, DefId, Hash128, Hash128Map};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
@@ -426,7 +428,7 @@ impl DefTable {
 /// `source_deps`/`outputs`/`inflight` stay exactly as they were in Tier 1:
 /// sparse side maps, now keyed by [`NodeRef`] instead of `NodeId`, with an
 /// entry only for a node that actually has one. [`Self::remove_by_id`]
-/// purges all three whenever a node is collected, so a GC'd node never
+/// purges all four whenever a node is collected, so a GC'd node never
 /// leaves an orphaned side-table entry behind.
 pub(crate) struct NodeTable {
     /// Indexed by [`DefIndex`].
@@ -439,6 +441,19 @@ pub(crate) struct NodeTable {
     source_deps: HashMap<NodeRef, HashSet<RawDep>>,
     outputs: HashMap<NodeRef, HashSet<RawOutput>>,
     inflight: HashMap<NodeRef, SharedExec>,
+    /// A flow-argument node's ordered [`FlowId`]s (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`), sparse like the three side
+    /// maps above: absent (not merely empty) for every ordinary
+    /// builder-path node, which never has any. Needed at three points a
+    /// flow-argument node's identity alone can't supply: rerunning it
+    /// (`crate::engine::EngineInner::rerun_node` resolves flows fresh from
+    /// the registry on every rerun, never from a stored closure — see
+    /// [`crate::flow`]'s module docs), persisting it
+    /// (`crate::persist::PendingRecord::snapshot` copies this into the
+    /// on-disk `NodeRecord`), and reviving it after a restart
+    /// (`crate::persist::EngineInner::restore_nodes` writes the persisted
+    /// list straight back in via [`Self::set_flow_ids`]).
+    flow_ids: HashMap<NodeRef, Vec<FlowId>>,
 }
 
 impl NodeTable {
@@ -457,6 +472,7 @@ impl NodeTable {
             source_deps: HashMap::new(),
             outputs: HashMap::new(),
             inflight: HashMap::new(),
+            flow_ids: HashMap::new(),
         }
     }
 
@@ -609,13 +625,31 @@ impl NodeTable {
     }
 
     /// Frees `r`'s row (see [`DefTable::remove`]) and purges every sparse
-    /// side-table entry (`source_deps`/`outputs`/`inflight`) for it, so a
-    /// collected node never leaves one behind.
+    /// side-table entry (`source_deps`/`outputs`/`inflight`/`flow_ids`) for
+    /// it, so a collected node never leaves one behind.
     pub(crate) fn remove_by_id(&mut self, r: NodeRef) {
         self.dt_mut(r.def).remove(r.row);
         self.source_deps.remove(&r);
         self.outputs.remove(&r);
         self.inflight.remove(&r);
+        self.flow_ids.remove(&r);
+    }
+
+    /// Records `r`'s ordered flow ids (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`). A no-op for an empty `flows`,
+    /// so an ordinary builder-path node never gets an entry at all — see
+    /// this table's `flow_ids` field docs on why this stays sparse.
+    pub(crate) fn set_flow_ids(&mut self, r: NodeRef, flows: Vec<FlowId>) {
+        if flows.is_empty() {
+            return;
+        }
+        self.flow_ids.insert(r, flows);
+    }
+
+    /// `r`'s recorded flow ids, empty if it has none (the ordinary
+    /// builder-path case).
+    pub(crate) fn flow_ids_clone(&self, r: NodeRef) -> Vec<FlowId> {
+        self.flow_ids.get(&r).cloned().unwrap_or_default()
     }
 
     /// Every currently-live (non-freed) row, across every definition.
@@ -851,23 +885,40 @@ impl EngineInner {
     /// future rather than being reported synchronously, so every caller
     /// (in practice, only [`crate::driver`]'s wave propagation, joining many
     /// of these concurrently via `join_all`) can treat every job uniformly.
-    pub(crate) fn rerun_node(self: &Arc<Self>, key: &CompKey, param_bytes: &[u8]) -> BoxFuture<'static, Result<(), CompError>> {
+    ///
+    /// `flow_ids` is `r`'s recorded flow list (empty for an ordinary
+    /// builder-path node — Stage 9, see
+    /// `docs/persistence-benchmark-notes.md`). [`crate::def::ErasedDef::rerun`]
+    /// is tried first; only when that reports "not applicable" (`None` —
+    /// always the case for a flow-argument def, whose `param_bytes` alone
+    /// can't reconstruct its identity, never for a builder-path def with
+    /// well-formed `param_bytes`) does this fall back to
+    /// [`crate::def::ErasedDef::rerun_flows`]. This ordering means a caller
+    /// never has to know in advance which kind of def `key` names — it just
+    /// always passes whatever flow list it has on hand, empty or not.
+    pub(crate) fn rerun_node(
+        self: &Arc<Self>,
+        key: &CompKey,
+        flow_ids: &[FlowId],
+        param_bytes: &[u8],
+    ) -> BoxFuture<'static, Result<(), CompError>> {
         let Some(erased_def) = self.erased_defs.get(key.def()) else {
             let key = key.clone();
             return Box::pin(async move { Err(CompError::Failed(format!("no computation registered named `{}`", key.def()))) });
         };
-        match erased_def.rerun(self.clone(), param_bytes) {
-            Some(fut) => fut,
-            None => {
-                let key = key.clone();
-                Box::pin(async move {
-                    Err(CompError::Failed(format!(
-                        "computation `{}`: param bytes failed to decode during rerun",
-                        key.def()
-                    )))
-                })
-            }
+        if let Some(fut) = erased_def.rerun(self.clone(), param_bytes) {
+            return fut;
         }
+        if let Some(fut) = erased_def.rerun_flows(self.clone(), flow_ids, param_bytes) {
+            return fut;
+        }
+        let key = key.clone();
+        Box::pin(async move {
+            Err(CompError::Failed(format!(
+                "computation `{}`: param bytes failed to decode during rerun",
+                key.def()
+            )))
+        })
     }
 
     /// Decides whether `key` is a cache hit, an in-flight join, or needs a
@@ -876,11 +927,16 @@ impl EngineInner {
     /// marks it `Running`, so the caller must actually run the computation
     /// after this returns.
     ///
-    /// Takes `def` (already resolved by [`Self::eval`]) so a cache hit can
-    /// clone the typed result straight out of `def`'s value column (see
-    /// [`crate::def::CompDef::read_value`]) rather than downcasting an
-    /// erased `Arc<dyn Any>` — the Tier-2 fast path [`Action`]'s docs
-    /// describe.
+    /// Takes `def` (already resolved by [`Self::eval`]/[`Self::eval_flows`])
+    /// so a cache hit can clone the typed result straight out of `def`'s
+    /// value column (see [`crate::def::ValueColumn::read_value`]) rather
+    /// than downcasting an erased `Arc<dyn Any>` — the Tier-2 fast path
+    /// [`Action`]'s docs describe. Generic over `D:
+    /// `[`ValueColumn`]`<R>` rather than a concrete `Arc<CompDef<P, R>>`
+    /// (Stage 9 — see `docs/persistence-benchmark-notes.md`) precisely so
+    /// this one implementation serves both the builder path
+    /// (`D = CompDef<P, R>`) and the flow-argument path
+    /// (`D = crate::flow::FlowCompDef<R>`) without forking it.
     ///
     /// Also takes `param_bytes` — [`Self::eval`]'s own postcard encoding of
     /// the parameter, computed once, before this call, entirely outside the
@@ -894,9 +950,9 @@ impl EngineInner {
     /// hazard this closes: a panic while `self.nodes` is locked poisons the
     /// `std::sync::Mutex` for the rest of the process, taking down every
     /// concurrent computation, not just the offending one.
-    fn prepare<P: CompParam, R: CompResult>(
+    fn prepare<P: CompParam, R: CompResult, D: ValueColumn<R> + ?Sized>(
         self: &Arc<Self>,
-        def: &Arc<CompDef<P, R>>,
+        def: &D,
         key: &CompKey,
         param_bytes: &[u8],
     ) -> Result<Action<R>, CompError> {
@@ -957,14 +1013,33 @@ impl EngineInner {
     }
 
     /// Actually runs the computation for `key`/`node_ref`, building its
-    /// child `Ctx`, awaiting the body, updating the node on success or
+    /// child `Ctx`, awaiting `body`, updating the node on success or
     /// failure, and reconciling `source_index` / dropped sink outputs.
-    /// `def` is already resolved (by [`Self::eval`]), unlike Tier 1 where
-    /// this method did its own `get_def` lookup — see [`Self::prepare`]'s
-    /// docs for why `def` now needs to be in hand earlier.
-    async fn run<P: CompParam, R: CompResult>(
+    /// `def` is already resolved (by [`Self::eval`]/[`Self::eval_flows`]),
+    /// unlike Tier 1 where this method did its own `get_def` lookup — see
+    /// [`Self::prepare`]'s docs for why `def` now needs to be in hand
+    /// earlier.
+    ///
+    /// `body` is taken as an explicit [`BodyFn`] rather than read off `def`
+    /// (Stage 9 — see `docs/persistence-benchmark-notes.md`): the builder
+    /// path's caller passes `def.body.clone()`, exactly as this method used
+    /// to read internally, while the flow-argument path's caller builds a
+    /// one-off `BodyFn` that resolves flows via a `crate::flow::FlowResolver`
+    /// and calls the registered `crate::flow::FlowThunk` — letting `def`
+    /// itself stay generic over just [`ValueColumn`]`<R>` (needed only for
+    /// [`Self::prepare`]'s cache-hit read and this method's post-execution
+    /// write) with no `body`/`thunk` field in common between the two def
+    /// kinds at all.
+    // `body` is the one parameter Stage 9 added on top of Tier 2's already
+    // seven (see the doc comment above for why it can't just be read off
+    // `def` anymore); splitting the rest into a struct purely to dodge this
+    // lint would cost more clarity at each of `run`'s two call sites than it
+    // would buy here.
+    #[allow(clippy::too_many_arguments)]
+    async fn run<P: CompParam, R: CompResult, D: ValueColumn<R> + ?Sized>(
         self: &Arc<Self>,
-        def: &Arc<CompDef<P, R>>,
+        def: &D,
+        body: BodyFn<P, R>,
         key: &CompKey,
         node_ref: NodeRef,
         param: P,
@@ -993,7 +1068,6 @@ impl EngineInner {
         // pays neither the clone nor the eventual `format!`.
         let param_for_trace = if tracing::enabled!(tracing::Level::DEBUG) { Some(param.clone()) } else { None };
 
-        let body = def.body.clone();
         // Cloned in for the error message below only: `key` itself isn't
         // moved into the future (`ctx`/`param` are), and this is cheap (a
         // `DefId` is a `&'static str`, `Hash128` is 16 bytes).
@@ -1217,7 +1291,7 @@ impl EngineInner {
                 }
             };
 
-            let action = match self.prepare::<P, R>(&def, &key, &param_bytes) {
+            let action = match self.prepare::<P, R, CompDef<P, R>>(def.as_ref(), &key, &param_bytes) {
                 Ok(action) => action,
                 Err(e) => {
                     tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
@@ -1240,7 +1314,168 @@ impl EngineInner {
                         return Err(e);
                     }
                 },
-                Action::Run(node_ref, snapshot) => self.run::<P, R>(&def, &key, node_ref, param, chain, snapshot).await?,
+                Action::Run(node_ref, snapshot) => {
+                    let body = def.body.clone();
+                    self.run::<P, R, CompDef<P, R>>(def.as_ref(), body, &key, node_ref, param, chain, snapshot).await?
+                }
+            };
+
+            Ok((value, key))
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Looks up `id`'s registered flow-argument definition (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`), downcast to the caller's
+    /// concrete `R`. The flow-argument counterpart of [`Self::get_def`]: it
+    /// shares that method's `defs` table (a flow-argument def and a
+    /// builder-path def can never collide on the same name — whichever
+    /// registers first wins the map slot, and the other panics at
+    /// registration time, exactly as two builder-path defs sharing a name
+    /// already do) but needs only `R`, never `P` — see
+    /// [`crate::flow::FlowCompDef`]'s docs for why a flow-argument def's
+    /// parameter type is never named at the engine level at all.
+    fn get_flow_def<R: CompResult>(&self, id: &DefId) -> Result<Arc<FlowCompDef<R>>, CompError> {
+        let any = {
+            let defs = self.defs.lock().unwrap();
+            defs.get(id).cloned()
+        };
+        let any = any.ok_or_else(|| CompError::Failed(format!("no flow computation registered named `{id}`")))?;
+        any.downcast::<FlowCompDef<R>>().map_err(|_| {
+            CompError::Failed(format!(
+                "flow computation `{id}` was registered with a different result type than this call expects"
+            ))
+        })
+    }
+
+    /// The flow-argument counterpart of [`Self::eval`] (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`'s design rationale): looks up
+    /// `name`'s registered flow definition, builds the flow-aware
+    /// [`CompKey`] (via [`flow_aware_param_hash`], which folds `flows`' ids
+    /// into the identity — see [`crate::flow`]'s module docs for why that's
+    /// a correctness requirement, not an optimization), then runs through
+    /// the exact same [`Self::prepare`]/[`Self::run`] cache-hit/
+    /// single-flight-join/run algorithm [`Self::eval`] uses — never a
+    /// forked copy of it. The public entry point for this is
+    /// [`crate::ctx::Ctx::eval_flows`]; this method is also, in a sense,
+    /// this crate's own hand-written stand-in for what a future
+    /// `#[computation]` macro would generate a call to.
+    pub(crate) async fn eval_flows<P: CompParam, R: CompResult>(
+        self: &Arc<Self>,
+        name: &'static str,
+        flows: &[FlowId],
+        param: P,
+        chain: Arc<Vec<CompKey>>,
+    ) -> Result<(R, CompKey), CompError> {
+        let def_id = DefId::new(name);
+        let param_bytes = match postcard::to_stdvec(&param) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(CompError::Failed(format!("computation `{def_id}`: parameter failed to serialize: {e}")));
+            }
+        };
+        let flow_def = self.get_flow_def::<R>(&def_id)?;
+        self.eval_flows_core::<P, R>(def_id, flow_def, flows, param, param_bytes, chain).await
+    }
+
+    /// The erased rerun/revival entry point for a flow-argument node
+    /// (Stage 9): unlike [`Self::eval_flows`], this has no compile-time `P`
+    /// at all — only `param_bytes`, exactly what
+    /// [`crate::persist::EngineInner::restore_nodes`]/
+    /// [`Self::rerun_node`] have on hand for a node that has no live
+    /// handle. It runs the identical [`Self::eval_flows_core`] machinery
+    /// instantiated at `P = ()`; this is sound (not a hack) precisely
+    /// because a flow-argument def's engine-visible identity and execution
+    /// never depend on `P` in the first place — [`crate::flow::FlowThunk`]
+    /// decodes `param_bytes` itself, and [`Self::prepare`]'s debug-only
+    /// param-determinism check (the only place `P` is actually used at
+    /// runtime) only ever fires for a node this engine has never seen
+    /// before, which a rerun/revival can't be by construction (the node
+    /// already exists — that's why it's being rerun). The one visible cost
+    /// is diagnostic, not correctness: a flow-argument node's rerun trace
+    /// event renders its `param` field as `()` rather than the real typed
+    /// value, since that value was never reconstructed here at all.
+    pub(crate) async fn eval_flows_erased<R: CompResult>(
+        self: &Arc<Self>,
+        flow_def: Arc<FlowCompDef<R>>,
+        flows: &[FlowId],
+        param_bytes: Vec<u8>,
+        chain: Arc<Vec<CompKey>>,
+    ) -> Result<(), CompError> {
+        let def_id = flow_def.id;
+        self.eval_flows_core::<(), R>(def_id, flow_def, flows, (), param_bytes, chain).await.map(|_| ())
+    }
+
+    /// The shared implementation behind [`Self::eval_flows`]/
+    /// [`Self::eval_flows_erased`] — the flow-argument analogue of
+    /// [`Self::eval`] itself. `param_bytes` is taken as an explicit,
+    /// already-encoded argument (rather than re-derived from `param`,
+    /// unlike `eval`) so [`Self::eval_flows_erased`] can supply the real,
+    /// original bytes even though it has no real typed `param` to encode.
+    async fn eval_flows_core<P: CompParam, R: CompResult>(
+        self: &Arc<Self>,
+        def_id: DefId,
+        flow_def: Arc<FlowCompDef<R>>,
+        flows: &[FlowId],
+        param: P,
+        param_bytes: Vec<u8>,
+        chain: Arc<Vec<CompKey>>,
+    ) -> Result<(R, CompKey), CompError> {
+        let param_hash = flow_aware_param_hash(flows, &param_bytes);
+        let key = CompKey::from_parts(def_id, param_hash);
+        let span = tracing::debug_span!(
+            "comp.eval",
+            comp = %def_id.name(),
+            param_hash = %key.param_hash().short_hex()
+        );
+
+        async move {
+            if chain.contains(&key) {
+                let e = CompError::Cycle(render_chain(&chain, &key));
+                tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                return Err(e);
+            }
+
+            let action = match self.prepare::<P, R, FlowCompDef<R>>(flow_def.as_ref(), &key, &param_bytes) {
+                Ok(action) => action,
+                Err(e) => {
+                    tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                    return Err(e);
+                }
+            };
+
+            let value = match action {
+                Action::CacheHit(v) => {
+                    tracing::debug!(outcome = "cache_hit", "comp.eval finished");
+                    v
+                }
+                Action::Join(shared) => match shared.await {
+                    Ok((v, _hash, _elapsed)) => {
+                        tracing::debug!(outcome = "dedup_join", "comp.eval finished");
+                        downcast_value::<R>(v, &key)?
+                    }
+                    Err(e) => {
+                        tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
+                        return Err(e);
+                    }
+                },
+                Action::Run(node_ref, snapshot) => {
+                    // Recorded once, right here, rather than inside
+                    // `prepare` (which stays entirely flow-agnostic): a
+                    // fresh node's flows never change across its lifetime
+                    // (a different flow set hashes to a different `CompKey`
+                    // entirely -- see `flow_aware_param_hash`), so setting
+                    // this unconditionally on every `Run` is a cheap,
+                    // idempotent no-op after the first time.
+                    {
+                        let mut nodes = self.nodes.lock().unwrap();
+                        nodes.set_flow_ids(node_ref, flows.to_vec());
+                    }
+                    let body = build_flow_body::<P, R>(flow_def.thunk, flows, param_bytes, key.clone());
+                    self.run::<P, R, FlowCompDef<R>>(flow_def.as_ref(), body, &key, node_ref, param, chain, snapshot)
+                        .await?
+                }
             };
 
             Ok((value, key))
@@ -1305,6 +1540,37 @@ fn downcast_value<R: CompResult>(v: Arc<dyn Any + Send + Sync>, key: &CompKey) -
     })
 }
 
+/// Builds a one-off [`BodyFn`] that wraps a flow-argument definition's
+/// [`FlowThunk`] for exactly one call to [`EngineInner::run`] (Stage 9 — see
+/// `docs/persistence-benchmark-notes.md`). This is what lets `run` stay
+/// completely unaware of flows: from its point of view this is just an
+/// ordinary `BodyFn<P, R>`, identical in shape to what the builder path
+/// passes (`def.body.clone()`), except it ignores the `_param: P` argument
+/// `run` hands it (already folded into `param_bytes`, captured below) and
+/// instead resolves `thunk`'s flows fresh, from the registry, on every call
+/// — never from a stored handle. `flows`/`param_bytes` are cloned once per
+/// `Run` (never per cache hit or single-flight join, since only
+/// [`EngineInner::eval_flows_core`]'s `Action::Run` arm ever calls this).
+fn build_flow_body<P: CompParam, R: CompResult>(
+    thunk: FlowThunk,
+    flows: &[FlowId],
+    param_bytes: Vec<u8>,
+    key: CompKey,
+) -> BodyFn<P, R> {
+    let flows: Arc<[FlowId]> = Arc::from(flows.to_vec());
+    Arc::new(move |ctx: Ctx, _param: P| {
+        let flows = flows.clone();
+        let param_bytes = param_bytes.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let engine = ctx.engine.clone();
+            let resolver = FlowResolver::new(&engine.registry, &flows);
+            let value_any = (thunk)(ctx, resolver, &param_bytes).await?;
+            downcast_value::<R>(value_any, &key)
+        })
+    })
+}
+
 /// Renders the ancestor chain plus the repeated key as `a#hash -> b#hash ->
 /// a#hash`, for a readable `CompError::Cycle` message.
 fn render_chain(chain: &[CompKey], repeated: &CompKey) -> String {
@@ -1358,6 +1624,28 @@ impl Engine {
         };
         ctx.eval(*comp, param).await
     }
+
+    /// The flow-argument counterpart of [`Self::eval_root`] (Stage 9 — see
+    /// `docs/persistence-benchmark-notes.md`): evaluates the flow-argument
+    /// computation named `name`, applied to `flows`/`param`, as a root
+    /// application — what a macro-generated top-level call (outside any
+    /// other computation) would use, and what this crate's own hand-written
+    /// flow tests use directly. See [`crate::ctx::Ctx::eval_flows`] for the
+    /// nested-call counterpart (a computation calling another
+    /// flow-argument computation).
+    pub async fn eval_root_flows<P: CompParam, R: CompResult>(
+        &self,
+        name: &'static str,
+        flows: &[FlowId],
+        param: P,
+    ) -> Result<R, CompError> {
+        let ctx = Ctx {
+            engine: self.inner.clone(),
+            caller: None,
+            chain: Arc::new(Vec::new()),
+        };
+        ctx.eval_flows(name, flows, param).await
+    }
 }
 
 // `pub(crate)`, not `pub`, because its only caller is this module's own
@@ -1407,6 +1695,43 @@ impl EngineBuilder {
         self.def_names.insert(id.name().to_string(), id);
         self.def_order.push(id);
         Comp::from_def_id(id)
+    }
+
+    /// Registers a flow-argument computation named `name`, whose body is
+    /// `thunk` (Stage 9 — see `docs/persistence-benchmark-notes.md`'s design
+    /// rationale in full, and [`crate::flow`]'s module docs for what this
+    /// makes possible: a computation taking source/sink arguments directly,
+    /// with no builder-captured closure).
+    ///
+    /// Unlike [`Self::register`]/[`Self::define`], this returns no handle:
+    /// a flow-argument computation is called by name, through
+    /// [`crate::ctx::Ctx::eval_flows`]/[`crate::engine::Engine::eval_root_flows`],
+    /// not through a `Comp<P, R>` — there is no single `P` to attach to a
+    /// handle in the first place (see [`crate::flow::FlowCompDef`]'s docs).
+    /// This is also deliberately explicit, plain-value registration data
+    /// rather than anything closure-shaped: Phase B's `#[computation]` macro
+    /// is expected to collect `(name, thunk)` pairs via `inventory::submit!`
+    /// and call this once per collected pair, so keeping `thunk` a bare
+    /// [`FlowThunk`] `fn` pointer here is what makes that later step
+    /// possible at all.
+    ///
+    /// `R` must be given explicitly at the call site (e.g.
+    /// `builder.define_flows::<Result<(), CompError>>(name, thunk)`) since
+    /// nothing else here can infer it.
+    ///
+    /// # Panics
+    /// Panics if a computation (flow-argument or builder-path alike) with
+    /// the same name is already registered — this is a startup
+    /// configuration error, not a runtime condition (see [`Self::register`]).
+    pub fn define_flows<R: CompResult>(&mut self, name: &'static str, thunk: FlowThunk) -> &mut Self {
+        let id = DefId::new(name);
+        let def = Arc::new(FlowCompDef::<R>::new(id, thunk));
+        let prev = self.defs.insert(id, def.clone() as Arc<dyn Any + Send + Sync>);
+        assert!(prev.is_none(), "duplicate computation name: {id}");
+        self.erased_defs.insert(id, Arc::new(FlowDefAdapter(def)) as Arc<dyn ErasedDef>);
+        self.def_names.insert(id.name().to_string(), id);
+        self.def_order.push(id);
+        self
     }
 
     /// Defines and registers a computation named `name` in one step.

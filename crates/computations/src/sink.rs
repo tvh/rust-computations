@@ -33,6 +33,20 @@ impl fmt::Display for SinkId {
     }
 }
 
+// See `SourceId`'s identical hand-written impls for why this exists and why
+// it's hand-written rather than derived through the wrapped `Arc<str>`.
+impl serde::Serialize for SinkId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SinkId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|s| SinkId::new(&s))
+    }
+}
+
 /// The untyped operations every sink supports, independent of any particular
 /// [`Request`] type it can execute.
 pub trait SinkBase: Send + Sync + 'static {

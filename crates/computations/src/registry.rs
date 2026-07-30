@@ -1,5 +1,6 @@
 //! A startup-time registry of pluggable sources and sinks.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,10 +8,27 @@ use crate::sink::{ErasedSink, SinkAdapter, SinkBase, SinkId};
 use crate::source::{ErasedSource, SourceAdapter, SourceBase, SourceId};
 
 /// Holds every source and sink instance wired into a driver at startup.
+///
+/// Each source/sink is stored twice, under the same id: once behind its
+/// object-safe erased trait (`sources`/`sinks`, unchanged since Stage 0 —
+/// what the driver and `Ctx::src_req`/`sink_req` use, since they only ever
+/// need untyped operations) and once as a plain `Arc<dyn Any + Send +
+/// Sync>` holding the *original* `Arc<S>` (`source_typed`/`sink_typed`,
+/// added for flow-argument computations — see [`crate::flow`]). The second
+/// copy exists because a revived flow-argument node has only a
+/// [`crate::flow::FlowId`] to go on (no live handle survives a rerun or a
+/// restart), so [`crate::flow::FlowResolver`] must be able to look a
+/// concrete `Arc<S>` back up by id and downcast to the caller's expected
+/// `S` — something the erased `dyn ErasedSource`/`dyn ErasedSink` objects
+/// can't do (they were never `Any`). Both copies are the same `Arc`
+/// underneath (a refcount bump each, not a clone of the source/sink
+/// itself), so this doubles pointer bookkeeping only, not real state.
 #[derive(Default)]
 pub struct Registry {
     sources: HashMap<SourceId, Arc<dyn ErasedSource>>,
+    source_typed: HashMap<SourceId, Arc<dyn Any + Send + Sync>>,
     sinks: HashMap<SinkId, Arc<dyn ErasedSink>>,
+    sink_typed: HashMap<SinkId, Arc<dyn Any + Send + Sync>>,
 }
 
 impl Registry {
@@ -23,8 +41,9 @@ impl Registry {
         let id = src.instance_id();
         let prev = self
             .sources
-            .insert(id.clone(), Arc::new(SourceAdapter(src)));
+            .insert(id.clone(), Arc::new(SourceAdapter(src.clone())));
         assert!(prev.is_none(), "duplicate source id: {id}");
+        self.source_typed.insert(id, src as Arc<dyn Any + Send + Sync>);
     }
 
     /// Registers a sink instance under its [`SinkBase::instance_id`].
@@ -34,8 +53,9 @@ impl Registry {
     /// startup configuration error, not a runtime condition to recover from.
     pub fn register_sink<S: SinkBase>(&mut self, sink: Arc<S>) {
         let id = sink.instance_id();
-        let prev = self.sinks.insert(id.clone(), Arc::new(SinkAdapter(sink)));
+        let prev = self.sinks.insert(id.clone(), Arc::new(SinkAdapter(sink.clone())));
         assert!(prev.is_none(), "duplicate sink id: {id}");
+        self.sink_typed.insert(id, sink as Arc<dyn Any + Send + Sync>);
     }
 
     /// Iterates over every registered source, erased.
@@ -58,6 +78,22 @@ impl Registry {
         self.sinks.get(id)
     }
 
+    /// Looks up a registered source by id, downcast to the concrete `S` a
+    /// caller expects. `None` covers both "no source registered under this
+    /// id" and "registered, but as a different concrete type" — see
+    /// [`crate::flow::FlowResolver::source`], the one caller, for how it
+    /// turns either case into a named, loud [`crate::error::CompError`]
+    /// rather than leaving `None` to propagate as a generic failure.
+    pub(crate) fn source_typed<S: SourceBase>(&self, id: &SourceId) -> Option<Arc<S>> {
+        self.source_typed.get(id)?.clone().downcast::<S>().ok()
+    }
+
+    /// Looks up a registered sink by id, downcast to the concrete `S` a
+    /// caller expects — see [`Self::source_typed`].
+    pub(crate) fn sink_typed<S: SinkBase>(&self, id: &SinkId) -> Option<Arc<S>> {
+        self.sink_typed.get(id)?.clone().downcast::<S>().ok()
+    }
+
     /// Merges `other`'s sources and sinks into `self`, used by
     /// [`crate::EngineBuilder::registry`] so that call can *merge* into the
     /// builder's existing registrations instead of replacing them wholesale.
@@ -78,9 +114,15 @@ impl Registry {
             let prev = self.sources.insert(id.clone(), src);
             assert!(prev.is_none(), "duplicate source id: {id}");
         }
+        for (id, src) in other.source_typed {
+            self.source_typed.insert(id, src);
+        }
         for (id, sink) in other.sinks {
             let prev = self.sinks.insert(id.clone(), sink);
             assert!(prev.is_none(), "duplicate sink id: {id}");
+        }
+        for (id, sink) in other.sink_typed {
+            self.sink_typed.insert(id, sink);
         }
     }
 }
