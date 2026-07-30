@@ -1,0 +1,5 @@
+error: #[computation]'s first argument must be `&Ctx` (or `Ctx`)
+ --> tests/ui/first_arg_not_ctx.rs:4:28
+  |
+4 | async fn bad_first_arg(_n: u32) -> Result<(), computations::error::CompError> {
+  |                            ^^^

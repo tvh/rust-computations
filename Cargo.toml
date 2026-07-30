@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/computations", "crates/computations-fs", "crates/computations-time"]
+members = ["crates/computations", "crates/computations-fs", "crates/computations-macros", "crates/computations-time"]
 
 [profile.profiling]
 inherits = "release"
@@ -20,3 +20,8 @@ smallvec = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 tempfile = "3"
+inventory = "0.3"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+trybuild = "1"

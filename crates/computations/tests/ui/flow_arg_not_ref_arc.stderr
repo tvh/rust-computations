@@ -1,0 +1,13 @@
+error: #[flow] arguments must be a reference to `Arc<T>` where `T` implements `SourceBase` or `SinkBase` (e.g. `#[flow] source: &Arc<FsSource>`)
+ --> tests/ui/flow_arg_not_ref_arc.rs:7:46
+  |
+7 | async fn bad_flow(_ctx: &Ctx, #[flow] thing: NotAnArc) -> Result<(), computations::error::CompError> {
+  |                                              ^^^^^^^^
+
+warning: unused import: `computations::Ctx`
+ --> tests/ui/flow_arg_not_ref_arc.rs:1:5
+  |
+1 | use computations::Ctx;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

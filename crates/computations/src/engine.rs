@@ -1914,12 +1914,59 @@ impl EngineBuilder {
 
     /// Finishes building the `Engine`.
     ///
+    /// Before doing anything else, this also consumes every `#[computation]`
+    /// function's automatic registration (Phase B — see
+    /// `docs/persistence-benchmark-notes.md`'s Stage 10, and
+    /// [`crate::flow::ComputationEntry`]'s docs for the `inventory`-based
+    /// collection mechanism and its platform caveats), so a
+    /// `#[computation]`-defined computation is available with no explicit
+    /// `define*`/`register` call at all. Gated behind this crate's `macros`
+    /// feature, a no-op with it disabled.
+    ///
     /// # Panics
-    /// Panics if more than `u16::MAX + 1` computations were registered — the
-    /// capacity of the internal [`DefIndex`] the node table's lookup index
-    /// uses (see [`DefIndex`]'s docs). Not a realistic limit for any
-    /// hand-registered graph of definitions.
-    pub fn build(self) -> Engine {
+    /// - Panics if more than `u16::MAX + 1` computations were registered —
+    ///   the capacity of the internal [`DefIndex`] the node table's lookup
+    ///   index uses (see [`DefIndex`]'s docs). Not a realistic limit for any
+    ///   hand-registered graph of definitions.
+    /// - Panics if a `#[computation]` function's name collides with another
+    ///   `#[computation]` function's name, or with a name already
+    ///   registered directly on this builder (`define`/`define_flows`/
+    ///   `register`/...) before `build()` was called — naming the
+    ///   colliding name and which two registration paths produced it, the
+    ///   same "duplicate is a startup configuration error" stance every
+    ///   other registration method in this crate already takes.
+    // `mut` is only needed by the `#[cfg(feature = "macros")]` block below
+    // (each collected registration is applied via `&mut self`); with that
+    // feature disabled the binding is never mutated, hence the conditional
+    // `allow` rather than an unconditional one that would mask a genuine
+    // future unused-mut regression on the "macros"-enabled build.
+    #[cfg_attr(not(feature = "macros"), allow(unused_mut))]
+    pub fn build(mut self) -> Engine {
+        #[cfg(feature = "macros")]
+        {
+            let mut macro_registered: HashSet<&'static str> = HashSet::new();
+            for entry in inventory::iter::<crate::flow::ComputationEntry> {
+                if macro_registered.contains(entry.name) {
+                    panic!(
+                        "duplicate computation name `{}`: registered by more than one #[computation] function \
+                         (two functions producing the same `concat!(module_path!(), \"::\", ...)` name) -- \
+                         rename one of them",
+                        entry.name
+                    );
+                }
+                if self.def_names.contains_key(entry.name) {
+                    panic!(
+                        "duplicate computation name `{}`: registered both by a #[computation] function and by \
+                         an explicit EngineBuilder registration (define/define_flows/register/define_with/...) \
+                         made before build() -- rename one of them, or remove the explicit registration",
+                        entry.name
+                    );
+                }
+                macro_registered.insert(entry.name);
+                (entry.register)(&mut self);
+            }
+        }
+
         let (dirty_tx, dirty_rx) = mpsc::unbounded_channel();
         assert!(
             self.def_order.len() <= u16::MAX as usize + 1,

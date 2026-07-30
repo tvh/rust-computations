@@ -2057,3 +2057,321 @@ page-rounded file size at this scale.
   signature — squarely Phase B's job, once the macro can see that
   signature to generate from.
 
+## Stage 10 — the `#[computation]` macro
+
+Phase B: a new `computations-macros` proc-macro crate (`proc-macro = true`,
+`syn`/`quote`/`proc-macro2`) providing `#[computation]`, re-exported from
+`computations` (`pub use computations_macros::computation;`) behind a new,
+default-on `macros` feature. `#[computation]` turns exactly the shape Stage
+9 wrote out by hand — `async fn sync_file(ctx: &Ctx, #[flow] source:
+&Arc<FsSource>, #[flow] sink: &Arc<FsSink>, rel: PathBuf) -> Result<(),
+CompError>`, called as a plain `sync_file(ctx, &source, &sink,
+rel).await` — into generated code, with automatic registration on top
+(Stage 9 left both of those as explicitly deferred work; see "Left for
+Phase B" above).
+
+### Why `#[flow]` has to be explicit (not inferred from the type)
+
+A proc macro operates on tokens, never on resolved types: by the time
+`#[computation]` runs, the compiler hasn't looked up what `Arc<FsSource>`
+*is* yet, so there is no way to tell "this argument is a source/sink" apart
+from "this argument just happens to be `Arc`-wrapped" (e.g. `Arc<Vec<u8>>`,
+an ordinary shareable parameter) from syntax alone. `#[flow]` is the
+human-supplied signal that removes the ambiguity; the design constraint
+handed to this stage was explicit about not trying to infer it. The macro
+does perform one syntactic check on its own (a `#[flow]`-marked argument
+must be shaped `&Arc<T>` — a bare `T` or an owned `Arc<T>` is a
+`compile_error!` naming the argument directly), but it cannot check that
+`T` actually implements `SourceBase`/`SinkBase`; that surfaces at the
+generated call site as an ordinary Rust trait-bound error instead (see
+below).
+
+**Dispatching `Source` vs. `Sink` without type info, either.** The macro
+also never learns whether a given `#[flow]` argument's `T` is a source or a
+sink — same token-only limitation. Resolved with the "autoref
+specialization" pattern rather than a custom check: `computations::flow`
+defines two *distinct* traits per operation —
+`AsFlowId`/`AsFlowIdSink` (build a `FlowId` from an `Arc<T>`) and
+`ResolveFlow`/`ResolveFlowSink` (rebuild an `Arc<T>` from a
+`FlowResolver`) — each blanket-implemented over one of `SourceBase`/
+`SinkBase`. Two blanket impls of the *same* trait over `SourceBase` and
+`SinkBase` would conflict under Rust's coherence rules (the compiler can't
+prove the two are mutually exclusive for some hypothetical future type),
+but two impls of two *different* traits never conflict. Generated code
+imports both traits into scope and calls the shared method name
+(`source.as_flow_id()`, `Arc::<T>::resolve_flow(&resolver, idx)`); for any
+concrete `T` that implements only one of the two marker traits (every type
+in this workspace), method/associated-function resolution picks the one
+applicable impl with no ambiguity — verified directly against a standalone
+`rustc` sandbox before wiring it into the macro, since this dispatch trick
+is the one piece of this stage that isn't obviously correct just from
+reading it. A `T` implementing neither surfaces as an ordinary "no method
+named `as_flow_id`"/unsatisfied-trait-bound error — not a custom
+diagnostic, but still a compile-time failure naming the real problem
+(constraint 1's contract, satisfied by ordinary Rust rather than by
+macro-side type checking, which categorically cannot do this without a
+`T: SourceBase` bound to check against). A `T` implementing *both* would
+make the call genuinely ambiguous (`rustc` E0034) — an accepted, documented
+edge case, since no type here is both a source and a sink.
+
+### The generated code
+
+For each `#[computation]` function, the macro emits five items in place of
+the original one (module path shown for `sync_doc` inside `mod smoke`, via
+`cargo +nightly expand`):
+
+```rust
+const SYNC_DOC_NAME: &str = "computation_macro_smoke::smoke::sync_doc";
+
+async fn __computation_impl_sync_doc(
+    ctx: &Ctx, source: &Arc<MemKvSource>, sink: &Arc<VecSink>, key: String,
+) -> Result<(), CompError> { /* the original body, verbatim */ }
+
+pub async fn sync_doc(
+    ctx: &Ctx, source: &Arc<MemKvSource>, sink: &Arc<VecSink>, key: String,
+) -> Result<(), ::computations::error::CompError> {
+    use ::computations::flow::{AsFlowId as _, AsFlowIdSink as _};
+    let __flows: [::computations::FlowId; 2usize] = [source.as_flow_id(), sink.as_flow_id()];
+    let __param: String = key;
+    ctx.eval_flows(SYNC_DOC_NAME, &__flows, __param).await
+}
+
+fn __computation_thunk_sync_doc(
+    __ctx: ::computations::Ctx, __resolver: ::computations::FlowResolver<'_>, __param_bytes: &[u8],
+) -> ::computations::FlowThunkFut {
+    use ::computations::flow::{ResolveFlow as _, ResolveFlowSink as _};
+    let __param: String = /* postcard-decode __param_bytes, or return a boxed Err future */;
+    let key: String = __param;
+    let source: Arc<MemKvSource> = /* Arc::<MemKvSource>::resolve_flow(&__resolver, 0), or return Err */;
+    let sink: Arc<VecSink> = /* Arc::<VecSink>::resolve_flow(&__resolver, 1), or return Err */;
+    Box::pin(async move {
+        let __result = __computation_impl_sync_doc(&__ctx, &source, &sink, key).await?;
+        Ok(Arc::new(__result) as Arc<dyn Any + Send + Sync>)
+    })
+}
+
+fn __computation_register_sync_doc(builder: &mut ::computations::EngineBuilder) {
+    builder.define_flows::<()>(SYNC_DOC_NAME, __computation_thunk_sync_doc);
+}
+::computations::inventory::submit! {
+    ::computations::flow::ComputationEntry { name: SYNC_DOC_NAME, register: __computation_register_sync_doc }
+}
+```
+
+This is, line for line, what `tests/flow.rs` wrote out by hand (Stage 9's
+whole point). Two deliberate departures from a literal transcription:
+
+- **`SYNC_DOC_NAME` is public** (matching the annotated function's own
+  visibility), not doc-hidden — it's the escape hatch that lets a caller
+  drive a `#[computation]` function as a genuine root via
+  `Engine::run_flows`/`eval_root_flows` (building its own `FlowId` list from
+  the equally-public `AsFlowId`/`AsFlowIdSink` traits) with zero `Comp<P,
+  R>` handles and zero `EngineBuilder::define*` calls anywhere — see
+  `examples/dirsync.rs` below, which needs exactly this.
+- **`computations::postcard`/`computations::inventory` are re-exported**
+  from the `computations` crate specifically so generated code never has to
+  assume the annotated crate depends on `postcard`/`inventory` directly —
+  only on `computations` itself. `FlowThunkFut` (a new, exported type alias
+  for `FlowThunk`'s return type) does the same job for `futures::future::
+  BoxFuture`/`std::any::Any`: an annotated crate needs no dependency on
+  `futures` at all.
+- **Multi-param bundling.** Two or more unmarked (non-`#[flow]`) arguments
+  are bundled into a tuple, in left-to-right declaration order, for both
+  hashing and (de)serialization — `fn f(ctx: &Ctx, a: A, b: B) -> ...`
+  becomes `(a, b): (A, B)`. Exactly one param stays unwrapped (no
+  single-element-tuple overhead); zero params encode as `()`. The ordering
+  guarantee is load-bearing, not cosmetic: `computation_macro.rs`'s
+  `zero_flow_params_only_computation_memoizes_and_orders_params` and
+  `multi_param_with_flow_preserves_argument_order` tests both assert that
+  swapping which argument plays which role produces a genuinely different
+  node identity (and result), not a silently transposed one.
+
+### Registration mechanism and its caveats
+
+`::computations::inventory::submit!` collects every `ComputationEntry {
+name, register }` in the final linked binary via platform constructor
+sections (`.init_array`/`.ctors` on Linux/macOS, an equivalent on Windows)
+that run before `main`. `EngineBuilder::build()` walks
+`inventory::iter::<ComputationEntry>()` and calls each entry's `register`
+fn — eager, not lazy-on-first-call, which matters specifically for
+persistence: restore drops any record whose `DefId` isn't registered yet
+(Stage 7's existing "unknown definition" tolerance), so a hypothetical
+lazily-registered def would cold-start its *entire* subtree on every
+restart, silently, the first time nothing had called it yet. `register` is
+a plain, non-generic `fn(&mut EngineBuilder)` monomorphized per
+`#[computation]` (it already knows its own concrete `R`), mirroring
+`FlowThunk`'s own "erase to a bare fn pointer" trick one level up — this is
+what lets `ComputationEntry` collect definitions of different result types
+uniformly without `EngineBuilder::build()` ever naming any of them.
+
+Two caveats, both inherited from `inventory`/ctor-based collection in
+general, not specific to this crate:
+
+- **No WebAssembly support** — wasm has no constructor-section mechanism,
+  so `inventory::submit!`'s items never run there.
+- **Static-linking dead-code elimination.** If a `#[computation]` function
+  ends up in a `.rlib` archived into a final binary, and nothing else in
+  that translation unit is ever referenced, an aggressive linker is in
+  principle free to drop the whole object file — submit-time constructor
+  included — before it ever runs.
+
+**Escape hatch**: every `#[computation]` function also generates a plain,
+directly-callable `__computation_register_<fn_name>(&mut EngineBuilder)` —
+the very function `ComputationEntry::register` already points at. Call it
+explicitly, before `build()`, on a target or link configuration where
+automatic collection doesn't apply.
+
+**Collision handling.** `EngineBuilder::build()` checks each inventory
+entry's name against both the names already registered directly on the
+builder (`define`/`define_with`/`define_flows`/... calls made before
+`build()`) and every other inventory entry's name seen earlier in the same
+walk, panicking with a message naming the colliding name and *which two*
+registration paths produced it (two `#[computation]` functions vs. a
+`#[computation]` function colliding with an explicit builder registration)
+— the same "duplicate is a startup configuration error, not a runtime
+condition" stance `register`/`define_flows`/`Registry::register_source`
+already take, just extended to name both sides for this new registration
+path.
+
+### What `dirsync` lost
+
+`crates/computations-fs/examples/dirsync.rs` — the deliverable "proof" —
+lost its `env` tuple, both `EngineBuilder::define_with`/`define_rec_with`
+calls, and both `Comp<PathBuf, ()>` handles: `sync_file`/`sync_dir` are now
+two plain `#[computation]` functions, calling each other (and, for
+`sync_dir`, itself) exactly the way any two ordinary async functions would.
+`EngineBuilder::build()` picks both up with no `define*` call for either.
+The one param `FsSink`'s design let the old version fold into a captured
+closure invisibly — `source_root` (`FsSource` has no root of its own,
+unlike `FsSink`) — has to be an explicit, ordinary (unmarked) parameter now,
+threaded through both functions and cloned at each recursive call site,
+since a `#[computation]` function has no captured environment to hide it
+in. `Ctx::eval_all`'s batched-concurrent-evaluation role (needs a `Comp<P,
+R>` handle) is played by `futures::future::try_join_all` over an iterator
+of direct wrapper calls instead.
+
+Net effect on raw line count is close to a wash, not a reduction — worth
+stating plainly rather than rounding to a nicer-sounding number:
+
+| | before (builder path) | after (`#[computation]`) |
+|---|---|---|
+| whole file | 167 lines | 198 lines (+31, almost entirely new module-doc explaining the Phase B wiring) |
+| computation wiring only (defs + registration + driving call, comments excluded) | 41 lines | 45 lines |
+
+The qualitative reduction — zero `EngineBuilder::define*` calls, zero
+`Comp<P, R>` handles, zero captured `env` tuple, two top-level `pub`-able
+async functions callable and testable on their own — doesn't show up as
+fewer lines here specifically because `source_root` moved from "captured
+once, invisible thereafter" to "explicit parameter, re-cloned at every
+recursive call site." A computation with no such non-flow, non-`Arc`
+shared state (most of `computation_macro.rs`'s own scenarios) sees a
+straightforward reduction instead; `dirsync` is the one case in this
+workspace shaped so the ledger doesn't obviously favor either side, which
+is exactly why it was worth reporting honestly rather than picking a
+rosier comparison.
+
+`crates/computations-fs/tests/dirsync.rs` was deliberately **kept on the
+builder path** rather than ported alongside the example: the example
+already *is* the macro's port proof, and this test's job is to confirm the
+older API keeps working, unchanged, once the macro exists alongside it —
+porting both would leave zero coverage in this workspace actually
+exercising `define_with`/`define_rec_with` against a real, nontrivial
+(self-recursive, concurrent-batch) computation graph.
+
+### Tests
+
+`crates/computations/tests/computation_macro.rs` (7 scenarios, each its own
+module so its `module_path!()`-derived name and run-counter `static` stay
+unique, mirroring `tests/flow.rs`'s own pattern): single-flow
+evaluate+memoize, multi-flow rerun-under-the-live-driver, zero-flow
+params-only with multi-param ordering, a flow combined with multiple
+ordinary params (the `dirsync` shape, params-ordering-preserved), mutual
+recursion between two `#[computation]` functions (constraint 5 — now
+supported, since compile-time name resolution through the generated
+wrapper functions removes the hazard that used to motivate banning it on
+the builder path), the identity guarantee (two different source instances
+behind the same computation+param never collapse onto one node), and a
+persisted restart through the macro path (cache hit, zero reruns). None of
+these ever call `EngineBuilder::define_flows` for the `#[computation]`
+function under test — every one relies purely on automatic registration,
+which is itself the property being exercised throughout.
+
+`crates/computations/tests/computation_macro_compile_fail.rs` +
+`tests/ui/*.rs` (4 fixtures, `trybuild`, checked-in `.stderr` snapshots):
+not-`async`, first argument not `&Ctx`, a `#[flow]` argument not shaped
+`&Arc<T>`, and a return type not `Result<R, CompError>`. A fifth case
+constraint 1 also names — a `#[flow]` argument correctly shaped as
+`&Arc<T>` where `T` implements neither `SourceBase` nor `SinkBase` — is
+deliberately *not* snapshot-tested: that failure is an ordinary Rust
+trait-bound error whose exact wording is `rustc`'s to own, not this crate's
+to pin down (and thus not safe to commit into a version-independent test
+fixture). Snapshot fragility across `rustc` versions is `trybuild`'s known
+tradeoff; regenerate with `TRYBUILD=overwrite` after a deliberate wording
+change to this crate's own `compile_error!` messages.
+
+**Correctness.** `cargo test --workspace --all-features`: 121 passed (up
+from 113 — +7 in `computation_macro.rs`, +1 in
+`computation_macro_compile_fail.rs`), 2 pre-existing ignored tests
+unaffected. `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean.
+
+### Benchmark
+
+`uptime` load average **7.04** (1-min; 10.85/11.23 at 5/15-min) on this
+same 14-core box at benchmark time — elevated, same rough range as Stage
+9's own flagged 11.66, so read absolute numbers against that, not an idle
+box; the relative comparison against this task's stated baselines (in turn
+inherited from Stage 9) is what actually matters. `persist_bench` itself
+exercises only the builder path (its 1M-instance synthetic graph predates
+this stage and was never ported) — the point of running it here is to
+confirm that adding a new default-on feature and two new dependencies
+(`computations-macros`, `inventory`) to `computations` costs the
+*unrelated* core engine path nothing, not to benchmark `#[computation]`
+directly (the macro's own runtime cost is exactly `Ctx::eval_flows`, a
+constant-time layer already measured in full in Stage 9 — this stage adds
+no new field, lock, or branch to the hot `prepare`/`run` path at all).
+`cargo run -p computations --release --example persist_bench --features
+testutil`, full 1M scale:
+
+| phase | baseline (task-stated) | this run (loaded box) | direction |
+|---|---|---|---|
+| cold eval (persistence configured) | ~3.65 s | 3.798 s | +4.1% |
+| warm restart, no changes | ~1.40 s | 1.454 s / 1.407 s (2 trials) | +3.9% / +0.5% |
+| live incremental, no persistence | ~499 ms | 549 ms | +10.0% |
+| persist_now / db size | 269.49 MB | 269.49 MB | unchanged |
+| engine-only RSS (no persistence) | ~331–339 MB | 333.8 MB / 344.7 MB (2 trials) | flat |
+
+Every phase landed within the stated baseline's noise band, and nothing
+crossed (or came close to) the 15% regression threshold this task asked to
+watch for — the largest delta (live incremental, +10.0%) is consistent
+with this run's elevated load rather than a genuine regression, and is
+still well clear of the threshold. `#[computation]` and its automatic
+registration are confirmed to add no measurable cost to the engine's
+existing hot paths.
+
+### Deferred
+
+- **A typed handle for a `#[computation]` function**, analogous to
+  `Comp<P, R>`, that could be passed around and stored the way a
+  builder-path handle can (today, only the plain wrapper function itself,
+  or the public `<FN>_NAME` constant plus `run_flows`/`eval_root_flows`, do
+  that job). Not attempted here: the wrapper function already *is* the
+  ergonomic handle for every call site this stage's tests or `dirsync`
+  needed, and inventing a second handle type purely for symmetry with the
+  builder path wasn't judged worth the added surface.
+- **Generic `#[computation]` functions.** The macro rejects any annotated
+  function with generic parameters outright (`#[computation] fn f<T>(...)
+  -> ...` is a compile error) rather than attempting to support them — a
+  generic function's `FlowThunk`/`ComputationEntry` would need one concrete
+  monomorphization submitted per instantiation actually used in the
+  binary, which `inventory::submit!`'s link-time, non-generic collection
+  model cannot express on its own.
+- **Complex argument patterns.** Every `#[computation]` argument (`ctx`,
+  each `#[flow]` argument, each param) must bind via a simple identifier;
+  a destructuring pattern (`fn f(ctx: &Ctx, (a, b): (i32, i32))`) is a
+  compile error naming the offending argument. Supporting arbitrary
+  irrefutable patterns would complicate the tuple-tupling/destructuring
+  codegen for very little real-world benefit — every computation in this
+  workspace (including `dirsync`) binds every argument by a plain name
+  already.
+

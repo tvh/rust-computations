@@ -64,6 +64,93 @@ exactly once) — the analogue of the paper's built-in `compGetTime` source
 
 ## 2. Quick example
 
+The recommended way to define a computation is `#[computation]`: an
+annotated `async fn` becomes a plain, callable function — no builder
+registration, no captured environment, no handle to pass around.
+
+```rust,ignore
+use std::sync::Arc;
+use computations::{Ctx, Engine, computation};
+use computations::error::CompError;
+use computations_fs::{FsSink, FsSource};
+
+// `#[flow]` marks a source/sink argument: its *instance* joins this
+// computation's identity (so `uppercase_file(src_a, ...)` and
+// `uppercase_file(src_b, ...)` are distinct, independently-memoized
+// applications), but its *contents* are read/written exactly as with the
+// builder API (`Ctx::src_req`/`sink_req`), never hashed as a parameter.
+// Unmarked arguments (`path` below) are ordinary hashed/persisted params.
+#[computation]
+async fn uppercase_file(
+    ctx: &Ctx,
+    #[flow] source: &Arc<FsSource>,
+    #[flow] sink: &Arc<FsSink>,
+    path: std::path::PathBuf,
+) -> Result<(), CompError> {
+    let bytes = source.read_file(ctx, path.clone()).await?;
+    let upper = String::from_utf8_lossy(&bytes).to_uppercase();
+    sink.write_file(ctx, "out.txt", upper.into_bytes()).await
+}
+
+# async fn example() -> anyhow::Result<()> {
+let source = FsSource::new("fs")?;
+let sink = FsSink::new("fs", "/tmp/out");
+
+let mut builder = Engine::builder();
+builder.source(source.clone());
+builder.sink(sink.clone());
+// No `builder.define*` call for `uppercase_file`: `EngineBuilder::build()`
+// finds and registers every `#[computation]` function in the binary
+// automatically (see §2.1).
+let engine = builder.build();
+
+// Called like any other async function.
+uppercase_file(&some_ctx, &source, &sink, "/tmp/in.txt".into()).await?;
+# Ok(())
+# }
+```
+
+This is illustrative (marked `ignore`: it needs a live `Ctx`, which only
+exists inside a running computation or as `Engine::eval_root_flows`'s
+caller) rather than doc-tested; see
+`crates/computations-fs/examples/dirsync.rs` for a complete, runnable
+version with two mutually-recursive `#[computation]` functions, and
+`crates/computations/tests/computation_macro.rs` for single-flow,
+multi-flow, params-only, multi-param, mutual-recursion, identity, and
+persisted-restart scenarios exercised directly.
+
+### 2.1 How `#[computation]` registers itself
+
+`#[computation]` expands one annotated function into four items: a private
+`impl` function (your original body, unchanged), a public wrapper (your
+original signature, calling `Ctx::eval_flows` internally), a `FlowThunk`
+that resolves `#[flow]` arguments from the engine's `Registry` by position,
+and an `inventory::submit!` that registers `(name, thunk)` for
+`EngineBuilder::build()` to pick up — automatically, and eagerly (before any
+computation body runs, which matters for persistence: restore drops any
+record whose definition isn't registered yet, so a *lazily*-registered
+definition would cold-start its whole subtree on every restart). The
+computation's name is `concat!(module_path!(), "::", "<fn_name>")`, so two
+functions of the same name in different modules never collide.
+
+`inventory`'s collection relies on link-time constructor sections
+(`.init_array`/`.ctors`), which has two known gaps: it doesn't run on
+WebAssembly, and an aggressive static linker can in principle strip an
+otherwise-unreferenced object file (and the constructor inside it) before
+it ever runs. Each `#[computation]` function also generates a plain,
+directly-callable fallback — `__computation_register_<fn_name>(&mut
+EngineBuilder)` — for exactly those cases; call it explicitly before
+`build()` if automatic collection doesn't apply on your target.
+
+### 2.2 Builder API (for runtime-dynamic registration)
+
+The original builder API — `EngineBuilder::define`/`define_with`/
+`define_rec`/`define_rec_with`/`define_flows`, `Comp<P, R>` handles — is
+still fully supported, and is the right choice whenever a computation's
+existence or shape isn't known until runtime (e.g. one definition per row
+of a config file loaded at startup), since `#[computation]` only ever
+registers what's written directly into the source.
+
 ```rust,ignore
 use computations::Engine;
 use computations_fs::{FsSink, FsSource};
@@ -76,7 +163,6 @@ let mut builder = Engine::builder();
 builder.source(source.clone());
 builder.sink(sink.clone());
 
-// `uppercase_file`: reads a file and writes its upper-cased contents.
 // `EngineBuilder::define_with` is the environment-passing counterpart to
 // `define_comp` + `register`: build `env` once, and the body gets an owned
 // clone of it on every invocation — no per-call clone dance to write out
@@ -98,20 +184,26 @@ engine.eval_root(&uppercase_file, "/tmp/in.txt".into()).await?;
 # }
 ```
 
-This is illustrative (marked `ignore` since it depends on real paths at
-`/tmp`) rather than doc-tested; see `crates/computations-fs/examples/dirsync.rs`
-for a complete, runnable version with two mutually-recursive computations.
+`EngineBuilder::define` and its variants remain the preferred way to define
+a builder-path computation (`define_comp` + `register` stays public for
+callers that build a `CompDef` elsewhere). Use plain `define`/`define_rec`
+when a body needs no captured environment (see the `sum`/`store`
+computations in `crates/computations/tests/engine.rs`), and
+`define_rec`/`define_rec_with` when a computation calls itself: they hand
+the body a `Comp` handle to its own definition, so the name isn't repeated
+— and can't drift — across two call sites. Mutual recursion between two or
+more builder-path definitions still goes through `Comp::named` directly
+(see the `cycle_a`/`cycle_b` test in the same file) — `#[computation]`
+functions instead call each other directly, by name, with no `Comp::named`
+step at all (see `mutual_recursion` in `computation_macro.rs`).
 
-`EngineBuilder::define` and its variants are the preferred way to define a
-computation (`define_comp` + `register` stays public for callers that build
-a `CompDef` elsewhere). Use plain `define`/`define_rec` when a body needs no
-captured environment (see the `sum`/`store` computations in
-`crates/computations/tests/engine.rs`), and `define_rec`/`define_rec_with`
-when a computation calls itself: they hand the body a `Comp` handle to its
-own definition, so the name isn't repeated — and can't drift — across two
-call sites. Mutual recursion between two or more definitions still goes
-through `Comp::named` directly (see the `cycle_a`/`cycle_b` test in the same
-file).
+Both APIs coexist freely in the same `Engine`: a builder-path computation
+can call a `#[computation]` function's generated wrapper as an ordinary
+nested call, and vice versa (see `tests/flow.rs` and
+`tests/computation_macro.rs`, both of which do exactly this). The `macros`
+feature (default-on) gates `#[computation]` and its `inventory` dependency;
+disable it (`default-features = false`) for a leaner dependency tree on a
+target that only ever uses the builder API.
 
 ## 3. The dirsync demo
 

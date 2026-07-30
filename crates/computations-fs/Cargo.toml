@@ -9,6 +9,7 @@ tokio = { workspace = true, features = ["fs"] }
 notify = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 computations = { path = "../computations", features = ["testutil"] }

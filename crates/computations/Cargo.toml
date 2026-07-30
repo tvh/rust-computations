@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["macros"]
 testutil = []
+# The `#[computation]` proc-macro plus its runtime support (automatic
+# `inventory`-based registration -- see `crate::flow::ComputationEntry`'s
+# docs for the mechanism and its platform caveats). Default-on so
+# `use computations::computation;` works out of the box; disable with
+# `default-features = false` for a leaner dependency tree on a target where
+# the macro isn't wanted (e.g. no `inventory`/`computations-macros` pulled
+# in at all).
+macros = ["dep:computations-macros", "dep:inventory"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -16,6 +25,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 redb = { workspace = true }
 smallvec = { workspace = true }
+computations-macros = { path = "../computations-macros", optional = true }
+inventory = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
@@ -24,6 +35,7 @@ tempfile = { workspace = true }
 postcard = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+trybuild = { workspace = true }
 
 [[example]]
 name = "persist_bench"

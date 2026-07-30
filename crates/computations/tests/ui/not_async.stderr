@@ -1,0 +1,13 @@
+error: #[computation] functions must be `async fn`
+ --> tests/ui/not_async.rs:5:1
+  |
+5 | fn not_async(_ctx: &Ctx) -> Result<(), computations::error::CompError> {
+  | ^^
+
+warning: unused import: `computations::Ctx`
+ --> tests/ui/not_async.rs:1:5
+  |
+1 | use computations::Ctx;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

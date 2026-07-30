@@ -1,8 +1,20 @@
 //! End-to-end convergence test for the `dirsync` demo's wiring.
 //!
-//! Duplicates the computation wiring from
-//! `examples/dirsync.rs` (examples aren't importable from an integration
-//! test crate) and drives it against real temp directories via
+//! Deliberately kept on the **builder path** (`EngineBuilder::define_with`/
+//! `define_rec_with`, an `env` tuple, `Comp<PathBuf, ()>` handles) rather
+//! than ported to `#[computation]` alongside `examples/dirsync.rs` (Phase B
+//! — see `docs/persistence-benchmark-notes.md`'s Stage 10): the example
+//! *is* the macro's port proof, and this test's job is different —
+//! confirming that the older, still-fully-supported builder API keeps
+//! working, byte-for-byte unchanged, once the macro exists alongside it.
+//! Porting both would leave zero test coverage actually exercising
+//! `define_with`/`define_rec_with` against a real, nontrivial (self-
+//! recursive, concurrent-batch) computation graph. So: this file is
+//! coexistence evidence, not a regression the macro was supposed to fix.
+//!
+//! Duplicates the (builder-path) computation wiring `examples/dirsync.rs`
+//! used before its Phase B port (examples aren't importable from an
+//! integration test crate) and drives it against real temp directories via
 //! `Engine::run`, asserting that the target directory converges to mirror
 //! the source directory through a sequence of live edits: initial sync
 //! (plus startup GC of a stale pre-existing target file), content

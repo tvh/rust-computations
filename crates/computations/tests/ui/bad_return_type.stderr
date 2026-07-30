@@ -1,0 +1,13 @@
+error: #[computation] functions must return `Result<R, CompError>`
+ --> tests/ui/bad_return_type.rs:5:36
+  |
+5 | async fn bad_return(_ctx: &Ctx) -> u32 {
+  |                                    ^^^
+
+warning: unused import: `computations::Ctx`
+ --> tests/ui/bad_return_type.rs:1:5
+  |
+1 | use computations::Ctx;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

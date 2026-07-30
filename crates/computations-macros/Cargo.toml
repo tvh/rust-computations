@@ -1,0 +1,13 @@
+[package]
+name = "computations-macros"
+version = "0.1.0"
+edition = "2024"
+description = "The #[computation] proc-macro for the `computations` engine (see that crate's `macros` feature)."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

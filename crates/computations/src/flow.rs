@@ -177,6 +177,14 @@ impl<'a> FlowResolver<'a> {
     }
 }
 
+/// The return type of a [`FlowThunk`] — pulled out on its own and exported
+/// (`computations::FlowThunkFut`) so `#[computation]`-generated code can
+/// spell a thunk function's return type without needing `futures`'s
+/// `BoxFuture` (or `std::any::Any`) as a direct dependency of whatever crate
+/// the macro is used from; the macro-annotated crate only ever needs
+/// `computations` itself.
+pub type FlowThunkFut = BoxFuture<'static, Result<Arc<dyn Any + Send + Sync>, CompError>>;
+
 /// The type-erased body of a flow-argument computation: decodes
 /// `param_bytes` as its own (statically known only to itself, never to the
 /// engine) parameter type, resolves whatever flows it needs via the given
@@ -188,11 +196,11 @@ impl<'a> FlowResolver<'a> {
 /// stored per-node beyond the bytes/ids [`crate::engine::EngineInner::eval_flows`]
 /// already keeps track of. This is also deliberately a plain value (`fn`
 /// pointers are `Copy` and `'static`) rather than a boxed trait object,
-/// since Phase B's `#[computation]` macro will hand one to
+/// which is exactly what lets the `#[computation]` macro (Phase B — gated
+/// behind this crate's `macros` feature) hand one to
 /// [`crate::engine::EngineBuilder::define_flows`] via `inventory::submit!` —
-/// a plain value is exactly what that needs to collect at link time.
-pub type FlowThunk =
-    fn(crate::ctx::Ctx, FlowResolver<'_>, &[u8]) -> BoxFuture<'static, Result<Arc<dyn Any + Send + Sync>, CompError>>;
+/// see [`ComputationEntry`] for the collection mechanism.
+pub type FlowThunk = fn(crate::ctx::Ctx, FlowResolver<'_>, &[u8]) -> FlowThunkFut;
 
 /// A flow-argument computation definition: a globally-named [`FlowThunk`]
 /// plus its own typed value column (see [`crate::def::CompDef`]'s docs for
@@ -305,6 +313,123 @@ impl<R: CompResult> ErasedDef for FlowDefAdapter<R> {
         Some(Box::pin(async move {
             engine.eval_flows_erased::<R>(def, &flows, param_bytes, Arc::new(Vec::new())).await
         }))
+    }
+}
+
+// =====================================================================
+// `#[computation]` macro support (Phase B, gated behind this crate's
+// `macros` feature — see `docs/persistence-benchmark-notes.md`'s Stage 10).
+// =====================================================================
+
+/// One `#[computation]` function's registration, collected via `inventory`
+/// (Phase B) and consumed by [`crate::engine::EngineBuilder::build`].
+///
+/// `register` is a plain, non-generic `fn` — each `#[computation]`
+/// expansion generates its own concrete monomorphization that already
+/// knows its own result type `R`, so `build()` can call it uniformly
+/// (`(entry.register)(&mut builder)`) without ever naming `R` itself; this
+/// is the same "erase to a plain fn pointer" trick [`FlowThunk`] already
+/// uses, applied one level up.
+///
+/// ## Registration mechanism and its caveats
+///
+/// `inventory` collects every `ComputationEntry` submitted anywhere in the
+/// final linked binary by running a constructor function for each one
+/// before `main` starts (via platform-specific `.init_array`/`.ctors`
+/// sections on Linux/macOS, and an equivalent on Windows). This is eager
+/// and automatic — no call to `EngineBuilder::define*` needed — but it has
+/// two known caveats:
+///
+/// - **No support on WASM** (or any target without constructor-section
+///   support): `inventory::submit!`'s items simply never run there.
+/// - **Dead-code elimination under static linking**: if a `#[computation]`
+///   function lives in a `.rlib` that gets archived into a final binary,
+///   and nothing else in that object file is ever referenced, some linkers
+///   are free to drop the whole object file — including its
+///   `inventory::submit!` constructor — before it ever runs. This is a
+///   known, general `inventory`/`ctor` limitation, not specific to this
+///   crate.
+///
+/// **Escape hatch**: every `#[computation]` function also generates a
+/// hidden, plain function `__computation_register_<fn_name>(&mut
+/// EngineBuilder)` (the same one this `ComputationEntry` points `register`
+/// at) in the same module as the original function. On a target or link
+/// configuration where automatic collection doesn't apply, call it
+/// directly — e.g. `my_module::__computation_register_sync_file(&mut
+/// builder);` — before `builder.build()`.
+pub struct ComputationEntry {
+    pub name: &'static str,
+    pub register: fn(&mut crate::engine::EngineBuilder),
+}
+
+#[cfg(feature = "macros")]
+inventory::collect!(ComputationEntry);
+
+/// Type-directed dispatch helpers for `#[computation]`-generated code, so
+/// generated code can build a [`FlowId`] from a `#[flow]` argument's `Arc`,
+/// and later resolve one back from a [`FlowResolver`], without the
+/// `#[computation]` proc macro itself ever needing to know whether that
+/// argument's concrete type is a source or a sink — a proc macro only ever
+/// sees syntax, never resolved types (see `computations_macros`' module
+/// docs).
+///
+/// Implemented via the "autoref specialization" pattern: [`AsFlowId`] and
+/// [`AsFlowIdSink`] are two *distinct* traits (naming the same method,
+/// `as_flow_id`), each blanket-implemented over one of [`SourceBase`]/
+/// [`SinkBase`] — two impls of two different traits never conflict under
+/// Rust's coherence rules, unlike two impls of one trait. Generated code
+/// imports both traits and calls the shared method name; for any concrete
+/// `T` that implements only one of `SourceBase`/`SinkBase` (the only case
+/// this crate's own types exercise), method resolution picks the one
+/// applicable impl unambiguously. A `T` implementing neither surfaces as an
+/// ordinary "no method named `as_flow_id`" compile error — not a custom
+/// diagnostic, but still a compile-time failure naming the real problem. A
+/// `T` implementing *both* would make the call genuinely ambiguous (a
+/// `rustc` E0034), which is an acceptable, documented edge case: no type in
+/// this workspace is both a source and a sink.
+pub trait AsFlowId {
+    fn as_flow_id(&self) -> FlowId;
+}
+
+impl<T: SourceBase> AsFlowId for Arc<T> {
+    fn as_flow_id(&self) -> FlowId {
+        FlowId::Source(self.instance_id())
+    }
+}
+
+/// See [`AsFlowId`] — the sink-side counterpart of the same dispatch
+/// pattern.
+pub trait AsFlowIdSink {
+    fn as_flow_id(&self) -> FlowId;
+}
+
+impl<T: SinkBase> AsFlowIdSink for Arc<T> {
+    fn as_flow_id(&self) -> FlowId {
+        FlowId::Sink(self.instance_id())
+    }
+}
+
+/// The resolve-side counterpart of [`AsFlowId`]: reconstructs an `Arc<T>`
+/// `#[flow]` argument from a [`FlowResolver`] by position, dispatched the
+/// same "two distinct traits, one shared method name" way.
+pub trait ResolveFlow: Sized {
+    fn resolve_flow(resolver: &FlowResolver<'_>, idx: usize) -> Result<Self, CompError>;
+}
+
+impl<T: SourceBase> ResolveFlow for Arc<T> {
+    fn resolve_flow(resolver: &FlowResolver<'_>, idx: usize) -> Result<Self, CompError> {
+        resolver.source::<T>(idx)
+    }
+}
+
+/// See [`ResolveFlow`] — the sink-side counterpart.
+pub trait ResolveFlowSink: Sized {
+    fn resolve_flow(resolver: &FlowResolver<'_>, idx: usize) -> Result<Self, CompError>;
+}
+
+impl<T: SinkBase> ResolveFlowSink for Arc<T> {
+    fn resolve_flow(resolver: &FlowResolver<'_>, idx: usize) -> Result<Self, CompError> {
+        resolver.sink::<T>(idx)
     }
 }
 
