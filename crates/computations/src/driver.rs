@@ -371,10 +371,10 @@ impl EngineInner {
             let nodes = self.nodes.lock().unwrap();
             let mut affected = CompKeySet::default();
             for (key_id, dep) in resolved {
-                let Some(ids) = index.get(&key_id) else {
+                let Some(refs) = index.get(&key_id) else {
                     continue;
                 };
-                for &id in ids {
+                for id in refs.iter() {
                     if !nodes.contains(id) {
                         continue;
                     }
@@ -762,12 +762,7 @@ impl EngineInner {
 
             {
                 let mut index = self.source_index.lock().unwrap();
-                index.retain(|_, callers| {
-                    for r in &dead_ids {
-                        callers.remove(r);
-                    }
-                    !callers.is_empty()
-                });
+                index.retain(|_, refs| !refs.retain_live(&dead_ids));
             }
             nodes.retain_rdeps_not_in(&dead_ids);
 

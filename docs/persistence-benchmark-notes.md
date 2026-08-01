@@ -3176,3 +3176,191 @@ cargo run -p computations --release --example persist_bench --features testutil,
 cargo run -p computations --release --example hospital_bench --features testutil,alloc-stats
 COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital_bench --features testutil
 ```
+
+## Stage 14 — Zero/One/Many source_index entries
+
+Stage 13 interned `source_index`'s key (`SrcKeyId`, a `u32`) but left its
+value alone: `Mutex<HashMap<SrcKeyId, HashSet<NodeRef>, IdentityBuildHasher>>`.
+An entry's "zero" state is already the *absent* map entry — both
+`EngineInner::reconcile_source_deps` and `driver::liveness_gc` prune an
+entry the moment its last dependent goes away — so every entry that exists
+has **at least one** dependent by construction. The unexploited cost this
+stage targets: an entry with exactly **one** dependent still pays for a
+`HashSet<NodeRef>`'s backing-table allocation to hold a single 8-byte
+`NodeRef`. This is the direct analogue of the Haskell reference engine's
+own `SrcKeyArena` small-size optimisation (commit `2d2a726`,
+`SrcKeyZero`/`SrcKeyOne`/`SrcKeyMany`), applied to this crate's
+already-interned `source_index` rather than to a from-scratch arena.
+
+### Design
+
+`crate::engine::SourceRefs` replaces `HashSet<NodeRef>` as `source_index`'s
+value type:
+
+```rust
+pub(crate) enum SourceRefs {
+    One(NodeRef),
+    Many(HashSet<NodeRef>),
+}
+```
+
+- **Promotion** (`One -> Many`) happens in place, in `SourceRefs::insert`,
+  the first time a second *distinct* `NodeRef` is recorded against a key —
+  used by both `record_source_deps`'s live insert path and
+  `persist::restore_nodes`'s cold rebuild path (both previously called
+  `index.entry(key_id).or_default().insert(caller_r)`, relying on
+  `HashSet::default()`; there is no longer a `Default` impl for
+  `SourceRefs` — the map's `Entry` API is used directly instead, so a
+  vacant entry always starts life as `One`, never an implicit empty
+  `Many`).
+- **Removal** goes through `SourceRefs::remove` (single dependent, used by
+  `reconcile_source_deps`) or `SourceRefs::retain_live` (batch, used by
+  `liveness_gc`'s mark-sweep `HashMap::retain` pass — `One`'s check has to
+  test membership against the *whole* dead-set at once, since looping a
+  single-item removal across a batch would need the batch's *last* id to
+  happen to be the live one, which iteration order doesn't guarantee).
+  Both report whether the entry is now empty; the caller drops the map
+  entry entirely in that case, exactly as before.
+- **Iteration** (`affected_keys`'s read path) goes through
+  `SourceRefs::iter`, a two-armed iterator (`Option<NodeRef>` for `One`,
+  `HashSet`'s own `Iter` for `Many`) so that call site doesn't need to match
+  on the enum itself.
+- **Demotion (`Many -> One`) is not implemented**, matching the Haskell
+  prior's own one-way-promotion decision. Neither of this crate's two
+  benchmarks exercises a key whose dependent count oscillates back down to
+  exactly one without hitting zero first (`persist_bench`'s 300 keys hold a
+  stable ~683 dependents each for the whole run; `hospital_bench`'s ~2.08M
+  keys never exceed one dependent in the first place), so there is no
+  workload here to justify the added complexity and the repeated
+  allocate/discard churn an oscillating key would pay under demotion. If a
+  future workload shows that shape, `SourceRefs::retain_live`/`remove` are
+  exactly where a demotion check would slot in (compare `set.len() == 1`
+  after removal and collapse to `One`).
+- No public API change: `SourceRefs` is `pub(crate)`, only ever seen inside
+  `engine.rs`/`driver.rs`/`persist.rs`.
+
+**This is not Stage 5's rejected `SmallVec` experiment, despite the
+surface similarity ("give a container inline capacity for its common
+size").** Stage 5 measured-and-reverted `SmallVec<[NodeRef; N]>` for
+`source_deps`/`outputs` because *most nodes have zero* of those — a node
+that reads no sources and produces no sink outputs is common, and
+`SmallVec`'s inline capacity is paid unconditionally on every node whether
+or not it's ever used, losing to a never-allocated empty `HashSet`. A
+`source_index` entry is never in that position: it doesn't exist at all
+(no map entry, no allocation of any kind) until it has a first dependent,
+by the pruning invariant above. There is no "wasted inline slot on an
+empty container" case for `SourceRefs` to lose to — only "one slot
+suffices for the common single-dependent case, promote when a second
+distinct dependent shows up" — which is exactly the shape where a
+size-1-then-N small-size optimization pays off rather than backfires.
+
+### Measurements
+
+`uptime` load average ranged **~4.0–7.4** (1-min figures 4.02 at session
+start, 7.43/6.08 immediately before the "before" runs, 7.32 immediately
+before the "after" runs) across this stage's benchmark session — broadly
+similar on both sides, but this box is frequently loaded and RSS in
+particular swings by tens of MB between repeated runs of the *identical*
+binary at this load, so (as in every prior stage) the deterministic
+byte-counted metrics (`allocated_bytes`, db size, rerun counts) are what
+this stage's conclusion rests on; RSS is reported alongside for
+completeness. Both sides are same-session, stash/pop A/B pairs (this
+stage's changes stashed for "before", popped back for "after") so load
+conditions match as closely as this machine allows.
+
+**`persist_bench`, default scale** (shared-key: 300 distinct keys, ~683
+dependents/key each — nearly every `source_index` entry is `Many`):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| phase 5 (engine-only RSS), 6 samples each | 290.5–330.5 MB, avg 297.3 MB | 290.8–328.9 MB, avg 302.6 MB | +5.3 MB / +1.8% (noise: both sides include a ~330 MB single-run spike, and the ranges fully overlap) |
+| phase 5 `allocated_bytes` (net), 2 samples each | 325,219,346 B (both trials, identical) | 325,219,346 B / 325,219,586 B | +240 B on one trial, +0.00007% — noise floor |
+| `persist_now` db size | 269.49 MB | 269.49 MB | byte-identical, every run |
+| `record_source_deps/source_index` lock share, phase 1 | 1.42–2.63% across 6 sampled runs | 1.42–2.27% across 6 sampled runs | unchanged within run-to-run spread |
+| `remove_stale_source_index` lock share, phase 1 | 0.24–0.45% | 0.24–0.45% | unchanged |
+| reruns, every phase | exact-match every run | exact-match every run | identical |
+
+**Neutral, as predicted.** `persist_bench`'s keys are essentially all
+`Many` from their first or second dependent onward (683 dependents each),
+so this change adds one enum discriminant and one extra branch per
+`source_index` operation on a workload that reaches the `Many` arm
+immediately and stays there — the same "control, must not regress" role
+Stage 7's Haskell existing-benchmark and this crate's own Stage 13 table
+already established for this workload. The deterministic metric
+(`allocated_bytes`) confirms it: 240 bytes apart on a 325 MB base is
+noise, not a regression, and every RSS sample on both sides falls inside
+the same ~40 MB band this box's load already produces run-to-run on an
+*unchanged* binary (see Stage 13's own phase-5 noise discussion).
+
+**`hospital_bench`, default scale** (unshared-key: ~2.08M distinct keys, ~1
+dependent/key each — nearly every `source_index` entry is `One`):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| cold-eval RSS, 3 samples each | 1209.3–1244.3 MB, avg 1221.0 MB | 1112.5–1129.0 MB, avg 1120.4 MB | **−100.6 MB, −8.24%** |
+| cold-eval `allocated_bytes` (net) | 1,239,604,594 B (1239.6 MB) | 1,148,788,594 B (1148.8 MB) | **−90.8 MB, −7.33%** |
+| `record_source_deps/source_index` lock share (phases 1–3) | 2,081,168 calls, 0.134 s, 6.41% | 2,081,168 calls, 0.095 s, 4.68% | −29.4% of this site's own time |
+| cold-eval wall time | 3739–3998 ms | 3512–3894 ms | flat-to-slightly-faster (reported, not relied on) |
+| reruns, cold / rerun-heavy | 1,116,093 / 1,444 | 1,116,093 / 1,444 | identical, every run |
+
+**A real, reproducible win on the workload this stage targeted.** Every
+sample on the "after" side beats every sample on the "before" side for
+both RSS and `allocated_bytes` — no overlap, unlike `persist_bench`'s
+noise band above. The deterministic `allocated_bytes` drop (−7.33%) is
+close to the RSS drop (−8.24%), same relationship Stage 13 saw for the
+opposite reason (RSS also captures allocator per-allocation overhead,
+which shrinks further here since ~2.08M single-element `HashSet`
+allocations are gone entirely, replaced by an inline enum variant with no
+heap allocation at all). `record_source_deps/source_index`'s own lock-held
+time drops by a relative 29%, consistent with skipping a `HashSet`
+construction (hasher init, single-bucket table allocation) on every
+first-and-only insert. Reruns matched exactly on both sides, confirming
+no behavior change.
+
+### Comparison to the Haskell prior
+
+The Haskell `SrcKeyArena` optimisation measured `max_live_bytes` 4,310.3 →
+4,012.4 MB (**−6.91%**) on its own unshared-key Hospital workload, plus a
+smaller cold-eval `allocated_bytes` drop (−1.34%), with its shared-key
+control moving by noise only (+0.004%). This stage lands in the same
+place, workload for workload: our unshared-key `hospital_bench` improves
+(−8.24% RSS / −7.33% `allocated_bytes`, slightly larger than Haskell's
+figure — plausibly because our `HashSet<NodeRef>` held only a single
+8-byte element per entry pre-change with no version/generation bytes
+alongside it, so the *entire* backing-table allocation was pure overhead
+being removed, versus Haskell's arena which still carried some per-key
+`IORef` overhead even in the `SrcKeyOne` case per their own Stage 7 notes),
+while our shared-key control (`persist_bench`) moves by noise only, same
+as theirs. Both engines independently arrived at the identical
+Zero/One/Many shape for the identical reason: an interned-key reverse
+index's single-dependent case is the common one on an unshared-key
+workload, and a HashSet-shaped container is the wrong default for holding
+exactly one element.
+
+### Verdict: kept
+
+`hospital_bench` — the workload this stage was motivated by — improves by
+a real, reproducible margin with no overlapping samples between before and
+after; `persist_bench` — the workload predicted to be neutral-at-best —
+lands within noise on every metric, deterministic and otherwise, with no
+observed regression. The two workloads' predicted-and-confirmed
+disagreement is exactly the shape the task called out in advance ("hospital
+wins, persist neutral"), not an average to paper over: `hospital_bench`'s
+win is kept without qualification, and `persist_bench`'s neutrality is
+reported as such rather than folded into a blended number. Public API is
+unchanged, persisted format and db size are unaffected (`source_index` was
+never persisted — only `NodeRecord::source_deps`, which this stage does not
+touch), and the full test suite (including reclamation and per-dependent
+version-tracking tests) passes unmodified.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **134 passed**, same count as
+Stage 13 (no new test added: `SourceRefs`'s behavior is already covered
+transitively by every existing `source_index`-touching test —
+`reconcile_source_deps`, `affected_keys`, `liveness_gc` reclamation, and
+`persist::restore_nodes` — since a wrong promotion/demotion/iteration would
+fail those directly, e.g. a dependent silently dropped from notification).
+`cargo test -p computations --features testutil,alloc-stats` — all green
+standalone. `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean.

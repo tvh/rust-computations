@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::def::ErasedDef;
-use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable};
+use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable, SourceRefs};
 use crate::flow::FlowId;
 use crate::interner::{SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
@@ -1178,7 +1178,12 @@ impl EngineInner {
         {
             let mut source_index = self.source_index.lock().unwrap();
             for (key_id, r) in source_index_entries {
-                source_index.entry(key_id).or_default().insert(r);
+                match source_index.entry(key_id) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(SourceRefs::One(r));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut occ) => occ.get_mut().insert(r),
+                }
             }
         }
 

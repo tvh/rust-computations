@@ -28,6 +28,7 @@
 //! keeps around.
 
 use std::any::Any;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -132,6 +133,123 @@ pub(crate) struct DefIndex(u16);
 pub(crate) struct NodeRef {
     pub(crate) def: DefIndex,
     pub(crate) row: u32,
+}
+
+/// Small-size optimization for `source_index`'s value (Stage 14 — see
+/// `docs/persistence-benchmark-notes.md`).
+///
+/// A `source_index` entry's "zero" state is already the *absent* map entry
+/// (both `EngineInner::reconcile_source_deps` and `driver::liveness_gc`
+/// prune an entry the moment its last dependent goes away — see below), so
+/// every entry that exists has **at least one** dependent by construction.
+/// `One` holds that common single dependent inline, with no backing-table
+/// allocation at all; `Many` is the always-allocated `HashSet<NodeRef>` the
+/// map used to store unconditionally, reached on a key's second *distinct*
+/// dependent. This is the same shape as the Haskell reference engine's
+/// `SrcKeyZero`/`SrcKeyOne`/`SrcKeyMany` (their commit `2d2a726`), applied
+/// to this crate's already-interned `source_index`.
+///
+/// **Not the same reasoning as Stage 5's rejected `SmallVec` experiment**
+/// for `source_deps`/`outputs`: those containers are legitimately empty on
+/// *most nodes* (a node with no source reads has zero `source_deps`), so an
+/// inline `SmallVec` slot was paid on every node whether or not it was ever
+/// used, and lost to a never-allocated empty `HashSet`. A `source_index`
+/// entry is never in that position — it doesn't exist at all until it has a
+/// first dependent — so there is no "wasted inline capacity on an empty
+/// container" case here, only "one slot suffices for the common case,
+/// promote when a second distinct dependent shows up."
+///
+/// Promotion (`One` -> `Many`) is one-way, matching the Haskell prior:
+/// `Many` never demotes back to `One` when a set shrinks to a single
+/// element, only all the way to the absent-entry "zero" state when its last
+/// dependent is removed (see [`Self::remove`]/[`Self::retain_live`]).
+/// `persist_bench`'s workload keeps every key at ~683 stable dependents
+/// (no key oscillates between `Many` and `One`), and `hospital_bench`'s
+/// keys never grow past one dependent in the first place, so this crate has
+/// the same "no oscillating-dependent-count workload to justify the
+/// complexity" absence of a demonstrated payoff the Haskell haddock cites
+/// for skipping demotion there.
+#[derive(Debug)]
+pub(crate) enum SourceRefs {
+    One(NodeRef),
+    Many(HashSet<NodeRef>),
+}
+
+impl SourceRefs {
+    /// Inserts `r`, promoting `One -> Many` in place the first time a
+    /// second *distinct* dependent is recorded against this key.
+    pub(crate) fn insert(&mut self, r: NodeRef) {
+        match self {
+            SourceRefs::One(existing) => {
+                if *existing != r {
+                    let mut set = HashSet::with_capacity(2);
+                    set.insert(*existing);
+                    set.insert(r);
+                    *self = SourceRefs::Many(set);
+                }
+            }
+            SourceRefs::Many(set) => {
+                set.insert(r);
+            }
+        }
+    }
+
+    /// Removes a single dependent `r`. Returns `true` once this entry has
+    /// no dependents left, in which case the caller must drop the whole
+    /// entry from the map — an absent entry, not an empty container, is
+    /// this type's "zero" state.
+    pub(crate) fn remove(&mut self, r: NodeRef) -> bool {
+        match self {
+            SourceRefs::One(existing) => *existing == r,
+            SourceRefs::Many(set) => {
+                set.remove(&r);
+                set.is_empty()
+            }
+        }
+    }
+
+    /// Batch removal for `driver::liveness_gc`'s mark-sweep pass: removes
+    /// every dependent in `dead` from this entry in one call. Returns `true`
+    /// once no dependents remain (same "drop the whole entry" contract as
+    /// [`Self::remove`]). Kept separate from `remove` (rather than looping
+    /// `remove` once per dead id) because `One`'s check has to test
+    /// membership in the whole `dead` set at once — looping a single-item
+    /// `remove` across a batch would need the *last* dead id checked to
+    /// happen to be the live one, which isn't guaranteed by iteration order.
+    pub(crate) fn retain_live(&mut self, dead: &HashSet<NodeRef>) -> bool {
+        match self {
+            SourceRefs::One(existing) => dead.contains(existing),
+            SourceRefs::Many(set) => {
+                for r in dead {
+                    set.remove(r);
+                }
+                set.is_empty()
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> SourceRefsIter<'_> {
+        match self {
+            SourceRefs::One(r) => SourceRefsIter::One(Some(*r)),
+            SourceRefs::Many(set) => SourceRefsIter::Many(set.iter()),
+        }
+    }
+}
+
+pub(crate) enum SourceRefsIter<'a> {
+    One(Option<NodeRef>),
+    Many(std::collections::hash_set::Iter<'a, NodeRef>),
+}
+
+impl Iterator for SourceRefsIter<'_> {
+    type Item = NodeRef;
+
+    fn next(&mut self) -> Option<NodeRef> {
+        match self {
+            SourceRefsIter::One(opt) => opt.take(),
+            SourceRefsIter::Many(it) => it.next().copied(),
+        }
+    }
 }
 
 /// The small set of mutually-exclusive/boolean bits packed into one byte
@@ -832,8 +950,12 @@ pub(crate) struct EngineInner {
     /// with [`IdentityBuildHasher`]: an id is an opaque process-local `u32`
     /// this process itself assigned, never adversary-chosen byte content —
     /// see `crate::hashers`'s docs on why that's exactly the shape of key
-    /// this hasher is safe for.
-    pub(crate) source_index: Mutex<HashMap<SrcKeyId, HashSet<NodeRef>, IdentityBuildHasher>>,
+    /// this hasher is safe for. Value is [`SourceRefs`], a `One`/`Many`
+    /// small-size optimization over the single-dependent case (Stage 14 —
+    /// see `docs/persistence-benchmark-notes.md`, and [`SourceRefs`]'s own
+    /// docs for why this differs from Stage 5's rejected `SmallVec`
+    /// experiment).
+    pub(crate) source_index: Mutex<HashMap<SrcKeyId, SourceRefs, IdentityBuildHasher>>,
     /// Refcounted `(SourceId, key bytes) -> SrcKeyId` interner backing
     /// `source_deps`/`source_index` — see [`crate::interner`]'s module
     /// docs for the full design (including reclamation and why versions
@@ -1304,11 +1426,10 @@ impl EngineInner {
             {
                 let mut index = self.source_index.lock().unwrap();
                 for &id in &dropped {
-                    if let Some(set) = index.get_mut(&id) {
-                        set.remove(&r);
-                        if set.is_empty() {
-                            index.remove(&id);
-                        }
+                    if let Entry::Occupied(mut occ) = index.entry(id)
+                        && occ.get_mut().remove(r)
+                    {
+                        occ.remove();
                     }
                 }
             }
@@ -1653,7 +1774,12 @@ impl EngineInner {
         self.timed(crate::lock_stats::LockSite::RecordSourceDepsIndex, || {
             let mut index = self.source_index.lock().unwrap();
             for dep in interned {
-                index.entry(dep.key_id).or_default().insert(caller_r);
+                match index.entry(dep.key_id) {
+                    Entry::Vacant(v) => {
+                        v.insert(SourceRefs::One(caller_r));
+                    }
+                    Entry::Occupied(mut occ) => occ.get_mut().insert(caller_r),
+                }
             }
         });
     }
