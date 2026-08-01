@@ -5,6 +5,8 @@
 //! re-running only the computations affected by them (with early cutoff when
 //! a recomputed value is unchanged).
 
+#[cfg(feature = "alloc-stats")]
+pub mod alloc_stats;
 pub mod ctx;
 pub mod def;
 pub mod driver;
@@ -13,10 +15,20 @@ pub mod error;
 pub mod flow;
 mod hashers;
 pub mod key;
+mod lock_stats;
 pub mod persist;
 pub mod registry;
 pub mod sink;
 pub mod source;
+
+/// Installed only when the off-by-default `alloc-stats` cargo feature is
+/// enabled (see `crate::alloc_stats`'s module docs) — an ordinary build has
+/// no `#[global_allocator]` here at all and uses the platform default, so
+/// every benchmark number measured without this feature is bit-for-bit
+/// unaffected by its existence.
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_stats::CountingAlloc = alloc_stats::CountingAlloc;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

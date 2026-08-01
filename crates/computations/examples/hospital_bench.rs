@@ -128,6 +128,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "alloc-stats")]
+use computations::alloc_stats;
 use computations::error::SourceError;
 use computations::testutil::{VecSink, WriteDoc};
 use computations::{Comp, Dep, Engine, Registry, Request, Source, SourceBase, SourceId};
@@ -950,6 +952,23 @@ fn report(label: &str, ms: u128, reruns: usize) {
     println!("RESULT|{label}|{ms}|{reruns}|{rss:.1}");
 }
 
+/// Prints this phase's own allocated/deallocated-byte delta (see
+/// `computations::alloc_stats`'s module docs and `persist_bench.rs`'s
+/// identical helper) between `before` and `after`. Absent from stdout
+/// entirely unless the `alloc-stats` feature is enabled.
+#[cfg(feature = "alloc-stats")]
+fn report_alloc_delta(label: &str, before: alloc_stats::AllocSnapshot, after: alloc_stats::AllocSnapshot) {
+    let delta = before.delta(&after);
+    println!(
+        "allocated_bytes ({label}): {} ({:.1} MB), deallocated_bytes: {} ({:.1} MB), net: {} B",
+        delta.allocated,
+        delta.allocated as f64 / 1_000_000.0,
+        delta.deallocated,
+        delta.deallocated as f64 / 1_000_000.0,
+        delta.net()
+    );
+}
+
 struct PhaseResult {
     label: String,
     ms: u128,
@@ -1096,6 +1115,8 @@ async fn run_main_phase(settle_signal: &Arc<AtomicU64>, round_signal: &Arc<Atomi
     let (engine, root) = build_graph(&srcs, &sink, &counter, patient_count, ward_count);
 
     // 1. Cold eval.
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before_cold = alloc_stats::snapshot();
     let baseline = settle_signal.load(Ordering::SeqCst);
     let t0 = Instant::now();
     let handle = {
@@ -1105,6 +1126,8 @@ async fn run_main_phase(settle_signal: &Arc<AtomicU64>, round_signal: &Arc<Atomi
     wait_for_signal(settle_signal, baseline, phase_timeout).await;
     let cold_ms = t0.elapsed().as_millis();
     let cold_reruns = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta("1. cold eval", alloc_before_cold, alloc_stats::snapshot());
     eprintln!(
         "  -> achieved instance count: {cold_reruns} (target {target_instances}, {:+.2}%)",
         (cold_reruns as f64 - target_instances as f64) / target_instances as f64 * 100.0
@@ -1121,11 +1144,15 @@ async fn run_main_phase(settle_signal: &Arc<AtomicU64>, round_signal: &Arc<Atomi
     // `patient_summary`'s cross-system batch.
     let round_baseline = round_signal.load(Ordering::SeqCst);
     let reruns_before = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before_live = alloc_stats::snapshot();
     let t1 = Instant::now();
     srcs.vitals.set(&vital_value_key(0, 0), &"x".repeat(40));
     wait_for_signal(round_signal, round_baseline, phase_timeout).await;
     let live_ms = t1.elapsed().as_millis();
     let live_reruns = counter.load(Ordering::Relaxed) - reruns_before;
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta("2. live incremental", alloc_before_live, alloc_stats::snapshot());
     report("2. live incremental, 1 changed vitals key", live_ms, live_reruns);
 
     println!("SOURCE|--- source calls (after phases 1-2) ---");
@@ -1150,6 +1177,13 @@ async fn run_main_phase(settle_signal: &Arc<AtomicU64>, round_signal: &Arc<Atomi
     if rerun_keys > 0 {
         run_rerun_heavy_phase(&srcs, &counter, patient_count, rerun_keys, rerun_loops, phase_timeout).await;
     }
+
+    // Cumulative over this engine's whole lifetime (phases 1-3 combined) --
+    // see `Engine::print_lock_stats`'s docs on why this benchmark reports
+    // one "engine shutdown" breakdown rather than a per-phase delta (no
+    // reset primitive exists, mirroring the Haskell reference engine's own
+    // once-at-close report).
+    engine.print_lock_stats();
 
     handle.abort();
     let _ = handle.await;
@@ -1199,6 +1233,8 @@ async fn run_rerun_heavy_phase(
     rerun_loops: usize,
     phase_timeout: Duration,
 ) {
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before = alloc_stats::snapshot();
     let t0 = Instant::now();
     let reruns_before = counter.load(Ordering::Relaxed);
     let all_srcs = [&srcs.adt, &srcs.vitals, &srcs.labs, &srcs.pharmacy, &srcs.notes];
@@ -1221,6 +1257,8 @@ async fn run_rerun_heavy_phase(
     let reruns = final_count - reruns_before;
     let total_keys = rerun_keys * rerun_loops;
 
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta("3. rerun-heavy live update", alloc_before, alloc_stats::snapshot());
     report(
         &format!("3. rerun-heavy live update ({total_keys} keys mutated)"),
         rerun_ms,

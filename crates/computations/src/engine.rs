@@ -852,9 +852,38 @@ pub(crate) struct EngineInner {
     /// is filled in exactly once, asynchronously, after `EngineInner`
     /// itself already exists as an `Arc`; never contended in practice.
     pub(crate) persist: Mutex<Option<Arc<PersistHandle>>>,
+    /// Whether `COMPUTATIONS_LOCK_STATS` was read as enabled at
+    /// `EngineBuilder::build()` time -- read exactly once, there, and never
+    /// again (see `crate::lock_stats`'s module docs for why a per-call
+    /// re-check would itself perturb the measurement). [`Self::timed`]
+    /// branches on this plain `bool`, never on a fresh env lookup.
+    pub(crate) lock_stats_enabled: bool,
+    /// Per-call-site lock-hold-time accumulators, written to only when
+    /// `lock_stats_enabled` is set -- see [`Self::timed`] and
+    /// `crate::lock_stats`.
+    pub(crate) lock_stats: crate::lock_stats::LockStats,
 }
 
 impl EngineInner {
+    /// Times `f` (expected to be one semantic critical section -- see
+    /// `crate::lock_stats::LockSite`'s docs for the naming convention) and
+    /// records its elapsed time under `site`, but only when
+    /// `lock_stats_enabled` was set at build time. When disabled this costs
+    /// exactly one predictable branch: no `Instant::now`, no atomic write.
+    /// See `crate::lock_stats`'s module docs for why the enabled/disabled
+    /// decision itself is never re-read here.
+    #[inline]
+    pub(crate) fn timed<T>(&self, site: crate::lock_stats::LockSite, f: impl FnOnce() -> T) -> T {
+        if self.lock_stats_enabled {
+            let t0 = Instant::now();
+            let out = f();
+            self.lock_stats.record(site, t0.elapsed());
+            out
+        } else {
+            f()
+        }
+    }
+
     fn get_def<P: CompParam, R: CompResult>(&self, id: &DefId) -> Result<Arc<CompDef<P, R>>, CompError> {
         let any = {
             let defs = self.defs.lock().unwrap();
@@ -971,45 +1000,48 @@ impl EngineInner {
             )));
         }
 
-        let mut nodes = self.nodes.lock().unwrap();
+        self.timed(crate::lock_stats::LockSite::Prepare, || {
+            let mut nodes = self.nodes.lock().unwrap();
 
-        if let Some(r) = nodes.id_of(key) {
-            if nodes.state(r) == NodeState::Clean
-                && let Some(v) = def.read_value(r.row)
-            {
-                return Ok(Action::CacheHit(v));
+            if let Some(r) = nodes.id_of(key) {
+                if nodes.state(r) == NodeState::Clean
+                    && let Some(v) = def.read_value(r.row)
+                {
+                    return Ok(Action::CacheHit(v));
+                }
+                if let Some(shared) = nodes.inflight_get(r) {
+                    return Ok(Action::Join(shared));
+                }
+            } else {
+                // A genuinely new node: this is the one point `param_bytes`
+                // was "first serialized" for it (`Self::eval` serializes on
+                // every call, cache hit or not, but only a first-sight
+                // `param` ever reaches this branch and actually gets
+                // stored) — see `debug_check_param_determinism`'s docs for
+                // what this checks and why. Debug-only, so a release build
+                // pays nothing here.
+                #[cfg(debug_assertions)]
+                debug_check_param_determinism::<P>(key, param_bytes);
             }
-            if let Some(shared) = nodes.inflight_get(r) {
-                return Ok(Action::Join(shared));
-            }
-        } else {
-            // A genuinely new node: this is the one point `param_bytes` was
-            // "first serialized" for it (`Self::eval` serializes on every
-            // call, cache hit or not, but only a first-sight `param` ever
-            // reaches this branch and actually gets stored) — see
-            // `debug_check_param_determinism`'s docs for what this checks
-            // and why. Debug-only, so a release build pays nothing here.
-            #[cfg(debug_assertions)]
-            debug_check_param_determinism::<P>(key, param_bytes);
-        }
 
-        let r = nodes.get_or_insert(key, || param_bytes.to_vec());
+            let r = nodes.get_or_insert(key, || param_bytes.to_vec());
 
-        let old_hash = nodes.result_hash(r);
-        nodes.set_state(r, NodeState::Running);
-        nodes.clear_comp_deps(r);
+            let old_hash = nodes.result_hash(r);
+            nodes.set_state(r, NodeState::Running);
+            nodes.clear_comp_deps(r);
 
-        let old_outputs = nodes.take_outputs(r);
-        let old_source_deps = nodes.take_source_deps(r);
+            let old_outputs = nodes.take_outputs(r);
+            let old_source_deps = nodes.take_source_deps(r);
 
-        Ok(Action::Run(
-            r,
-            PreRunSnapshot {
-                old_hash,
-                old_outputs,
-                old_source_deps,
-            },
-        ))
+            Ok(Action::Run(
+                r,
+                PreRunSnapshot {
+                    old_hash,
+                    old_outputs,
+                    old_source_deps,
+                },
+            ))
+        })
     }
 
     /// Actually runs the computation for `key`/`node_ref`, building its
@@ -1105,10 +1137,10 @@ impl EngineInner {
         });
         let shared: SharedExec = fut.shared();
 
-        {
+        self.timed(crate::lock_stats::LockSite::RunSetInflight, || {
             let mut nodes = self.nodes.lock().unwrap();
             nodes.inflight_set(node_ref, shared.clone());
-        }
+        });
 
         let outcome = shared.await;
 
@@ -1116,7 +1148,7 @@ impl EngineInner {
             Ok((value_any, hash, elapsed)) => {
                 let changed = old_hash != Some(hash);
                 let value: R = downcast_value::<R>(value_any, key)?;
-                let (new_source_deps, new_outputs) = {
+                let (new_source_deps, new_outputs) = self.timed(crate::lock_stats::LockSite::RunFinishSuccess, || {
                     let mut nodes = self.nodes.lock().unwrap();
                     nodes.set_result(node_ref, hash);
                     nodes.set_last_changed(node_ref, changed);
@@ -1144,7 +1176,7 @@ impl EngineInner {
                     let new_source_deps = nodes.source_deps_clone(node_ref);
                     let new_outputs = nodes.outputs_clone(node_ref);
                     (new_source_deps, new_outputs)
-                };
+                });
 
                 self.remove_stale_source_index(node_ref, &old_source_deps, &new_source_deps);
 
@@ -1169,9 +1201,11 @@ impl EngineInner {
                 // Errors are not memoized: leave the node `Dirty` (not
                 // `Clean`) so the next eval retries instead of reusing the
                 // stale (or absent) value.
-                let mut nodes = self.nodes.lock().unwrap();
-                nodes.set_state(node_ref, NodeState::Dirty);
-                nodes.inflight_clear(node_ref);
+                self.timed(crate::lock_stats::LockSite::RunFinishError, || {
+                    let mut nodes = self.nodes.lock().unwrap();
+                    nodes.set_state(node_ref, NodeState::Dirty);
+                    nodes.inflight_clear(node_ref);
+                });
                 tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 Err(e)
             }
@@ -1201,19 +1235,21 @@ impl EngineInner {
         }
         let new_pairs: HashSet<(SourceId, KeyBytes)> =
             new.iter().map(|dep| (dep.source.clone(), dep.key.clone())).collect();
-        let mut index = self.source_index.lock().unwrap();
-        for dep in old {
-            let idx_key = (dep.source.clone(), dep.key.clone());
-            if new_pairs.contains(&idx_key) {
-                continue;
-            }
-            if let Some(set) = index.get_mut(&idx_key) {
-                set.remove(&r);
-                if set.is_empty() {
-                    index.remove(&idx_key);
+        self.timed(crate::lock_stats::LockSite::RemoveStaleSourceIndex, || {
+            let mut index = self.source_index.lock().unwrap();
+            for dep in old {
+                let idx_key = (dep.source.clone(), dep.key.clone());
+                if new_pairs.contains(&idx_key) {
+                    continue;
+                }
+                if let Some(set) = index.get_mut(&idx_key) {
+                    set.remove(&r);
+                    if set.is_empty() {
+                        index.remove(&idx_key);
+                    }
                 }
             }
-        }
+        });
     }
 
     async fn delete_dropped_outputs(&self, dropped: HashSet<RawOutput>) {
@@ -1491,11 +1527,13 @@ impl EngineInner {
     /// stays small in practice, and a `SmallVec` has no hash table to check
     /// in O(1) anyway.
     pub(crate) fn record_call_dep(&self, caller: &CompKey, callee: &CompKey) {
-        let mut nodes = self.nodes.lock().unwrap();
-        if let (Some(caller_r), Some(callee_r)) = (nodes.id_of(caller), nodes.id_of(callee)) {
-            nodes.push_comp_dep(caller_r, callee_r);
-            nodes.push_rdep(callee_r, caller_r);
-        }
+        self.timed(crate::lock_stats::LockSite::RecordCallDep, || {
+            let mut nodes = self.nodes.lock().unwrap();
+            if let (Some(caller_r), Some(callee_r)) = (nodes.id_of(caller), nodes.id_of(callee)) {
+                nodes.push_comp_dep(caller_r, callee_r);
+                nodes.push_rdep(callee_r, caller_r);
+            }
+        });
     }
 
     pub(crate) fn mark_root(&self, key: CompKey) {
@@ -1506,29 +1544,33 @@ impl EngineInner {
         if raw.is_empty() {
             return;
         }
-        let caller_r = {
+        let caller_r = self.timed(crate::lock_stats::LockSite::RecordSourceDepsNodes, || {
             let mut nodes = self.nodes.lock().unwrap();
             let r = nodes.id_of(caller);
             if let Some(r) = r {
                 nodes.extend_source_deps(r, &raw);
             }
             r
-        };
+        });
         let Some(caller_r) = caller_r else { return };
-        let mut index = self.source_index.lock().unwrap();
-        for dep in raw {
-            index.entry((dep.source, dep.key)).or_default().insert(caller_r);
-        }
+        self.timed(crate::lock_stats::LockSite::RecordSourceDepsIndex, || {
+            let mut index = self.source_index.lock().unwrap();
+            for dep in raw {
+                index.entry((dep.source, dep.key)).or_default().insert(caller_r);
+            }
+        });
     }
 
     pub(crate) fn record_outputs(&self, caller: &CompKey, raw: HashSet<RawOutput>) {
         if raw.is_empty() {
             return;
         }
-        let mut nodes = self.nodes.lock().unwrap();
-        if let Some(r) = nodes.id_of(caller) {
-            nodes.extend_outputs(r, &raw);
-        }
+        self.timed(crate::lock_stats::LockSite::RecordOutputs, || {
+            let mut nodes = self.nodes.lock().unwrap();
+            if let Some(r) = nodes.id_of(caller) {
+                nodes.extend_outputs(r, &raw);
+            }
+        });
     }
 }
 
@@ -1645,6 +1687,29 @@ impl Engine {
             chain: Arc::new(Vec::new()),
         };
         ctx.eval_flows(name, flows, param).await
+    }
+
+    /// Whether `COMPUTATIONS_LOCK_STATS` was read as enabled when this
+    /// engine was built (see [`EngineBuilder::build`] and
+    /// `crate::lock_stats`'s module docs). Lets a caller (typically a
+    /// benchmark) decide whether it's worth calling [`Self::print_lock_stats`]
+    /// at all.
+    pub fn lock_stats_enabled(&self) -> bool {
+        self.inner.lock_stats_enabled
+    }
+
+    /// Prints the per-call-site lock-hold-time breakdown collected so far
+    /// (see `crate::lock_stats`) to stdout, sorted by total hold time
+    /// descending. A no-op -- prints nothing -- if `COMPUTATIONS_LOCK_STATS`
+    /// wasn't enabled at build time. Safe to call at any point in the
+    /// engine's lifetime, including mid-run; a benchmark typically calls
+    /// this once, near the end of a phase or its own run, as its "engine
+    /// shutdown" report (mirroring the Haskell reference engine's
+    /// `COMP_ENGINE_LOCK_STATS`, printed once at engine close).
+    pub fn print_lock_stats(&self) {
+        if self.inner.lock_stats_enabled {
+            print!("{}", self.inner.lock_stats.report());
+        }
     }
 }
 
@@ -1973,6 +2038,17 @@ impl EngineBuilder {
             "engine has {} registered computations, exceeding the u16::MAX+1 DefIndex capacity",
             self.def_order.len()
         );
+        // Read once, here, rather than per critical section: `EngineInner::timed`
+        // is on the hottest path in the engine (every `nodes`/`source_index`
+        // critical section, millions of times at 1M-instance scale), so the
+        // enabled/disabled decision has to be made once, at build time, and
+        // baked into this plain `bool` -- not re-checked on every call. See
+        // `crate::lock_stats`'s module docs (this mirrors the Haskell
+        // reference engine's `COMP_ENGINE_LOCK_STATS` design point exactly).
+        let lock_stats_enabled = match std::env::var_os("COMPUTATIONS_LOCK_STATS") {
+            None => false,
+            Some(v) => !v.is_empty() && v != "0",
+        };
         Engine {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
@@ -1986,6 +2062,8 @@ impl EngineBuilder {
                 def_names: self.def_names,
                 persist_opts: self.persist_opts,
                 persist: Mutex::new(None),
+                lock_stats_enabled,
+                lock_stats: crate::lock_stats::LockStats::new(),
             }),
         }
     }

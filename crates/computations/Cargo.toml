@@ -6,6 +6,12 @@ edition = "2024"
 [features]
 default = ["macros"]
 testutil = []
+# Installs a counting `#[global_allocator]` wrapper (`crate::alloc_stats`)
+# that tracks bytes allocated/deallocated, for benchmarks to report a
+# per-phase allocation delta alongside RSS. Off by default so an ordinary
+# build/benchmark run is bit-for-bit unaffected -- see
+# `docs/persistence-benchmark-notes.md`'s Stage 12.
+alloc-stats = []
 # The `#[computation]` proc-macro plus its runtime support (automatic
 # `inventory`-based registration -- see `crate::flow::ComputationEntry`'s
 # docs for the mechanism and its platform caveats). Default-on so

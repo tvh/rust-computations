@@ -2616,3 +2616,295 @@ HOSPITAL_BENCH_RERUN_KEYS=1000 HOSPITAL_BENCH_RERUN_LOOPS=3 \
 `HOSPITAL_BENCH_PHASE` (`main` or `demo`) is the internal re-exec switch
 (mirrors `PERSIST_BENCH_PHASE`); it isn't meant to be set by hand.
 
+## Stage 12 — instrumentation: allocation deltas and lock-hold attribution
+
+Two prerequisites for judging the next round of optimization candidates,
+both ported from `haskell-computations`'s own instrumentation work
+(`docs/benchmark-notes.md` there, commits `4d95a3f` for allocation deltas,
+`572cc06`/`198cd75` for lock-hold stats): RSS only shows peaks, which is
+blind to a fix that reduces churn without moving the peak (exactly what
+that repo's own Stage 10 found); and Stage 6 of this doc flagged the global
+`Mutex<NodeTable>` with only an aggregate "0.7% direct wait" figure, which
+cannot say whether — or where — sharding it would help.
+
+### Instrument 1 — allocated-bytes delta per phase
+
+`crate::alloc_stats` (`crates/computations/src/alloc_stats.rs`) installs a
+`GlobalAlloc` wrapper (`CountingAlloc`, delegating every call to `System`)
+behind an off-by-default `alloc-stats` cargo feature
+(`crates/computations/Cargo.toml`), gated at the `#[global_allocator]`
+declaration itself (`lib.rs`) so an ordinary build has no custom allocator
+at all — every number in this document prior to this stage was measured
+without it and stays comparable. Two `Relaxed` `AtomicU64`s
+(`ALLOCATED`/`DEALLOCATED`) accumulate bytes across every `alloc`/`dealloc`/
+`alloc_zeroed`/`realloc` call; `snapshot()` reads both, and
+`AllocSnapshot::delta` turns two snapshots into a phase's own allocation
+independent of when GC/OS reclamation happens to run — mirroring GHC's
+`allocated_bytes` (`getRTSStats`) exactly, down to the "delta, not
+cumulative total" design point.
+
+Both benchmarks sample a snapshot before and after each phase (cold eval,
+each restart trial, the live-incremental settle, the rerun-heavy phase) and
+print an `allocated_bytes (<phase>): N (X MB), deallocated_bytes: ..., net:
+...` line, entirely absent from stdout when the feature is off (every
+`#[cfg(feature = "alloc-stats")]`-guarded call site compiles to nothing).
+
+**Enable with**: `--features testutil,alloc-stats` on either example, e.g.
+`cargo run -p computations --release --example persist_bench --features
+testutil,alloc-stats`.
+
+**Overhead measured**: comparing `persist_bench`/`hospital_bench` with vs.
+without the feature (same box, same session, load average 4.6–8.3 across
+the runs below — see "the matrix" for the full load context), every phase's
+allocation-instrumented wall time landed within noise of its baseline: -8.6%
+to +12.5% across `persist_bench`'s eleven phases (straddling zero, no
+consistent direction), +1.6% to +8.6% across `hospital_bench`'s four. A
+single global atomic pair proved cheap enough at this crate's ~1M-instance,
+multi-threaded-tokio-runtime scale that sharded/per-thread counters were not
+needed in practice — worth revisiting only if a future, far more
+allocation-heavy workload shows contention on `ALLOCATED`/`DEALLOCATED`
+specifically. The allocation numbers themselves are, as GHC's equivalent
+predicted, far more stable than wall time: `persist_bench` phase 5's two
+trials reported bit-identical `allocated_bytes` (3,011,756,891 B) despite
+their wall times differing by 3ms.
+
+### Instrument 2 — per-call-site lock-hold time
+
+`crate::lock_stats` (`crates/computations/src/lock_stats.rs`) times
+`nodes: Mutex<NodeTable>` and `source_index: Mutex<HashMap<..>>`'s semantic
+critical sections (not raw `.lock()` calls) individually, under a single
+`COMPUTATIONS_LOCK_STATS` environment variable read exactly once, in
+`EngineBuilder::build()`, into a plain `bool` field
+(`EngineInner::lock_stats_enabled`) — the same load-bearing design point the
+Haskell reference engine's `COMP_ENGINE_LOCK_STATS` makes explicit in its
+own haddock: the enabled/disabled decision must be baked in once at setup,
+never re-checked per acquisition, or the check itself would perturb the
+hold-time baseline being measured. `EngineInner::timed` is the single choke
+point every instrumented site calls through: when disabled it costs exactly
+one `bool` branch (no `Instant::now`, no atomic write); when enabled it
+records `(calls, nanos)` into one of 16 named [`LockSite`] accumulators
+(`Relaxed` atomics throughout — pure statistics, not synchronization).
+
+Sixteen named sites, chosen to match the task's own examples
+(`record_call_dep`, `remove_stale_source_index`, the GC sweep,
+dirty-priority updates, `prepare`) plus every other `nodes`/`source_index`
+critical section on the propagation hot path (`engine.rs`'s `prepare` and
+`run`'s three lock scopes, `record_call_dep`, `record_source_deps`'s two
+mutex-scoped halves, `record_outputs`; `driver.rs`'s `affected_keys`,
+`mark_dirty_quiet`, `split_by_tier`, `run_wave`'s two lock scopes, and
+`liveness_gc`'s mark-sweep plus its later source-key-unregister scan) —
+cold/startup-only paths (`live_outputs_by_sink`, `mark_all_dirty`,
+`mark_root`, flow-argument `set_flow_ids`) were left uninstrumented since
+neither benchmark exercises them and they contribute negligibly at scale.
+A site that acquires two different mutexes in sequence
+(`record_source_deps`) gets one `LockSite` variant per mutex, so no site's
+nanoseconds are ever a mix of two unrelated locks' hold times.
+
+`Engine::print_lock_stats()` prints the sorted, formatted breakdown (same
+shape as the Haskell reference's per-method table: site, calls, total
+seconds, mean nanoseconds, % of total) — a no-op when disabled. Both
+benchmarks call it once per engine, at the point closest to "engine
+shutdown" available in each benchmark's own structure: `persist_bench`
+(process-per-phase — see its own module docs) calls it at the end of each
+phase's worker process, giving one breakdown per phase; `hospital_bench`
+(one long-lived engine across phases 1–3 in a single process) calls it once
+at the end of `run_main_phase`, giving one cumulative breakdown across cold
+eval + live incremental + rerun-heavy combined.
+
+**Enable with**: `COMPUTATIONS_LOCK_STATS=1 cargo run -p computations
+--release --example persist_bench --features testutil` (no cargo feature
+needed — this is runtime-gated only, unlike `alloc-stats`).
+
+**Overhead measured**: the *disabled* path is the one that must cost
+nothing — confirmed by the baseline matrix below matching this document's
+existing baselines. The *enabled* path's overhead scales with how many
+critical sections a workload actually exercises: on `persist_bench`
+(fewer, larger critical sections — 300 shared keys) it ranged from -5.1% to
++14.6% across phases, closer to noise on the multi-second cold-eval phases
+and largest (+14.6%) on the two ~500ms live-incremental phases, where the
+fixed per-call `Instant::now`-plus-atomic cost is a larger fraction of a
+much shorter phase. On `hospital_bench` (far more critical-section calls —
+~2M distinct source keys registered individually) overhead ran higher,
++9.6% to +20.1%, consistent with `Instant::now`'s per-call cost (not free
+on any platform) being paid millions of additional times. Cheap enough for
+an occasional diagnostic run; not something to leave on for every benchmark
+invocation, which is exactly why it is opt-in.
+
+### The matrix
+
+`uptime` load average ranged **4.6–8.3** across this stage's nine runs
+(1-min figures 4.6, 6.6, 6.3, 8.3, 6.6 at various points; the box was
+moderately-to-heavily loaded throughout, similar to several earlier stages
+in this document) — absolute numbers below should be read against that,
+per this document's standing practice; the baseline-vs-instrumented
+comparisons within each benchmark are same-session, same-load A/B pairs
+and are the reliable signal.
+
+**`persist_bench`, default scale**, baseline (both instruments off) vs.
+`alloc-stats` on vs. `COMPUTATIONS_LOCK_STATS=1`:
+
+| phase | baseline | alloc-stats | lock-stats | documented baseline |
+|---|---|---|---|---|
+| 1. cold eval (persistence configured) | 3382 ms | 3359 ms | 3438 ms | ~3.1–3.7 s ✓ |
+| 2. persist_now [db=269.49 MB] | 2439 ms | 2369 ms | 2430 ms | (db size exact match, all three runs) |
+| 3. warm restart, no changes | 1381/1360 ms | 1400/1378 ms | 1310/1341 ms | ~1.2–1.4 s ✓ |
+| 4. restart, 1 changed input | 1828/1982 ms | 1802/1812 ms | 1771/1958 ms | (no documented range; reruns exact-match across all three: 100,164 / 137,085) |
+| 5. cold restart, no persistence (engine-only RSS) | 2734/2561 ms, 336.4/328.8 MB | 2570/2567 ms, 329.3/352.9 MB | 2872/2871 ms, 338.6/345.6 MB | ~330 MB ✓ |
+| 6. fingerprint mismatch (full revalidation) | 4306 ms | 4402 ms | 4662 ms | (no documented range) |
+| 7. live incremental, no persistence | 465 ms | 502 ms | 533 ms | ~450–500 ms ✓ |
+| 8. live incremental, with persistence (settle) | 560 ms | 630 ms | 642 ms | (no documented range) |
+
+Every phase's rerun count and phase-5 engine-only RSS matched the
+documented baseline exactly across all three runs (999,760 cold; 80,767
+live; 336±8 MB engine-only), and the db size (269.49 MB) was byte-identical
+in every run — the instruments change nothing about what the engine
+computes, only what gets measured alongside it.
+
+**`hospital_bench`, default scale**, same three configurations:
+
+| phase | baseline | alloc-stats | lock-stats | documented baseline |
+|---|---|---|---|---|
+| 1. cold eval | 4152 ms, 1,116,093 reruns, 1512.4 MB | 4219 ms, 1509.2 MB | 4713 ms, 1516.2 MB | ~3.9 s / 1.12M reruns / ~1520 MB ✓ (time a little high, consistent with load) |
+| 2. live incremental, 1 changed vitals key | 104 ms, 6 reruns | 108 ms | 114 ms | ~81 ms (high vs. doc, but a 6-rerun/~100ms phase is disproportionately scheduler-sensitive) |
+| 3. rerun-heavy live update (300 keys) | 537 ms, 1444 reruns | 529 ms | 645 ms | ~524 ms ✓ |
+| 4. concurrency demo | 70 ms, 7449 reruns | 76 ms | 70 ms | (no documented range; latency-hiding behavior unaffected) |
+
+Reruns matched the documented baseline exactly in every run (1,116,093
+cold; 1,444 rerun-heavy); RSS landed within the documented ~1520 MB band
+throughout. Phase 2's wall time ran high relative to the documented ~81 ms
+across all three configurations (not just the instrumented ones) — a
+same-magnitude deviation present in the *baseline* run too, so this reads
+as this session's load rather than anything the instruments touched.
+
+### The lock-hold breakdown
+
+This is the actual finding the instrument exists to produce — not just
+plumbing. Full per-call-site table, `persist_bench` phase 1 (cold eval,
+persistence configured — the largest, most representative shared-key run,
+7,386,075 instrumented calls, 1.90 s total instrumented time):
+
+| site | calls | total (s) | mean (ns) | % of total |
+|---|---|---|---|---|
+| `prepare` | 2,385,278 | 0.738 | 309.5 | 38.78% |
+| `run/finish_success` | 999,760 | 0.689 | 688.8 | 36.18% |
+| `record_call_dep` | 2,385,277 | 0.339 | 142.3 | 17.83% |
+| `record_source_deps/nodes` | 205,000 | 0.056 | 272.3 | 2.93% |
+| `record_source_deps/source_index` | 205,000 | 0.047 | 231.1 | 2.49% |
+| `run/set_inflight` | 999,760 | 0.029 | 29.4 | 1.54% |
+| `remove_stale_source_index` | 205,000 | 0.004 | 21.0 | 0.23% |
+| `record_outputs` | 1,000 | 0.0004 | 383.9 | 0.02% |
+
+`prepare` and `run/finish_success` alone are 74.96% of tracked lock-held
+time. Phase 5 (same graph, persistence *not* configured) isolates what
+persistence itself costs under the lock: `run/finish_success`'s share drops
+from 36.18% to 10.82% (mean 688.8 ns → 146.3 ns/call) because
+`crate::persist::enqueue_changed` — called from inside that critical
+section specifically so the persister's snapshot is race-free (see
+`engine.rs`'s own comment at that call site) — no longer runs; `prepare`
+correspondingly rises to 53.72% of a now-smaller total. Every one of these
+eight sites locks `nodes` except the two `record_source_deps`/
+`remove_stale_source_index` `source_index` sites, which together are under
+3% here — on this shared-key (300 keys, ~683 dependents/key) workload,
+`source_index` is cheap because almost every registration hits an
+already-present `HashMap` bucket.
+
+`hospital_bench`'s cumulative breakdown (phases 1–3 combined, unshared-key
+— ~2.07M distinct source keys, ~1 dependent/key, 9,896,830 instrumented
+calls, 2.69 s total):
+
+| site | calls | total (s) | mean (ns) | % of total |
+|---|---|---|---|---|
+| `record_source_deps/source_index` | 2,081,168 | 0.950 | 456.4 | 35.29% |
+| `liveness_gc/mark_sweep` | 6 | 0.567 | 94,442,993.2 | 21.05% |
+| `prepare` | 1,372,788 | 0.407 | 296.1 | 15.10% |
+| `record_source_deps/nodes` | 2,081,168 | 0.382 | 183.3 | 14.17% |
+| `run/finish_success` | 1,117,543 | 0.209 | 187.4 | 7.78% |
+| `record_call_dep` | 1,371,337 | 0.128 | 93.3 | 4.75% |
+| `run/set_inflight` | 1,117,543 | 0.031 | 28.0 | 1.16% |
+| `remove_stale_source_index` | 753,368 | 0.016 | 21.7 | 0.61% |
+| everything else (6 sites) | — | — | — | 0.09% |
+
+This inverts the picture. On the shared-key workload, `nodes`-locked sites
+are effectively the whole story (97%+); on the unshared-key workload, the
+single largest line item — `record_source_deps/source_index`, at 456 ns/
+call vs. `persist_bench`'s 231 ns/call for the identical operation — is a
+critical section over `source_index`, a *different* mutex than
+`Mutex<NodeTable>` entirely. That gap (about 2×/call, on ~10× the call
+count) is exactly what Stage 11's own "Open candidates" section predicted
+without measuring: a `HashMap<(SourceId, KeyBytes), HashSet<NodeRef>>`
+bucket that is almost always being created fresh (a genuinely new key,
+paying full hash + allocation cost) rather than found already-populated
+(a cheap `HashSet::insert` into an existing bucket) is precisely the shape
+a Zero/One/Many `source_index` representation targets. `liveness_gc`'s
+mark-sweep is the other large single item (21.05% from just 6 calls, ~94 ms
+each) — expected: it's a full reachability walk over ~1.1M nodes, paid once
+per settled round, so its cost scales with graph size rather than with lock
+contention. Like `record_source_deps/source_index`, just for a different
+structural reason, sharding `NodeTable` would not obviously fix this
+either: splitting the lock into shards would not shrink the amount of graph
+a single mark-sweep pass still has to walk under whichever shard(s) it
+touches.
+
+### Does this data support sharding `Mutex<NodeTable>`?
+
+**No** — for a different reason on each workload:
+
+- **`persist_bench` (shared-key)**: `nodes`-locked sites account for over
+  97% of tracked lock-held time, but Stage 6's own profiling already found
+  only **0.7% direct `pthread_mutex_lock` wait** on this exact workload —
+  i.e. the lock is essentially uncontended; almost all of this time is
+  genuine, serialized *work* (`prepare`'s cache-hit/insert logic,
+  `run/finish_success`'s result-write-plus-persist-enqueue, `record_call_dep`'s
+  `SmallVec` pushes) that a caller must do regardless of which mutex
+  instance guards it. Sharding splits *contention*, not *work* — with
+  Stage 6's own `--hide-idle` per-thread check showing this benchmark's
+  real concurrency tops out around 2–3 active threads, there is little
+  contention here to split. The higher-leverage move this breakdown
+  actually points at is shrinking what `prepare`/`run` do *under* the lock
+  (the same direction Stage 6's optimization-candidate list already
+  ranked hashing/tracing fixes into), not changing how many locks guard
+  `NodeTable`.
+- **`hospital_bench` (unshared-key)**: the single largest cost isn't even
+  reachable by sharding `NodeTable` — `record_source_deps/source_index`'s
+  35.29% is `source_index`, a separate `Mutex<HashMap<..>>` entirely.
+  Sharding `NodeTable` here would leave this workload's actual biggest
+  lock-held cost completely untouched. The data instead makes a concrete,
+  falsifiable case for Stage 11's already-proposed Zero/One/Many
+  `source_index` representation, which is what should be built and
+  re-measured against this exact benchmark before `NodeTable` sharding is
+  reconsidered at all.
+
+Verdict: **`NodeTable` sharding is not supported as the next move by
+either workload's breakdown.** Revisit only if a future change
+demonstrably increases genuine cross-thread contention on `nodes`
+specifically (this instrument is now in place to detect exactly that, via
+a rising hold-time share alongside a rising `pthread_mutex_lock`-style
+wait metric, should one be added later) — on the evidence gathered here,
+the two concrete next steps this data supports are shrinking `prepare`/
+`run`'s critical sections and redesigning `source_index`'s representation.
+
+### Correctness
+
+`cargo test --workspace --all-features` — 121 passed (unchanged count:
+`alloc_stats`/`lock_stats` added no new tests, and neither feature changes
+behavior, only what gets measured). `cargo test -p computations --features
+testutil,alloc-stats` separately — all `computations`-crate tests green,
+confirming the feature compiles and runs correctly standalone, not only as
+part of `--all-features`. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean.
+
+### How to run
+
+```text
+# Allocation deltas (either benchmark): add alloc-stats to the feature list
+cargo run -p computations --release --example persist_bench --features testutil,alloc-stats
+cargo run -p computations --release --example hospital_bench --features testutil,alloc-stats
+
+# Lock-hold breakdown (either benchmark): set the env var, no feature needed
+COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example persist_bench --features testutil
+COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital_bench --features testutil
+
+# Both at once
+COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example persist_bench --features testutil,alloc-stats
+```
+

@@ -109,6 +109,8 @@ use std::time::{Duration, Instant};
 
 use computations::testutil::{GetKey, MemKvSource, VecSink, WriteDoc};
 use computations::{Comp, Engine, Fingerprint, PersistOptions, Registry};
+#[cfg(feature = "alloc-stats")]
+use computations::alloc_stats;
 
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
@@ -386,6 +388,24 @@ fn report(label: &str, ms: u128, reruns: usize) {
     println!("RESULT|{label}|{ms}|{reruns}|{rss:.1}");
 }
 
+/// Prints this phase's own allocated/deallocated-byte delta (see
+/// `computations::alloc_stats`'s module docs) between `before` and `after` —
+/// a no-op line entirely absent from stdout unless the `alloc-stats` feature
+/// is enabled, so the `RESULT|...` line above stays the only thing an
+/// ordinary (non-instrumented) run's parser needs to see.
+#[cfg(feature = "alloc-stats")]
+fn report_alloc_delta(label: &str, before: alloc_stats::AllocSnapshot, after: alloc_stats::AllocSnapshot) {
+    let delta = before.delta(&after);
+    println!(
+        "allocated_bytes ({label}): {} ({:.1} MB), deallocated_bytes: {} ({:.1} MB), net: {} B",
+        delta.allocated,
+        delta.allocated as f64 / 1_000_000.0,
+        delta.deallocated,
+        delta.deallocated as f64 / 1_000_000.0,
+        delta.net()
+    );
+}
+
 struct PhaseResult {
     label: String,
     ms: u128,
@@ -653,6 +673,8 @@ async fn run_phase_1(
     let opts1 = PersistOptions::new(db_path, fingerprint_v1);
     let (engine1, root1) = build_graph(&kv, &sink, Some(opts1), &counter1, level_sizes);
 
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before_cold = alloc_stats::snapshot();
     let baseline = settle_signal.load(Ordering::SeqCst);
     let t0 = Instant::now();
     let handle1 = {
@@ -662,6 +684,8 @@ async fn run_phase_1(
     wait_for_signal(settle_signal, baseline, phase_timeout).await;
     let phase1_ms = t0.elapsed().as_millis();
     let phase1_reruns = counter1.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta("1. cold initial eval", alloc_before_cold, alloc_stats::snapshot());
     eprintln!(
         "  -> achieved instance count: {phase1_reruns} (target ~{target_instances:.0}, {:+.1}%)",
         (phase1_reruns as f64 - target_instances) / target_instances * 100.0
@@ -672,6 +696,7 @@ async fn run_phase_1(
         "every top-level doc must have been written"
     );
     report("1. cold initial eval (persistence configured)", phase1_ms, phase1_reruns);
+    engine1.print_lock_stats();
 
     let t1 = Instant::now();
     engine1.persist_now().await;
@@ -712,6 +737,8 @@ async fn run_restart_phase(
     let opts = PersistOptions::new(db_path, fingerprint);
     let (engine, root) = build_graph(&kv, &sink, Some(opts), &counter, level_sizes);
 
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before = alloc_stats::snapshot();
     let baseline = settle_signal.load(Ordering::SeqCst);
     let t = Instant::now();
     let handle = {
@@ -721,7 +748,10 @@ async fn run_restart_phase(
     wait_for_signal(settle_signal, baseline, phase_timeout).await;
     let ms = t.elapsed().as_millis();
     let reruns = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta(label, alloc_before, alloc_stats::snapshot());
     report(label, ms, reruns);
+    engine.print_lock_stats();
 
     engine.persist_now().await;
     engine.persist_close();
@@ -745,6 +775,8 @@ async fn run_no_persist_phase(
     let counter = Arc::new(AtomicUsize::new(0));
     let (engine, root) = build_graph(&kv, &sink, None, &counter, level_sizes);
 
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before = alloc_stats::snapshot();
     let baseline = settle_signal.load(Ordering::SeqCst);
     let t = Instant::now();
     let handle = {
@@ -754,7 +786,10 @@ async fn run_no_persist_phase(
     wait_for_signal(settle_signal, baseline, phase_timeout).await;
     let ms = t.elapsed().as_millis();
     let reruns = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta(label, alloc_before, alloc_stats::snapshot());
     report(label, ms, reruns);
+    engine.print_lock_stats();
 
     handle.abort();
     let _ = handle.await;
@@ -778,6 +813,8 @@ async fn run_fingerprint_mismatch_phase(
     let opts = PersistOptions::new(db_path, fingerprint_v2);
     let (engine, root) = build_graph(&kv, &sink, Some(opts), &counter, level_sizes);
 
+    #[cfg(feature = "alloc-stats")]
+    let alloc_before = alloc_stats::snapshot();
     let baseline = settle_signal.load(Ordering::SeqCst);
     let t = Instant::now();
     let handle = {
@@ -787,11 +824,14 @@ async fn run_fingerprint_mismatch_phase(
     wait_for_signal(settle_signal, baseline, phase_timeout).await;
     let ms = t.elapsed().as_millis();
     let reruns = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta("6. fingerprint mismatch", alloc_before, alloc_stats::snapshot());
     report(
         "6. restart, fingerprint mismatch (full revalidation)",
         ms,
         reruns,
     );
+    engine.print_lock_stats();
 
     engine.persist_close();
     handle.abort();
@@ -846,12 +886,17 @@ async fn run_live_incremental_phase(
     // so this is always live.
     let round_baseline = round_signal.load(Ordering::SeqCst);
     let reruns_before = counter.load(Ordering::Relaxed);
+    #[cfg(feature = "alloc-stats")]
+    let alloc_pre_live = alloc_stats::snapshot();
     let t = Instant::now();
     kv.set("0", "13371337").await;
     wait_for_signal(round_signal, round_baseline, phase_timeout).await;
     let settle_ms = t.elapsed().as_millis();
     let reruns = counter.load(Ordering::Relaxed) - reruns_before;
+    #[cfg(feature = "alloc-stats")]
+    report_alloc_delta(label, alloc_pre_live, alloc_stats::snapshot());
     report(label, settle_ms, reruns);
+    engine.print_lock_stats();
 
     // Time-to-durable: the same settle latency above, plus however long an
     // explicit, awaited `persist_now()` takes right after — the actual

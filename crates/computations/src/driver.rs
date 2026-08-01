@@ -350,24 +350,26 @@ impl EngineInner {
     /// version is already the one recorded on the node (a spurious wake:
     /// the node's last run already observed this exact version).
     fn affected_keys(&self, changed: &HashSet<RawDep>) -> CompKeySet {
-        let index = self.source_index.lock().unwrap();
-        let nodes = self.nodes.lock().unwrap();
-        let mut affected = CompKeySet::default();
-        for dep in changed {
-            let Some(ids) = index.get(&(dep.source.clone(), dep.key.clone())) else {
-                continue;
-            };
-            for &id in ids {
-                if !nodes.contains(id) {
+        self.timed(crate::lock_stats::LockSite::AffectedKeys, || {
+            let index = self.source_index.lock().unwrap();
+            let nodes = self.nodes.lock().unwrap();
+            let mut affected = CompKeySet::default();
+            for dep in changed {
+                let Some(ids) = index.get(&(dep.source.clone(), dep.key.clone())) else {
                     continue;
+                };
+                for &id in ids {
+                    if !nodes.contains(id) {
+                        continue;
+                    }
+                    if nodes.source_deps_contains(id, dep) {
+                        continue;
+                    }
+                    affected.insert(nodes.key_of(id));
                 }
-                if nodes.source_deps_contains(id, dep) {
-                    continue;
-                }
-                affected.insert(nodes.key_of(id));
             }
-        }
-        affected
+            affected
+        })
     }
 
     /// Marks every key in `keys` dirty at `priority`, taking the max of any
@@ -384,17 +386,19 @@ impl EngineInner {
     /// once the loop is already running, must go through [`Self::mark_dirty`]
     /// instead so the loop actually wakes up to service it.
     pub(crate) fn mark_dirty_quiet(&self, keys: &CompKeySet, priority: DirtyPriority) {
-        let mut nodes = self.nodes.lock().unwrap();
-        for key in keys {
-            if let Some(r) = nodes.id_of(key) {
-                let merged = match nodes.dirty_priority(r) {
-                    Some(existing) => existing.max(priority),
-                    None => priority,
-                };
-                nodes.set_dirty_priority(r, Some(merged));
-                nodes.set_state(r, NodeState::Dirty);
+        self.timed(crate::lock_stats::LockSite::MarkDirtyQuiet, || {
+            let mut nodes = self.nodes.lock().unwrap();
+            for key in keys {
+                if let Some(r) = nodes.id_of(key) {
+                    let merged = match nodes.dirty_priority(r) {
+                        Some(existing) => existing.max(priority),
+                        None => priority,
+                    };
+                    nodes.set_dirty_priority(r, Some(merged));
+                    nodes.set_state(r, NodeState::Dirty);
+                }
             }
-        }
+        });
     }
 
     /// Marks `keys` dirty at `priority` (see [`Self::mark_dirty_quiet`])
@@ -471,21 +475,23 @@ impl EngineInner {
     /// or no pending priority (nothing to do — already settled), is
     /// dropped from both.
     fn split_by_tier(&self, keys: CompKeySet) -> (CompKeySet, CompKeySet) {
-        let nodes = self.nodes.lock().unwrap();
-        let mut input = CompKeySet::default();
-        let mut revalidate = CompKeySet::default();
-        for key in keys {
-            match nodes.id_of(&key).and_then(|r| nodes.dirty_priority(r)) {
-                Some(DirtyPriority::Input) => {
-                    input.insert(key);
+        self.timed(crate::lock_stats::LockSite::SplitByTier, move || {
+            let nodes = self.nodes.lock().unwrap();
+            let mut input = CompKeySet::default();
+            let mut revalidate = CompKeySet::default();
+            for key in keys {
+                match nodes.id_of(&key).and_then(|r| nodes.dirty_priority(r)) {
+                    Some(DirtyPriority::Input) => {
+                        input.insert(key);
+                    }
+                    Some(DirtyPriority::Revalidate) => {
+                        revalidate.insert(key);
+                    }
+                    None => {}
                 }
-                Some(DirtyPriority::Revalidate) => {
-                    revalidate.insert(key);
-                }
-                None => {}
             }
-        }
-        (input, revalidate)
+            (input, revalidate)
+        })
     }
 
     /// Wave propagation, tier-aware: `Input`-tier dirty work (genuine
@@ -595,7 +601,7 @@ impl EngineInner {
         // for a flow-argument node; `rerun_node` itself decides which of
         // `ErasedDef::rerun`/`rerun_flows` actually applies, so this driver
         // code stays uniform across both kinds.
-        let jobs: Vec<(CompKey, Vec<u8>, Vec<FlowId>)> = {
+        let jobs: Vec<(CompKey, Vec<u8>, Vec<FlowId>)> = self.timed(crate::lock_stats::LockSite::RunWaveDequeue, || {
             let mut nodes = self.nodes.lock().unwrap();
             batch
                 .iter()
@@ -605,7 +611,7 @@ impl EngineInner {
                     Some((key.clone(), nodes.param_bytes(r).to_vec(), nodes.flow_ids_clone(r)))
                 })
                 .collect()
-        };
+        });
 
         let results =
             join_all(jobs.iter().map(|(key, param_bytes, flow_ids)| self.rerun_node(key, flow_ids, param_bytes))).await;
@@ -613,7 +619,7 @@ impl EngineInner {
         let mut next_frontier = CompKeySet::default();
         let mut reran = 0usize;
         let mut cutoffs = 0usize;
-        {
+        self.timed(crate::lock_stats::LockSite::RunWaveRequeue, || {
             let nodes = self.nodes.lock().unwrap();
             for ((key, _, _), result) in jobs.iter().zip(results.iter()) {
                 match result {
@@ -654,7 +660,7 @@ impl EngineInner {
                     }
                 }
             }
-        }
+        });
         tracing::debug!(
             wave,
             tier = ?tier,
@@ -678,7 +684,17 @@ impl EngineInner {
     /// and it is removed from the node table, `source_index`, and every
     /// surviving node's `rdeps`.
     async fn liveness_gc(&self) -> GcStats {
-        let (dead_keys, outputs_by_sink, dead_source_deps) = {
+        // The mark-sweep proper (reachability scan, dead-node removal, and
+        // the nested `source_index` retain pass) is one instrumented
+        // critical section (`LockSite::LivenessGc`). Returns `None` when
+        // nothing is dead (the common case, most rounds) -- surfaced as a
+        // plain early return from `liveness_gc` itself, outside the timed
+        // closure, rather than threading a sentinel `GcStats::default()`
+        // value through it, since the closure's other branch produces the
+        // `(dead_keys, outputs_by_sink, dead_source_deps)` triple this
+        // function needs to continue, not a `GcStats` (that's still to be
+        // built from `keys_unregistered` below).
+        let Some((dead_keys, outputs_by_sink, dead_source_deps)) = self.timed(crate::lock_stats::LockSite::LivenessGc, || {
             let mut nodes = self.nodes.lock().unwrap();
 
             let mut reachable: HashSet<NodeRef> = HashSet::new();
@@ -701,7 +717,7 @@ impl EngineInner {
 
             let dead_ids: HashSet<NodeRef> = nodes.iter_refs().filter(|r| !reachable.contains(r)).collect();
             if dead_ids.is_empty() {
-                return GcStats::default();
+                return None;
             }
 
             let mut dead_keys: Vec<CompKey> = Vec::with_capacity(dead_ids.len());
@@ -735,7 +751,9 @@ impl EngineInner {
             }
             nodes.retain_rdeps_not_in(&dead_ids);
 
-            (dead_keys, outputs_by_sink, dead_source_deps)
+            Some((dead_keys, outputs_by_sink, dead_source_deps))
+        }) else {
+            return GcStats::default();
         };
 
         for key in &dead_keys {
@@ -744,7 +762,7 @@ impl EngineInner {
 
         // Unregister source keys that no surviving node depends on anymore.
         let mut to_unregister: HashMap<SourceId, Vec<KeyBytes>> = HashMap::new();
-        {
+        self.timed(crate::lock_stats::LockSite::LivenessGcUnregister, || {
             let index = self.source_index.lock().unwrap();
             for (source_id, keys) in &dead_source_deps {
                 for key in keys {
@@ -753,7 +771,7 @@ impl EngineInner {
                     }
                 }
             }
-        }
+        });
         let mut keys_unregistered = 0usize;
         for (source_id, keys) in to_unregister {
             keys_unregistered += keys.len();
