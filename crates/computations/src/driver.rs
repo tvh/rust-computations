@@ -37,6 +37,7 @@ use crate::def::Comp;
 use crate::engine::{DirtyPriority, Engine, EngineInner, NodeRef, NodeState};
 use crate::error::CompError;
 use crate::flow::FlowId;
+use crate::interner::SrcKeyId;
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId};
@@ -350,19 +351,34 @@ impl EngineInner {
     /// version is already the one recorded on the node (a spurious wake:
     /// the node's last run already observed this exact version).
     fn affected_keys(&self, changed: &HashSet<RawDep>) -> CompKeySet {
+        // Resolved to `SrcKeyId` first, in its own critical section, kept
+        // separate from the `source_index`/`nodes` one below (Stage 13 —
+        // see `docs/persistence-benchmark-notes.md`): a dep whose key was
+        // never interned at all can't have any dependent either, exactly
+        // like the old `source_index.get(&(source, key))` miss it
+        // replaces, and this way `src_key_interner`'s lock never nests
+        // with the other two (this call site is also the one place this
+        // engine already has a pre-existing `source_index`/`nodes` lock
+        // ordering that differs from `liveness_gc`'s — see that function's
+        // docs — so a third lock never nests with either here is
+        // deliberate, not incidental).
+        let resolved: Vec<(SrcKeyId, &RawDep)> = {
+            let interner = self.src_key_interner.lock().unwrap();
+            changed.iter().filter_map(|dep| interner.lookup(&dep.source, &dep.key).map(|id| (id, dep))).collect()
+        };
         self.timed(crate::lock_stats::LockSite::AffectedKeys, || {
             let index = self.source_index.lock().unwrap();
             let nodes = self.nodes.lock().unwrap();
             let mut affected = CompKeySet::default();
-            for dep in changed {
-                let Some(ids) = index.get(&(dep.source.clone(), dep.key.clone())) else {
+            for (key_id, dep) in resolved {
+                let Some(ids) = index.get(&key_id) else {
                     continue;
                 };
                 for &id in ids {
                     if !nodes.contains(id) {
                         continue;
                     }
-                    if nodes.source_deps_contains(id, dep) {
+                    if nodes.source_deps_contains(id, key_id, &dep.ver) {
                         continue;
                     }
                     affected.insert(nodes.key_of(id));
@@ -694,7 +710,7 @@ impl EngineInner {
         // `(dead_keys, outputs_by_sink, dead_source_deps)` triple this
         // function needs to continue, not a `GcStats` (that's still to be
         // built from `keys_unregistered` below).
-        let Some((dead_keys, outputs_by_sink, dead_source_deps)) = self.timed(crate::lock_stats::LockSite::LivenessGc, || {
+        let Some((dead_keys, outputs_by_sink, dead_key_ids)) = self.timed(crate::lock_stats::LockSite::LivenessGc, || {
             let mut nodes = self.nodes.lock().unwrap();
 
             let mut reachable: HashSet<NodeRef> = HashSet::new();
@@ -722,7 +738,12 @@ impl EngineInner {
 
             let mut dead_keys: Vec<CompKey> = Vec::with_capacity(dead_ids.len());
             let mut outputs_by_sink: HashMap<SinkId, Vec<OutBytes>> = HashMap::new();
-            let mut dead_source_deps: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
+            // One entry per (dead node, distinct interned key) it held --
+            // deliberately *not* deduplicated across nodes: each is a
+            // separate `src_key_interner` reference that must be released
+            // separately below (Stage 13 — see
+            // `docs/persistence-benchmark-notes.md`).
+            let mut dead_key_ids: Vec<SrcKeyId> = Vec::new();
             for &r in &dead_ids {
                 // Captured before `remove_by_id`, which purges every
                 // side-table entry (`source_deps`/`outputs`/`inflight`) for
@@ -735,9 +756,8 @@ impl EngineInner {
                 for RawOutput { sink, out } in outputs {
                     outputs_by_sink.entry(sink).or_default().push(out);
                 }
-                for dep in source_deps {
-                    dead_source_deps.entry(dep.source).or_default().insert(dep.key);
-                }
+                let distinct_ids: HashSet<SrcKeyId> = source_deps.iter().map(|dep| dep.key_id).collect();
+                dead_key_ids.extend(distinct_ids);
             }
 
             {
@@ -751,7 +771,7 @@ impl EngineInner {
             }
             nodes.retain_rdeps_not_in(&dead_ids);
 
-            Some((dead_keys, outputs_by_sink, dead_source_deps))
+            Some((dead_keys, outputs_by_sink, dead_key_ids))
         }) else {
             return GcStats::default();
         };
@@ -761,17 +781,34 @@ impl EngineInner {
         }
 
         // Unregister source keys that no surviving node depends on anymore.
+        // Resolved back to real bytes via `src_key_interner` *before* the
+        // release pass below frees anything -- a released id's reverse
+        // mapping is gone, so resolving has to happen first (Stage 13 —
+        // see `docs/persistence-benchmark-notes.md`).
+        let touched_ids: HashSet<SrcKeyId> = dead_key_ids.iter().copied().collect();
         let mut to_unregister: HashMap<SourceId, Vec<KeyBytes>> = HashMap::new();
         self.timed(crate::lock_stats::LockSite::LivenessGcUnregister, || {
             let index = self.source_index.lock().unwrap();
-            for (source_id, keys) in &dead_source_deps {
-                for key in keys {
-                    if !index.contains_key(&(source_id.clone(), key.clone())) {
-                        to_unregister.entry(source_id.clone()).or_default().push(key.clone());
-                    }
+            let interner = self.src_key_interner.lock().unwrap();
+            for &id in &touched_ids {
+                if index.contains_key(&id) {
+                    continue; // a surviving node still depends on it
+                }
+                if let Some((source_id, key)) = interner.resolve(id) {
+                    to_unregister.entry(source_id.clone()).or_default().push(key.to_vec());
                 }
             }
         });
+
+        // Now that every real byte has been resolved for the unregister
+        // step above, release every collected node's interner references.
+        {
+            let mut interner = self.src_key_interner.lock().unwrap();
+            for id in dead_key_ids {
+                interner.release(id);
+            }
+        }
+
         let mut keys_unregistered = 0usize;
         for (source_id, keys) in to_unregister {
             keys_unregistered += keys.len();
@@ -810,6 +847,8 @@ impl EngineInner {
 mod tests {
     use super::*;
     use crate::def::define_comp;
+    use crate::registry::Registry;
+    use crate::testutil::{GetKey, MemKvSource};
 
     /// Marking a node Revalidate then Input must leave it at Input (the
     /// higher priority); marking it Revalidate again afterwards must not
@@ -871,5 +910,88 @@ mod tests {
         let nodes = engine.inner.nodes.lock().unwrap();
         assert_eq!(nodes.dirty_priority(nodes.id_of(&key_a).unwrap()), Some(DirtyPriority::Revalidate));
         assert_eq!(nodes.dirty_priority(nodes.id_of(&key_b).unwrap()), Some(DirtyPriority::Revalidate));
+    }
+
+    /// Liveness GC must release a collected node's `src_key_interner`
+    /// references, not just clear its own `source_deps` entry — otherwise a
+    /// workload whose key set turns over (a source key's last dependent
+    /// node eventually dying, e.g. a deleted file, a discharged patient)
+    /// leaks one interned id per turnover, forever (Stage 13 — see
+    /// `docs/persistence-benchmark-notes.md`).
+    ///
+    /// Reuses `tests/driver.rs`'s
+    /// `gc_collects_a_directly_source_dependent_node_once_unreachable`
+    /// scenario (a `leaf` reachable only while `root` reads `mode == "on"`)
+    /// but runs here, inside this crate, so it can reach
+    /// `EngineInner::src_key_interner` — `pub(crate)`, invisible to that
+    /// external integration-test crate — and drives `eval_root`/
+    /// `liveness_gc` directly rather than waiting on the background run
+    /// loop's own timing.
+    #[tokio::test]
+    async fn liveness_gc_releases_a_collected_nodes_interned_source_keys() {
+        let kv = MemKvSource::new("kv");
+        kv.set("mode", "on").await;
+        kv.set("val", "v1").await;
+
+        let mut registry = Registry::default();
+        registry.register_source(kv.clone());
+
+        let mut builder = Engine::builder();
+        builder.registry(registry);
+
+        let leaf: Comp<(), ()> = builder.define("interner_gc_leaf", {
+            let kv = kv.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                async move {
+                    let _ = ctx.src_req(&kv, GetKey("val".to_string())).await?;
+                    Ok(())
+                }
+            }
+        });
+
+        let root: Comp<(), ()> = builder.define("interner_gc_root", {
+            let kv = kv.clone();
+            move |ctx, _: ()| {
+                let kv = kv.clone();
+                async move {
+                    let mode = ctx.src_req(&kv, GetKey("mode".to_string())).await?.unwrap_or_default();
+                    if mode == "on" {
+                        ctx.eval(leaf, ()).await?;
+                    }
+                    Ok(())
+                }
+            }
+        });
+
+        let engine = builder.build();
+        engine.eval_root(&root, ()).await.unwrap();
+
+        // `root` read "mode" and `leaf` read "val": two distinct interned
+        // keys, each with exactly one live dependent.
+        assert_eq!(
+            engine.inner.src_key_interner.lock().unwrap().live_len(),
+            2,
+            "both source keys read so far should be interned"
+        );
+
+        // Make `leaf` unreachable: `root` stops calling it once "mode"
+        // reads "off". Marked dirty and re-evaluated directly (not through
+        // the background run loop) for a deterministic test.
+        kv.set("mode", "off").await;
+        let root_key = CompKey::new(*root.def_id(), &());
+        let mut keys = CompKeySet::default();
+        keys.insert(root_key);
+        engine.inner.mark_dirty_quiet(&keys, DirtyPriority::Input);
+        engine.eval_root(&root, ()).await.unwrap();
+
+        engine.inner.liveness_gc().await;
+
+        assert_eq!(
+            engine.inner.src_key_interner.lock().unwrap().live_len(),
+            1,
+            "leaf's node was collected by liveness GC -- its \"val\" reference must be released, \
+             leaving only root's still-live \"mode\" reference"
+        );
     }
 }

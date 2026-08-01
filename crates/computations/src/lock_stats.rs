@@ -60,22 +60,33 @@ pub(crate) enum LockSite {
     /// `EngineInner::record_call_dep` — pushing a caller/callee edge, under
     /// `nodes`.
     RecordCallDep,
+    /// `EngineInner::record_source_deps`'s `src_key_interner`-locked half
+    /// (Stage 13 — see `docs/persistence-benchmark-notes.md`): resolving
+    /// each dep's raw `(source, key)` bytes to a `SrcKeyId`, run *before*
+    /// either lock below so neither one ever hashes a byte vector.
+    RecordSourceDepsIntern,
     /// `EngineInner::record_source_deps`'s `nodes`-locked half (extending
     /// the node's own recorded source deps).
     RecordSourceDepsNodes,
     /// `EngineInner::record_source_deps`'s `source_index`-locked half
-    /// (registering the node against each `(source, key)` pair).
+    /// (registering the node against each interned key's `SrcKeyId`).
     RecordSourceDepsIndex,
     /// `EngineInner::record_outputs` — extending a node's recorded sink
     /// outputs, under `nodes`.
     RecordOutputs,
-    /// `EngineInner::remove_stale_source_index` — dropping a node's
-    /// `source_index` registrations for dependencies it no longer reads,
-    /// under `source_index`.
+    /// `EngineInner::reconcile_source_deps` (Stage 13's renamed
+    /// `remove_stale_source_index`) — retaining a fresh `src_key_interner`
+    /// reference for every dependency identity a run just gained, then
+    /// dropping `source_index` registrations and interner references for
+    /// every one it no longer reads. Spans `src_key_interner` and
+    /// `source_index`, held in sequence, never nested.
     RemoveStaleSourceIndex,
     /// `driver::EngineInner::affected_keys` — mapping a batch of changed
     /// source deps back to affected computations, under both `source_index`
-    /// and `nodes` together (held jointly for the whole lookup).
+    /// and `nodes` together (held jointly for the whole lookup). Resolving
+    /// each dep's raw bytes to a `SrcKeyId` via `src_key_interner` happens
+    /// first, in its own separate (and separately unmeasured, being cheap
+    /// and low-volume here) critical section, so it never nests with either.
     AffectedKeys,
     /// `driver::EngineInner::mark_dirty_quiet` — the dirty-priority update
     /// itself ("max priority wins"), under `nodes`.
@@ -102,12 +113,13 @@ pub(crate) enum LockSite {
 }
 
 impl LockSite {
-    const ALL: [LockSite; 16] = [
+    const ALL: [LockSite; 17] = [
         LockSite::Prepare,
         LockSite::RunSetInflight,
         LockSite::RunFinishSuccess,
         LockSite::RunFinishError,
         LockSite::RecordCallDep,
+        LockSite::RecordSourceDepsIntern,
         LockSite::RecordSourceDepsNodes,
         LockSite::RecordSourceDepsIndex,
         LockSite::RecordOutputs,
@@ -128,6 +140,7 @@ impl LockSite {
             LockSite::RunFinishSuccess => "run/finish_success",
             LockSite::RunFinishError => "run/finish_error",
             LockSite::RecordCallDep => "record_call_dep",
+            LockSite::RecordSourceDepsIntern => "record_source_deps/interner",
             LockSite::RecordSourceDepsNodes => "record_source_deps/nodes",
             LockSite::RecordSourceDepsIndex => "record_source_deps/source_index",
             LockSite::RecordOutputs => "record_outputs",
@@ -155,7 +168,7 @@ struct SiteCounters {
 }
 
 /// Per-[`LockSite`] accumulators. Always present on
-/// [`crate::engine::EngineInner`] — [`LockSite::ALL`]`.len()` (16) pairs of
+/// [`crate::engine::EngineInner`] — [`LockSite::ALL`]`.len()` (17) pairs of
 /// atomics, a few hundred bytes total, once per engine, never per node —
 /// but only ever *written* to when `COMPUTATIONS_LOCK_STATS` was read as
 /// enabled at `Engine::build()` time (see

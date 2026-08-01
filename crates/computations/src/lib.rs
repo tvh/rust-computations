@@ -14,6 +14,7 @@ pub mod engine;
 pub mod error;
 pub mod flow;
 mod hashers;
+mod interner;
 pub mod key;
 mod lock_stats;
 pub mod persist;

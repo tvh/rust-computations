@@ -74,6 +74,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::def::ErasedDef;
 use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable};
 use crate::flow::FlowId;
+use crate::interner::{SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
@@ -352,12 +353,22 @@ struct RawDepRepr {
 }
 
 impl RawDepRepr {
-    fn from_dep(dep: &RawDep) -> Self {
-        RawDepRepr {
-            source: dep.source.to_string(),
-            key: dep.key.clone(),
+    /// The persisted counterpart of a node's *interned* [`SrcDep`]:
+    /// resolves `dep.key_id` back to real `(source, key)` bytes through
+    /// `interner`, since the on-disk record must never store a
+    /// process-local id — see `crate::interner`'s module docs on why
+    /// persistence stays byte-based. `None` if `dep.key_id` has already
+    /// been released (should not happen while the owning node still holds
+    /// it — see `crate::engine::EngineInner::reconcile_source_deps` — but
+    /// this is a snapshot read racing nothing under the same lock, so it's
+    /// handled rather than assumed).
+    fn from_src_dep(interner: &SrcKeyInterner, dep: &SrcDep) -> Option<Self> {
+        let (source, key) = interner.resolve(dep.key_id)?;
+        Some(RawDepRepr {
+            source: source.to_string(),
+            key: key.to_vec(),
             ver: dep.ver.clone(),
-        }
+        })
     }
 
     fn to_dep(&self) -> RawDep {
@@ -456,8 +467,17 @@ impl PendingRecord {
     /// `nodes` is needed to translate `r`'s `comp_deps` [`NodeRef`]s back
     /// into the `CompKey`s persistence actually stores, and to read `r`'s
     /// `source_deps`/`outputs` out of `nodes`'s sparse side tables.
+    ///
+    /// `interner` resolves each of `r`'s interned `source_deps` back to the
+    /// real `(source, key)` bytes the on-disk record stores (Stage 13 —
+    /// see `docs/persistence-benchmark-notes.md`): the persisted format is
+    /// unchanged by interning, only how the in-memory side reaches it. A
+    /// dep whose id has already been released (should not happen while `r`
+    /// still holds it) is simply dropped rather than trusted — see
+    /// [`RawDepRepr::from_src_dep`].
     fn snapshot(
         nodes: &NodeTable,
+        interner: &SrcKeyInterner,
         r: NodeRef,
         key: &CompKey,
         value: Arc<dyn Any + Send + Sync>,
@@ -469,7 +489,7 @@ impl PendingRecord {
             def_name: key.def().name().to_string(),
             param_bytes: nodes.param_bytes(r).to_vec(),
             comp_deps,
-            source_deps: nodes.source_deps_iter(r).map(RawDepRepr::from_dep).collect(),
+            source_deps: nodes.source_deps_iter(r).filter_map(|dep| RawDepRepr::from_src_dep(interner, dep)).collect(),
             result_hash: result_hash.as_bytes(),
             value,
             outputs: nodes.outputs_iter(r).map(RawOutputRepr::from_output).collect(),
@@ -1092,6 +1112,14 @@ impl EngineInner {
         }
 
         let mut nodes = self.nodes.lock().unwrap();
+        // Held for the whole two-pass restore below, nested inside `nodes`
+        // exactly like `enqueue_changed`'s ordering (Stage 13 — see
+        // `docs/persistence-benchmark-notes.md`): every restored dep is a
+        // brand-new reference (a freshly restored node has no prior "old"
+        // set to diff against), so each one is interned *and* retained in
+        // one call, mirroring `crate::interner::SrcKeyInterner::intern_retain`'s
+        // own doc comment.
+        let mut interner = self.src_key_interner.lock().unwrap();
 
         // Pass 1: every restored node gets a `NodeRef`, its value is decoded
         // straight into its definition's typed value column (see
@@ -1112,11 +1140,20 @@ impl EngineInner {
                 continue;
             }
             nodes.set_result(r, p.result_hash);
-            nodes.extend_source_deps(r, &p.source_deps);
+            let interned_deps: HashSet<SrcDep> = p
+                .source_deps
+                .iter()
+                .map(|dep| SrcDep {
+                    key_id: interner.intern_retain(&dep.source, &dep.key),
+                    ver: dep.ver.clone(),
+                })
+                .collect();
+            nodes.extend_source_deps(r, &interned_deps);
             nodes.extend_outputs(r, &p.outputs);
             nodes.set_flow_ids(r, p.flow_ids);
             edge_work.push((r, p.comp_dep_keys));
         }
+        drop(interner);
         let restored_count = edge_work.len();
 
         // Pass 2: wire up `comp_deps`/`rdeps` now that every ref exists. A
@@ -1134,16 +1171,14 @@ impl EngineInner {
 
         // Rebuild `source_index` the same way `record_source_deps` builds it
         // incrementally for a live node.
-        let source_index_entries: Vec<(SourceId, KeyBytes, NodeRef)> = nodes
-            .iter_refs()
-            .flat_map(|r| nodes.source_deps_iter(r).map(move |dep| (dep.source.clone(), dep.key.clone(), r)))
-            .collect();
+        let source_index_entries: Vec<(SrcKeyId, NodeRef)> =
+            nodes.iter_refs().flat_map(|r| nodes.source_deps_iter(r).map(move |dep| (dep.key_id, r))).collect();
         drop(nodes);
 
         {
             let mut source_index = self.source_index.lock().unwrap();
-            for (source, key_bytes, r) in source_index_entries {
-                source_index.entry((source, key_bytes)).or_default().insert(r);
+            for (key_id, r) in source_index_entries {
+                source_index.entry(key_id).or_default().insert(r);
             }
         }
 
@@ -1165,15 +1200,39 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> CompKeySet {
     // Snapshot what's needed and release the lock before awaiting anything
     // (holding a `std::sync::Mutex` guard across an `.await` is unsound to
     // rely on and easy to deadlock).
-    let deps_by_key: CompKeyMap<HashSet<RawDep>> = {
+    let deps_by_key: CompKeyMap<HashSet<SrcDep>> = {
         let nodes = engine.nodes.lock().unwrap();
         nodes.iter_refs().map(|r| (nodes.key_of(r), nodes.source_deps_clone(r))).collect()
     };
 
+    // Resolve every interned key back to real `(source, key)` bytes up
+    // front, through a single `src_key_interner` lock -- a one-time,
+    // startup-only cost (Stage 13 — see
+    // `docs/persistence-benchmark-notes.md`), unlike the per-dependent hot
+    // path interning targets. A dep whose id has already been released
+    // (should not happen for a node whose `source_deps` snapshot above
+    // still lists it) is simply dropped rather than trusted.
+    let resolved: CompKeyMap<Vec<(SourceId, KeyBytes, VerBytes)>> = {
+        let interner = engine.src_key_interner.lock().unwrap();
+        deps_by_key
+            .iter()
+            .map(|(key, deps)| {
+                let deps = deps
+                    .iter()
+                    .filter_map(|dep| {
+                        let (source, key_bytes) = interner.resolve(dep.key_id)?;
+                        Some((source.clone(), key_bytes.to_vec(), dep.ver.clone()))
+                    })
+                    .collect();
+                (key.clone(), deps)
+            })
+            .collect()
+    };
+
     let mut by_source: HashMap<SourceId, HashSet<KeyBytes>> = HashMap::new();
-    for deps in deps_by_key.values() {
-        for dep in deps {
-            by_source.entry(dep.source.clone()).or_default().insert(dep.key.clone());
+    for deps in resolved.values() {
+        for (source, key, _ver) in deps {
+            by_source.entry(source.clone()).or_default().insert(key.clone());
         }
     }
 
@@ -1190,11 +1249,11 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> CompKeySet {
     }
 
     let mut changed = CompKeySet::default();
-    for (key, deps) in &deps_by_key {
-        for dep in deps {
+    for (key, deps) in &resolved {
+        for (source, key_bytes, ver) in deps {
             let unchanged = matches!(
-                probed.get(&dep.source),
-                Some(Some(map)) if matches!(map.get(&dep.key), Some(Some(ver)) if *ver == dep.ver)
+                probed.get(source),
+                Some(Some(map)) if matches!(map.get(key_bytes), Some(Some(v)) if v == ver)
             );
             if !unchanged {
                 changed.insert(key.clone());
@@ -1288,7 +1347,14 @@ pub(crate) fn enqueue_changed(engine: &EngineInner, nodes: &NodeTable, key: &Com
     let Some(erased_def) = engine.erased_defs.get(key.def()) else { return };
     let Some(value) = erased_def.value_any(r.row) else { return };
     let Some(result_hash) = nodes.result_hash(r) else { return };
-    let record = PendingRecord::snapshot(nodes, r, key, value, result_hash);
+    // `src_key_interner` is a separate lock from `nodes` (held by the
+    // caller already), acquired and dropped fully within this one
+    // statement -- never nested with anything else, matching every other
+    // `EngineInner` call site's ordering (see `crate::lock_stats`'s
+    // `LockSite` docs).
+    let interner = engine.src_key_interner.lock().unwrap();
+    let record = PendingRecord::snapshot(nodes, &interner, r, key, value, result_hash);
+    drop(interner);
     handle.enqueue_upsert(key.clone(), record);
 }
 

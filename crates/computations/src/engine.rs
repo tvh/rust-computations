@@ -45,11 +45,13 @@ use crate::def::{
 };
 use crate::error::CompError;
 use crate::flow::{FlowCompDef, FlowDefAdapter, FlowId, FlowResolver, FlowThunk, flow_aware_param_hash};
+use crate::hashers::IdentityBuildHasher;
+use crate::interner::{SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult, DefId, Hash128, Hash128Map};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
 use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
-use crate::source::{KeyBytes, RawDep, SourceBase, SourceId};
+use crate::source::{RawDep, SourceBase};
 
 /// The result of one execution: the (erased) value, its content hash, and
 /// how long the body itself took to run (for the `comp.eval` tracing
@@ -438,7 +440,13 @@ pub(crate) struct NodeTable {
     /// [`Self::key_of`]).
     def_ids: Vec<DefId>,
     def_index: HashMap<DefId, DefIndex>,
-    source_deps: HashMap<NodeRef, HashSet<RawDep>>,
+    /// Each node's recorded source dependencies, keyed on an interned
+    /// [`SrcKeyId`] rather than a raw `(SourceId, KeyBytes)` pair (Stage
+    /// 13 — see `docs/persistence-benchmark-notes.md`); still hashed with
+    /// `std`'s default `SipHash`, not `IdentityBuildHasher`, because
+    /// [`SrcDep`] carries raw version bytes (see `crate::hashers`'s docs on
+    /// why that disqualifies it, same as `RawDep`).
+    source_deps: HashMap<NodeRef, HashSet<SrcDep>>,
     outputs: HashMap<NodeRef, HashSet<RawOutput>>,
     inflight: HashMap<NodeRef, SharedExec>,
     /// A flow-argument node's ordered [`FlowId`]s (Stage 9 — see
@@ -670,29 +678,35 @@ impl NodeTable {
 
     // -- sparse side tables (`source_deps`/`outputs`/`inflight`) --
 
-    pub(crate) fn source_deps_iter(&self, r: NodeRef) -> impl Iterator<Item = &RawDep> {
+    pub(crate) fn source_deps_iter(&self, r: NodeRef) -> impl Iterator<Item = &SrcDep> {
         self.source_deps.get(&r).into_iter().flatten()
     }
 
-    pub(crate) fn source_deps_contains(&self, r: NodeRef, dep: &RawDep) -> bool {
-        self.source_deps.get(&r).is_some_and(|deps| deps.contains(dep))
+    /// Whether `r` currently has a dependency on exactly `key_id` at
+    /// exactly `ver`. A linear scan, not a `HashSet::contains` lookup: it
+    /// would need an owned `SrcDep` (a `ver.to_vec()` allocation) to probe
+    /// with, and a node's own distinct source-dep count stays small in
+    /// practice — the same tradeoff `DefTable::comp_deps`'s docs make for
+    /// `SmallVec` fan-in/fan-out lists.
+    pub(crate) fn source_deps_contains(&self, r: NodeRef, key_id: SrcKeyId, ver: &[u8]) -> bool {
+        self.source_deps.get(&r).is_some_and(|deps| deps.iter().any(|d| d.key_id == key_id && d.ver == ver))
     }
 
-    pub(crate) fn source_deps_clone(&self, r: NodeRef) -> HashSet<RawDep> {
+    pub(crate) fn source_deps_clone(&self, r: NodeRef) -> HashSet<SrcDep> {
         self.source_deps.get(&r).cloned().unwrap_or_default()
     }
 
     /// Removes and returns `r`'s source deps (empty if it had none),
     /// leaving no entry behind — the side-table equivalent of clearing a
     /// plain field.
-    pub(crate) fn take_source_deps(&mut self, r: NodeRef) -> HashSet<RawDep> {
+    pub(crate) fn take_source_deps(&mut self, r: NodeRef) -> HashSet<SrcDep> {
         self.source_deps.remove(&r).unwrap_or_default()
     }
 
     /// Merges `raw` into `r`'s source-dep set, creating the entry if this
     /// is its first one. A no-op for an empty `raw`, so a node that never
     /// reads any source never gets an entry at all.
-    pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &HashSet<RawDep>) {
+    pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &HashSet<SrcDep>) {
         if raw.is_empty() {
             return;
         }
@@ -740,7 +754,7 @@ impl NodeTable {
 struct PreRunSnapshot {
     old_hash: Option<Hash128>,
     old_outputs: HashSet<RawOutput>,
-    old_source_deps: HashSet<RawDep>,
+    old_source_deps: HashSet<SrcDep>,
 }
 
 /// What `prepare` decided to do about an evaluation request. Generic over
@@ -812,7 +826,19 @@ pub(crate) struct EngineInner {
     /// without scanning the whole node table. Stores [`NodeRef`]s rather
     /// than full [`CompKey`]s for the same reason `DefTable::comp_deps`/
     /// `rdeps` do — see [`NodeRef`]'s docs.
-    pub(crate) source_index: Mutex<HashMap<(SourceId, KeyBytes), HashSet<NodeRef>>>,
+    ///
+    /// Keyed on [`SrcKeyId`] rather than a raw `(SourceId, KeyBytes)` pair
+    /// (Stage 13 — see `docs/persistence-benchmark-notes.md`), and hashed
+    /// with [`IdentityBuildHasher`]: an id is an opaque process-local `u32`
+    /// this process itself assigned, never adversary-chosen byte content —
+    /// see `crate::hashers`'s docs on why that's exactly the shape of key
+    /// this hasher is safe for.
+    pub(crate) source_index: Mutex<HashMap<SrcKeyId, HashSet<NodeRef>, IdentityBuildHasher>>,
+    /// Refcounted `(SourceId, key bytes) -> SrcKeyId` interner backing
+    /// `source_deps`/`source_index` — see [`crate::interner`]'s module
+    /// docs for the full design (including reclamation and why versions
+    /// are deliberately left uninterned).
+    pub(crate) src_key_interner: Mutex<SrcKeyInterner>,
     /// Root applications (evaluated via `Engine::eval_root`), so the
     /// driver's liveness GC knows which nodes are reachable from outside the
     /// graph and must not be collected even with no `rdeps`.
@@ -1178,7 +1204,7 @@ impl EngineInner {
                     (new_source_deps, new_outputs)
                 });
 
-                self.remove_stale_source_index(node_ref, &old_source_deps, &new_source_deps);
+                self.reconcile_source_deps(node_ref, &old_source_deps, &new_source_deps);
 
                 let dropped_outputs: HashSet<RawOutput> =
                     old_outputs.iter().filter(|o| !new_outputs.contains(o)).cloned().collect();
@@ -1201,53 +1227,94 @@ impl EngineInner {
                 // Errors are not memoized: leave the node `Dirty` (not
                 // `Clean`) so the next eval retries instead of reusing the
                 // stale (or absent) value.
-                self.timed(crate::lock_stats::LockSite::RunFinishError, || {
+                let new_source_deps = self.timed(crate::lock_stats::LockSite::RunFinishError, || {
                     let mut nodes = self.nodes.lock().unwrap();
                     nodes.set_state(node_ref, NodeState::Dirty);
                     nodes.inflight_clear(node_ref);
+                    nodes.source_deps_clone(node_ref)
                 });
+                // A failed run may still have recorded some deps via
+                // `record_source_deps` before it errored out (whatever it
+                // read before failing) -- reconciling against `old` here,
+                // exactly as the success path does, is what keeps
+                // `src_key_interner`'s refcounts correct: `old_source_deps`
+                // was already taken out of the node table in `prepare`
+                // (before this run started), so if this reconciliation
+                // never ran, its references would simply never be
+                // released, leaking one interned id per failed run's
+                // stale dependency. See `crate::interner`'s module docs.
+                self.reconcile_source_deps(node_ref, &old_source_deps, &new_source_deps);
                 tracing::debug!(outcome = "error", error = %e, "comp.eval finished");
                 Err(e)
             }
         }
     }
 
-    /// Drops `key` from `source_index`'s `(source, key-bytes)` bucket for
-    /// every source dependency it read last run (`old`) but not this run
-    /// (`new`) — so a node that has genuinely stopped reading some
-    /// `(source, key-bytes)` pair no longer receives its future change
-    /// notifications.
+    /// Reconciles `r`'s recorded source dependencies after a run (Stage 13
+    /// — see `docs/persistence-benchmark-notes.md` — this is the renamed,
+    /// interner-aware `remove_stale_source_index`): retains a fresh
+    /// `src_key_interner` reference for every dependency identity `r`
+    /// gained (in `new` but not `old`), then drops `source_index`'s
+    /// registration *and* the interner reference for every identity it
+    /// lost (in `old` but not `new`) — so a node that has genuinely
+    /// stopped reading some key no longer receives its future change
+    /// notifications, and the key's interned id is reclaimed once nothing
+    /// else references it either.
     ///
-    /// Compares `old`/`new` by `(source, key-bytes)` identity, deliberately
-    /// ignoring `ver`: `source_index` itself is keyed on identity alone (it
-    /// has no notion of version), so a node that re-reads the *same*
-    /// `(source, key-bytes)` pair at a newer version — the ordinary case
-    /// for any node whose source input just changed — must stay registered
-    /// for it. Diffing `RawDep`'s full equality (as this used to) instead
+    /// Compares `old`/`new` by [`SrcKeyId`] identity, deliberately ignoring
+    /// `ver`: `source_index` (and the interner's refcount) has no notion of
+    /// version, so a node that re-reads the *same* key at a newer version —
+    /// the ordinary case for any node whose source input just changed —
+    /// must stay registered for it and must not transiently release its
+    /// reference. Diffing by full equality (key *and* version) instead
     /// treats every version bump as "the old dep vanished, a new one
-    /// appeared", which deletes the node's own just-(re)inserted
-    /// registration for that identical pair one statement later,
-    /// orphaning it: the very next change to that key would then map to no
-    /// node at all in `affected_keys`, permanently.
-    fn remove_stale_source_index(&self, r: NodeRef, old: &HashSet<RawDep>, new: &HashSet<RawDep>) {
+    /// appeared", which would delete the node's own just-(re)inserted
+    /// registration one statement later, orphaning it — the very next
+    /// change to that key would then map to no node at all in
+    /// `affected_keys`, permanently (this was a real, fixed bug; see
+    /// `successive_live_changes_to_the_same_key_each_trigger_a_rerun` in
+    /// `tests/driver.rs`).
+    ///
+    /// Retains before releasing, in that order: see [`crate::interner`]'s
+    /// module docs on why the ordering matters when the same key is read
+    /// again this run.
+    fn reconcile_source_deps(&self, r: NodeRef, old: &HashSet<SrcDep>, new: &HashSet<SrcDep>) {
         if old == new {
             return;
         }
-        let new_pairs: HashSet<(SourceId, KeyBytes)> =
-            new.iter().map(|dep| (dep.source.clone(), dep.key.clone())).collect();
+        let old_ids: HashSet<SrcKeyId> = old.iter().map(|d| d.key_id).collect();
+        let new_ids: HashSet<SrcKeyId> = new.iter().map(|d| d.key_id).collect();
+        if old_ids == new_ids {
+            // A pure version bump on every dependency: no identity actually
+            // changed, so neither `source_index` nor the interner has
+            // anything to do.
+            return;
+        }
         self.timed(crate::lock_stats::LockSite::RemoveStaleSourceIndex, || {
-            let mut index = self.source_index.lock().unwrap();
-            for dep in old {
-                let idx_key = (dep.source.clone(), dep.key.clone());
-                if new_pairs.contains(&idx_key) {
-                    continue;
+            {
+                let mut interner = self.src_key_interner.lock().unwrap();
+                for &id in new_ids.difference(&old_ids) {
+                    interner.retain(id);
                 }
-                if let Some(set) = index.get_mut(&idx_key) {
-                    set.remove(&r);
-                    if set.is_empty() {
-                        index.remove(&idx_key);
+            }
+            let dropped: Vec<SrcKeyId> = old_ids.difference(&new_ids).copied().collect();
+            if dropped.is_empty() {
+                return;
+            }
+            {
+                let mut index = self.source_index.lock().unwrap();
+                for &id in &dropped {
+                    if let Some(set) = index.get_mut(&id) {
+                        set.remove(&r);
+                        if set.is_empty() {
+                            index.remove(&id);
+                        }
                     }
                 }
+            }
+            let mut interner = self.src_key_interner.lock().unwrap();
+            for id in dropped {
+                interner.release(id);
             }
         });
     }
@@ -1540,23 +1607,53 @@ impl EngineInner {
         self.roots.lock().unwrap().insert(key);
     }
 
+    /// Records `raw` as `caller`'s source dependencies for the run
+    /// currently in progress.
+    ///
+    /// Interns every dep's raw `(source, key)` bytes into a [`SrcKeyId`]
+    /// *before* either lock below (Stage 13 — see
+    /// `docs/persistence-benchmark-notes.md`), so the two critical sections
+    /// that actually dominate this call's frequency — one per source read,
+    /// across every node in the graph — never hash a byte vector: they only
+    /// ever compare/insert a `u32`. Interning itself still hashes the raw
+    /// bytes once per dep (unavoidable — it's the only way to recognize a
+    /// key seen before), but against `src_key_interner`'s own map, sized by
+    /// the number of *distinct* keys a workload has (300 on
+    /// `persist_bench`), not by the number of dependents reading them
+    /// (205,000) — see [`crate::interner`]'s module docs.
+    ///
+    /// Does *not* retain a reference for any newly-interned id: interning
+    /// alone never implies a live reference (see
+    /// [`crate::interner::SrcKeyInterner::intern`]'s docs) — that happens
+    /// only once this run settles, in [`Self::reconcile_source_deps`],
+    /// which is the one place that actually knows whether a given identity
+    /// is new to `caller` or one it already held.
     pub(crate) fn record_source_deps(&self, caller: &CompKey, raw: HashSet<RawDep>) {
         if raw.is_empty() {
             return;
         }
+        let interned: HashSet<SrcDep> = self.timed(crate::lock_stats::LockSite::RecordSourceDepsIntern, || {
+            let mut interner = self.src_key_interner.lock().unwrap();
+            raw.iter()
+                .map(|dep| SrcDep {
+                    key_id: interner.intern(&dep.source, &dep.key),
+                    ver: dep.ver.clone(),
+                })
+                .collect()
+        });
         let caller_r = self.timed(crate::lock_stats::LockSite::RecordSourceDepsNodes, || {
             let mut nodes = self.nodes.lock().unwrap();
             let r = nodes.id_of(caller);
             if let Some(r) = r {
-                nodes.extend_source_deps(r, &raw);
+                nodes.extend_source_deps(r, &interned);
             }
             r
         });
         let Some(caller_r) = caller_r else { return };
         self.timed(crate::lock_stats::LockSite::RecordSourceDepsIndex, || {
             let mut index = self.source_index.lock().unwrap();
-            for dep in raw {
-                index.entry((dep.source, dep.key)).or_default().insert(caller_r);
+            for dep in interned {
+                index.entry(dep.key_id).or_default().insert(caller_r);
             }
         });
     }
@@ -2053,7 +2150,8 @@ impl EngineBuilder {
             inner: Arc::new(EngineInner {
                 defs: Mutex::new(self.defs),
                 nodes: Mutex::new(NodeTable::new(self.def_order)),
-                source_index: Mutex::new(HashMap::new()),
+                source_index: Mutex::new(HashMap::default()),
+                src_key_interner: Mutex::new(SrcKeyInterner::new()),
                 roots: Mutex::new(CompKeySet::default()),
                 registry: self.registry,
                 dirty_tx,

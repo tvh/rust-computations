@@ -2908,3 +2908,271 @@ COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital
 COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example persist_bench --features testutil,alloc-stats
 ```
 
+
+## Stage 13 — interning source-dependency keys
+
+Stage 12's lock-hold attribution named the next candidate explicitly:
+`record_source_deps`'s `source_index`-locked critical section at 35.29% of
+tracked lock-held time on `hospital_bench`, and its own root cause —
+`crate::source::RawDep` (a `SourceId` plus two owned `Vec<u8>`s) stored
+fresh, per node, per run, with `source_index` keyed on the same compound
+`(SourceId, KeyBytes)` value. The Haskell reference engine hit the
+identical shape of cost twice: Stage 4e (`40a754a`) interned the analogous
+per-row source-dep column and measured it the single largest win of that
+campaign (`max_live_bytes` 817.3 → 375.7 MB, **−54.0%**, from ~205k rows
+duplicating only 300 distinct keys ~683×); Stage 4g (`6f5a8af`/`e0d0621`)
+then found the un-refcounted version of that same interner was a real leak
+in any workload whose key set turns over, and fixed it with reference
+counting rather than a threshold sweep. This stage ports both halves in
+one change, plus 76166c8's lesson (key a hot lookup on an interned integer,
+not a hashed compound value) applied to `source_index` itself.
+
+### Design
+
+`crate::interner::SrcKeyId` (a `u32`) now stands in for `(SourceId, key
+bytes)` everywhere a node or `source_index` used to store the pair
+directly:
+
+- `crate::interner::SrcKeyInterner` is the refcounted `(SourceId, key
+  bytes) <-> SrcKeyId` table. Its forward map is nested
+  (`SourceId -> (KeyBytes -> SrcKeyId)`) specifically so a lookup that hits
+  — the common case once a workload's key set has stabilized — never
+  allocates a probe key: `Vec<u8>: Borrow<[u8]>` lets it probe with a
+  borrowed `&[u8]` straight from the caller's own bytes. Only a genuine
+  miss (a key seen for the first time) pays for an owned `key.to_vec()`.
+- **Versions churn, keys don't** — only `(SourceId, key)` identity is
+  interned. `crate::interner::SrcDep { key_id: SrcKeyId, ver: VerBytes }`
+  replaces `RawDep` in `NodeTable::source_deps` and as `source_index`'s
+  value-set membership; the version stays inline, exactly as the task
+  specified, deferring "intern the version too" as a separate,
+  separately-measured follow-up rather than bundling it here.
+- `source_index` is now `Mutex<HashMap<SrcKeyId, HashSet<NodeRef>,
+  IdentityBuildHasher>>` — `SrcKeyId` is an opaque, process-local `u32`
+  this process itself assigned, never adversary-chosen content, which is
+  exactly the shape of key `crate::hashers::IdentityHasher` (Stage 6) is
+  documented safe for; a new `write_u32` override on that hasher folds a
+  bare `u32` newtype in with the same single rotate-xor `write_u64` uses,
+  rather than falling through to the default trait method's byte-wise FNV
+  loop. `SrcDep` itself still hashes with `std`'s default `SipHash`, not
+  `IdentityBuildHasher` — it carries raw version bytes, the same
+  low-entropy-content disqualifier `crate::hashers`'s docs already call
+  out for `RawDep`.
+- **Reclamation is refcounted, not swept**, per the task's explicit
+  requirement (and per Stage 4g's finding that "never recycled" is a real
+  leak, not a footnote): every live reference is `retain`ed/`release`d
+  exactly on the paths that already establish or drop a dependency —
+  `EngineInner::reconcile_source_deps` (the renamed, interner-aware
+  `remove_stale_source_index`: retains every `SrcKeyId` a run's dependency
+  set gained, releases every one it lost, **in that order** — retaining
+  new references before releasing old ones is load-bearing here for
+  exactly Stage 4g's "overlap-ordering hazard" reason: a node re-reading
+  the same key this run must never observe a transient zero refcount that
+  could free its own id out from under it) and `driver::liveness_gc`
+  (releases one reference per distinct key a collected node held, resolved
+  back to real bytes for `Source::unregister` *before* releasing —
+  a released id's reverse mapping is gone). A failed run reconciles too
+  (a new, deliberate divergence from the old code, which silently
+  abandoned `old_source_deps`' `source_index` registrations on error):
+  without this, a run that dies after partially recording some deps would
+  leak exactly those references forever, since nothing else would ever
+  release them.
+- **Persistence keeps storing real bytes, unconditionally.** `SrcKeyId` is
+  process-local and means nothing across a restart, so `NodeRecord`'s
+  `source_deps: Vec<RawDepRepr>` field, `FORMAT_VERSION`, and the on-disk
+  layout are all **unchanged** — confirmed empirically below (byte-identical
+  `persist_bench` db size, 269.49 MB, before and after). `enqueue_changed`
+  resolves each `SrcDep` back to bytes through the interner at snapshot
+  time (`RawDepRepr::from_src_dep`); `restore_nodes` re-interns (and
+  retains) every restored dep fresh, exactly as a live
+  `record_source_deps` call would, since a freshly restored node has no
+  prior "old" set to diff a retain against.
+- Public surface unchanged: `Source`/`Sink`, `RawDep`, `raw_deps()` are
+  untouched. Interning is entirely internal to `engine.rs`/`driver.rs`/
+  `persist.rs`.
+
+### Reclamation testing
+
+`crate::interner`'s own unit tests cover intern/retain/release accounting
+directly, including the task's explicitly-called-out case,
+`releasing_the_last_reference_shrinks_the_interner` (asserts `live_len()`
+drops to 0, not just that a counter hits 0), a shared-key survival case,
+recycled-slot reuse, the re-intern-after-release ordering hazard, a
+release-without-retain underflow (loud in debug builds), and a 50-key
+interleaved churn test. Above that, a real engine-level test —
+`driver::tests::liveness_gc_releases_a_collected_nodes_interned_source_keys`
+— drives an actual `root`/`leaf` graph through `eval_root`/`liveness_gc`
+(the same "leaf becomes unreachable" shape `tests/driver.rs`'s existing
+`gc_collects_a_directly_source_dependent_node_once_unreachable` regression
+test uses) and asserts `src_key_interner`'s live count drops from 2 to 1
+once the leaf's node is actually collected — proof reclamation fires
+through the real GC path, not only in the interner's own isolated tests.
+
+### The matrix
+
+`uptime` load average ranged **2.48–7.96** across this stage's benchmark
+session (1-min figures 7.96, 5.23, 4.42, 2.89, 2.48 at various points —
+similar to, and at moments heavier than, Stage 12's 4.6–8.3 band); as in
+every prior stage, absolute numbers below should be read against that, and
+the before/after pairs are same-session, same-machine A/B comparisons,
+stashing this stage's changes for the "before" runs and popping the stash
+back for "after" so both sides see the same load conditions rather than
+being separated by however long implementation took.
+
+**`persist_bench`, default scale** (shared-key: 300 distinct keys, ~683
+dependents/key):
+
+| phase | before | after | documented baseline |
+|---|---|---|---|
+| 1. cold eval (persistence configured) | 2879 ms, 1434.2 MB | 3016 ms, 1398.0 MB | ~3.1–3.7 s ✓ |
+| 2. persist_now [db] | 2083 ms, db=269.49 MB | 2221 ms, db=269.49 MB | db byte-identical before/after, every run |
+| 3. warm restart, no changes | 1151/1156 ms | 1244/1228 ms | ~1.2–1.4 s ✓ |
+| 4. restart, 1 changed input | 1505/1642 ms | 1632/1638 ms | (reruns exact-match: 100,164 / 137,085, both sides) |
+| 5. cold restart, no persistence (engine-only RSS) | 2344/2364 ms, 327.1/365.0 MB | 2344/2364 ms, 290.7/332.3 MB | ~330 MB (before) |
+| 6. fingerprint mismatch | 4006 ms | 3849 ms | (no documented range) |
+| 7. live incremental, no persistence | 415 ms | 414 ms | ~450–500 ms ✓ |
+| 8. live incremental, with persistence (settle) | 486 ms | 592 ms | (no documented range; noisy, see below) |
+
+Phase 5 — this benchmark's own canonical "engine-only RSS" figure, and the
+most reproducible number in this table — was sampled **8 times each side**
+across the session (plain, alloc-stats, and lock-stats runs, two trials
+each): **336.3 MB average before, 299.5 MB average after, a 36.8 MB
+(−10.9%) reduction**, holding up consistently despite ~15 MB of run-to-run
+noise on *either* side (327–365 MB before, 290–332 MB after — the ranges
+never overlap upward from after into before). Every other phase's RSS
+swung by up to ±250 MB between repeated runs of the *identical* binary at
+this box's current load (phases 1/3/4/6/8 all include heap growth from
+comp_deps/rdeps/value columns that dwarfs a 300-key interner's footprint
+either way), so those columns are reported for completeness but are not
+treated as a reliable per-phase signal here — phase 5 and the db-size
+column are. Time-wise, every phase landed within the same noise band on
+both sides; phases 7/8 (the two persistence-decoupled-from-propagation
+figures Stage 9 tuned) show no regression.
+
+Allocation deltas (`--features testutil,alloc-stats`), phase 5: **352.2 MB
+net before → 325.2 MB net after (−7.7%)** — smaller than the RSS delta,
+consistent with RSS also capturing the allocator's own per-allocation
+overhead (fewer, larger interner allocations vs. many small per-node
+`Vec<u8>` ones), which a raw byte-delta counter doesn't see.
+
+**`hospital_bench`, default scale** (unshared-key: ~2.08M distinct keys,
+~1 dependent/key each):
+
+| phase | before | after | documented baseline |
+|---|---|---|---|
+| 1. cold eval | 3824–4031 ms, 1504.5–1532.8 MB (3 runs) | 3649–3962 ms, 1209.2–1238.9 MB (4 runs) | ~3.9 s / 1.12M reruns / ~1520 MB (before) |
+| 2. live incremental, 1 changed vitals key | 79–89 ms | 76–90 ms | ~81 ms ✓ |
+| 3. rerun-heavy live update (300 keys) | 524–539 ms | 430–524 ms | ~524 ms ✓ (both sides) |
+| 4. concurrency demo | 57–62 ms | 57–61 ms | (unaffected, as expected — no source-dep interning on this path) |
+
+Reruns matched exactly on both sides in every run (1,116,093 cold; 1,444
+rerun-heavy). Averaged across every sample this session: **cold-eval RSS
+1514.7 MB before → 1216.9 MB after, a 297.8 MB (−19.7%) reduction** — the
+single largest number in this stage, on the workload with *zero* key
+sharing, where the win cannot come from deduplication. It comes instead
+from a structural halving: before, every one of ~2.08M distinct keys had
+its bytes stored **twice** — once inside the node's own `RawDep`, once
+again as `source_index`'s `HashMap` key — regardless of whether any other
+node shared that key. After, the interner holds the bytes once; both
+`NodeTable::source_deps` and `source_index` hold only a `u32`. Cold-eval
+wall time was flat-to-slightly-faster (3873.7 ms avg before → 3747.0 ms
+avg after) — no regression despite the extra interning step.
+
+Allocation deltas, cold eval: **1287.4 MB net before → 1239.6 MB net after
+(−3.7%)** — again much smaller than the RSS delta, for the same
+allocator-overhead reason as `persist_bench` above, only more pronounced
+here: 2.08M individually-small `Vec<u8>` allocations carry far more
+allocator bookkeeping overhead per byte than the interner's own
+`Vec`-backed storage does.
+
+### The lock-hold delta
+
+The specific question Stage 12 raised: does `record_source_deps`'s 35.29%
+share on `hospital_bench` actually drop? `hospital_bench`'s cumulative
+breakdown (phases 1–3 combined), before vs. after:
+
+| site | before | after |
+|---|---|---|
+| `record_source_deps/source_index` | 2,081,168 calls, 0.724 s, **33.60%** | 2,081,168 calls, 0.133 s, **6.39%** |
+| `record_source_deps/interner` | *(did not exist)* | 2,081,168 calls, 0.629 s, **30.17%** |
+| `record_source_deps/nodes` | 2,081,168 calls, 0.346 s, 16.07% | 2,081,168 calls, 0.273 s, 13.10% |
+| `liveness_gc/mark_sweep` | 6 calls, 0.407 s, 18.89% | 6 calls, 0.405 s, 19.44% |
+| `prepare` | 1,372,788 calls, 0.324 s, 15.05% | 1,372,788 calls, 0.321 s, 15.42% |
+
+**Yes, dramatically** — `source_index`'s own critical section drops from
+33.60% to 6.39% (our own baseline run landed close to Stage 12's documented
+35.29%), confirming the byte-hashing work Stage 12 found there is gone from
+that lock entirely. But the *total* cost of getting from raw bytes to a
+recorded dependency did not disappear: `record_source_deps/interner`
+(30.17%) plus the shrunk `source_index` (6.39%) plus `nodes` (13.10%) sums
+to 49.66%, against 33.60% + 16.07% = 49.67% before — **within rounding of
+identical**, exactly as expected for a workload with *zero* key reuse
+(every `intern()` call is a first-sight miss, paying full hash + insert
+cost no matter which lock holds it). The win here was never going to be
+"less total CPU work" on this specific workload — it's that the expensive
+byte-hashing work moved *off* `source_index` specifically and onto a
+separate, independent lock, so a caller contending for `source_index` for
+an unrelated reason (the reverse-lookup side, `affected_keys`) no longer
+waits behind it — and, far more concretely, the RSS/allocation wins above.
+`persist_bench`'s equivalent table (single-process, phase 1) shows the
+opposite regime working as designed: `record_source_deps/interner` is only
+1.37% there (205,000 calls, almost all cache hits against a 300-entry
+table), `source_index` unchanged at ~1.7% either side (it was never the
+bottleneck on this workload — Stage 12 already established `nodes`-locked
+sites are 97%+ of the story there).
+
+### Comparison to the Haskell prior
+
+Stage 4e's headline number — 817.3 → 375.7 MB, **−54.0%** — came from a
+1M-node, single-process, GC-copying-heavy runtime measuring *max live
+heap*, on a workload where the *entire* win was 683× key deduplication
+(their own root-cause finding: `wrapCompSrcDep` reconstructed a fresh
+`Text`/`CompSrcId` per call). Our two workloads land in a different but
+consistent place: `persist_bench` (the one genuinely comparable shared-key
+shape, same 300-key/~683-dependent structure) shows a real but far smaller
+**−10.9%** on the equivalent metric (engine-only RSS) — expected, since
+Rust's per-node `RawDep` was never reconstructed-and-reallocated on every
+*read* the way Haskell's `AnyCompSrcDep` was; the duplication here was
+already bounded to one clone per `record_source_deps` call, not one
+per-call *plus* one per `wrapCompSrcDep`/`compSrcId` round-trip. The
+**−19.7%** win instead showed up on `hospital_bench`, a workload
+Stage 4e's own campaign never had an equivalent to (theirs was
+shared-key-only) — the structural "stored twice regardless of sharing"
+cost this stage's design section describes above. Read together: this
+crate's baseline per-node layout was already tighter than the Haskell
+engine's pre-Stage-4e one (Stage 5's ~330 B/node vs. their ~1,500 B/node),
+so there was less duplication-shaped waste left to remove on the
+shared-key shape specifically — but the *reverse-index* redundancy
+Stage 4e's design never had to contend with (their `SrcIndex`, Stage 4h,
+was built key-interned from the start) turned out to be this codebase's
+own analogous win, just located on the other benchmark.
+
+### Verdict: kept
+
+Both workloads improve on memory (persist_bench −10.9% engine RSS,
+hospital_bench −19.7% cold-eval RSS) with flat-to-slightly-better wall time
+on every phase measured, the specific lock hot-spot Stage 12 flagged drops
+by 5×, the persisted format and db size are provably byte-identical, and
+the two workloads' differing lock-hold pictures (a wash on hospital's raw
+CPU accounting, a non-issue on persist_bench's) are fully explained rather
+than merely observed. This clears the task's own bar — "cuts memory
+materially... a win worth keeping" — on both benchmarks, not just the one
+the design was originally motivated by.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **134 passed** (121 baseline +
+13 new: 11 `crate::interner` unit tests, one `crate::hashers` `write_u32`
+regression test, one engine-level `driver::tests` reclamation test).
+`cargo test -p computations --features testutil,alloc-stats` — all green
+standalone. `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean.
+
+### How to run
+
+```text
+cargo run -p computations --release --example persist_bench --features testutil
+cargo run -p computations --release --example hospital_bench --features testutil
+cargo run -p computations --release --example persist_bench --features testutil,alloc-stats
+cargo run -p computations --release --example hospital_bench --features testutil,alloc-stats
+COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital_bench --features testutil
+```

@@ -26,7 +26,15 @@
 //! attacker-controlled or low-entropy bytes** (e.g. `crate::source::RawDep`
 //! or other string/byte-keyed side tables) -- those still need `std`'s
 //! default SipHash and are deliberately left alone; see the call sites that
-//! use this module for which key types qualify.
+//! use this module for which key types qualify. `crate::interner::SrcKeyId`
+//! is the same shape of exception as `Hash128`: it is a dense, process-local
+//! `u32` handle assigned by `crate::interner::SrcKeyInterner`, never a value
+//! an adversary chooses directly, so `crate::engine::EngineInner`'s
+//! `source_index` (keyed on it, Stage 13 -- see
+//! `docs/persistence-benchmark-notes.md`) uses this hasher too. The raw
+//! key/version *bytes* a `SrcKeyId` stands in for stay off this hasher
+//! entirely -- interning them is exactly what removes them from any hot,
+//! per-dependent hash path.
 //!
 //! ## Design
 //!
@@ -40,6 +48,12 @@
 //!   mixing at all. For a multi-field key (e.g. `crate::key::CompKey`,
 //!   whose `Hash` impl also hashes a short `DefId` string first), the
 //!   rotate-xor still combines both fields' contributions correctly.
+//! - `write_u32` -- what a bare `u32` newtype (e.g.
+//!   `crate::interner::SrcKeyId`) hashes through -- folds in via the same
+//!   rotate-xor as `write_u64`/`write_u128` rather than falling through to
+//!   the default trait method (which would `write()` its 4 bytes through
+//!   the FNV fold below instead: correct, but a multi-step loop where one
+//!   `rotate_left`/`xor` does the same job in one instruction).
 //! - `write` (arbitrary bytes) falls back to a plain FNV-1a fold, cheap and
 //!   correct for the short, non-adversarial byte spans this hasher
 //!   otherwise ever sees (a `DefId`'s name, a handful of bytes) -- still no
@@ -63,6 +77,10 @@ impl Hasher for IdentityHasher {
             h = h.wrapping_mul(0x0000_0100_0000_01B3); // FNV-1a prime
         }
         self.0 = h;
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
     }
 
     fn write_u64(&mut self, i: u64) {
@@ -108,6 +126,18 @@ mod tests {
         let h128 = Hash128::from_bytes(bytes);
         let expected = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         assert_eq!(hash_of(&h128), expected);
+    }
+
+    #[test]
+    fn write_u32_matches_write_u64_zero_extended() {
+        // A bare `u32` newtype (e.g. `crate::interner::SrcKeyId`) must fold
+        // in exactly like `write_u64` would on its zero-extended value, not
+        // fall through to the default trait method's byte-wise FNV fold.
+        let mut via_u32 = IdentityHasher::default();
+        via_u32.write_u32(0x1234_5678);
+        let mut via_u64 = IdentityHasher::default();
+        via_u64.write_u64(0x1234_5678);
+        assert_eq!(via_u32.finish(), via_u64.finish());
     }
 
     #[test]
