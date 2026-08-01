@@ -2375,3 +2375,244 @@ existing hot paths.
   workspace (including `dirsync`) binds every argument by a plain name
   already.
 
+## Stage 11 — the hospital benchmark (unshared-key workload)
+
+A second benchmark, `examples/hospital_bench.rs`, ported from
+`haskell-computations`'s `bench/Control/Computations/Demos/Bench/{Hospital,SystemSrc}.hs`
+(commits `77520f3`, `978c03c`, `d3de930`; graph-shape/measurement rationale in
+that repo's own `docs/benchmark-notes.md`, Stages 5–7). `persist_bench`'s
+1M-instance graph is *shared-key*: 205,000 level-0 instances read only 300
+distinct `MemKvSource` keys (`i % SRC_KEYS`), ~683 dependents per key, zero
+source latency, and every comp body issues exactly one source read via a
+single sequential `.await`. Two whole classes of optimization can never move
+that graph's numbers regardless of whether they're implemented correctly:
+anything that pays per *distinct interned source key* (300 keys is free no
+matter how it's stored) and anything that pays per *source round trip*
+(uncontended and free at zero latency, with nothing ever dispatched
+concurrently). `hospital_bench` exists to make both non-trivial.
+
+### What the Haskell original measures
+
+Five `SystemSrc` instances (admissions/discharge/transfer, vitals, labs,
+pharmacy, notes) stand in for separate clinical systems, each with a
+configurable simulated per-call latency (`threadDelay`), a call counter, and
+a concurrency high-water mark. `ApplicativeDo` desugars independent monadic
+binds into a real `<*>`-combined `CompReqCombined` batch, so most comp
+bodies' multi-key reads (vitals: value/unit/range, labs: result/range/
+specimen, meds: order/drug, notes: text/author) dispatch as genuine
+applicative batches, and `patientSummaryComp` reads one key from all five
+sources in a single 8-leaf batch. No key is ever shared between two
+dependents by design (~1.6M source calls against ~1.6M distinct keys, "every
+reading is its own clinical fact"). It reports cold-eval wall time and
+achieved instance count (an exact analytic target, not sampled), a
+single-key live update, a rerun-heavy multi-key live update, RSS/
+`max_live_bytes`, and per-source call/batch-call counts plus a concurrency
+high-water mark — and a separate width×latency grid (scale 0.05, latency
+500 µs) showing cold-eval speedup up to the graph's own widest-batch ceiling
+(a 5-leaf plateau at width 4).
+
+### What was ported, adapted, and dropped
+
+**Kept**: the five-source clinical-system shape and names; the unshared-key
+design (every leaf reads a key no other computation instance reads);
+`SystemSrc`'s three defining properties as `LatencySource` (configurable
+per-call latency via `tokio::time::sleep`, a call counter, a concurrency
+high-water mark); the self-recursive lab-trend chain with a per-patient
+depth cap in `[1, 5]` (`lab_trend_chain_cap`, identical formula); the one
+deliberately cross-system 5-key batch (`patient_summary`); ward/hospital-
+level rollups culminating in one root; a rerun-heavy live phase spreading
+mutations across all five sources via a large-prime stride.
+
+**Adapted, not transliterated**: `Ctx` has no `ApplicativeDo`-style
+desugaring (or any engine-level request-combining type at all — see "Open
+candidates" below), so every genuinely-independent multi-key read is written
+explicitly with `futures::try_join!`/`Ctx::eval_all`, which drives the
+underlying futures concurrently within tokio's cooperative scheduler. This
+is arguably a more honest port than a mechanical translation would be:
+nothing here secretly serializes what the source visually presents as
+concurrent, and — see the measured table below — it demonstrates real,
+substantial latency-hiding with **no width knob at all**: `Ctx::eval_all`
+and `try_join!` simply build one future tree that tokio polls cooperatively,
+and a `LatencySource::execute` call overlaps with any other pending call
+against the same instance for free as long as it doesn't serialize itself
+(it doesn't — the simulated delay is a plain `sleep`, held across no lock).
+The Haskell original's `HOSPITAL_BENCH_CONCURRENCY` knob bounds a hand-rolled
+worker pool that a wide batch's source leaves get dispatched to; this
+crate's engine has no equivalent worker-pool concept to bound, and inventing
+a per-source semaphore purely for this benchmark would measure a feature
+that doesn't exist rather than the engine that does — so there is
+deliberately no width knob here, only the measured, empirical high-water
+mark each run actually achieves.
+
+**Dropped**: the Haskell module's entire "pack every multi-field param/
+result into a bare `Word64`" section (a real ~5% memory win *there*,
+extensively justified in that module's own haddock). That whole exercise
+exists because GHC's per-def column storage only unboxes a column whose
+type is one of a fixed literal whitelist (`Word32`/`Word64`/`Int`/`Char`/
+`Bool`/`Double`); a tuple or newtype never qualifies regardless of its
+fields' types. This crate's per-def value column (`crate::def::CompDef`'s
+`Mutex<Vec<Option<R>>>`, Stage 5 above) is an ordinary generic `Vec` with no
+such whitelist — a `(u32, u32)` tuple is exactly as cheap as a bare `u64`
+here, so `admission`'s result is a plain `(WardId, u32)` tuple.
+
+**Simplified**: `interaction` checks only adjacent medication-order pairs
+(`MEDS_PER_PATIENT - 1` per patient) rather than the Haskell original's full
+`C(18, 2) = 153` all-pairs check. Both exist purely to give `interaction`'s
+body two independent upstream reads to join concurrently; all-pairs buys no
+further coverage of that property for ~8x the per-patient instance count.
+
+Resulting per-patient shape: 744 instances (admission 1, vital 200,
+vital_window 40, lab_result 180, lab_trend 180, med_order 20, interaction
+19, note 100, note_digest/risk_score/patient_summary/patient_alert 1 each)
+and 1,386 source calls (2 adt, 601 vitals, 541 labs, 41 pharmacy, 201
+notes) — at the default scale (1,500 patients, 30 wards), 1,116,093
+instances and 2,079,000 source calls against very close to that many
+*distinct* keys (a handful of keys — the ones `patient_summary`'s
+cross-system batch re-reads at sub-id 0 — are read by exactly 2 dependents;
+every other key by exactly 1).
+
+### Shared-key vs. unshared-key: which candidates each shape can measure
+
+| workload | distinct keys | dependents/key | source latency | can measure |
+|---|---|---|---|---|
+| `persist_bench` | 300 (fixed, any scale) | ~683 | 0 | fan-in/rerun-cost, columnar memory, dirty-propagation cost |
+| `hospital_bench` | ~2.07M at default scale (scales with graph size) | ~1 | configurable | per-key interning cost, latency-hiding, redundant-call elimination |
+
+Concretely, of the three open candidates this task named:
+
+- **Interning source-dep key bytes** (`crate::source::RawDep` stores each
+  key as an owned, uninterned `Vec<u8>` today): invisible on
+  `persist_bench` — 300 keys cost nothing to store redundantly at any scale.
+  `hospital_bench` already puts a number on the ceiling: its cold-eval RSS
+  is **~1,363 B/instance** (1,521.3 MB / 1,116,093 instances) against
+  `persist_bench`'s own no-persistence baseline of **~332 B/instance**
+  (Stage 5's own reported figure, reconfirmed below) — a **~4.1x** per-
+  instance cost, on a graph that (per source call, not per instance) reads
+  roughly 10x more source keys than `persist_bench` and shares almost none
+  of them. Interning would only be able to close *some* of that gap (this
+  benchmark's design deliberately never reads the same key twice from
+  unrelated call paths except at `patient_summary`'s 5 sub-id-0 keys per
+  patient, so there is little redundancy for an intern table to remove
+  within a single run) — the more relevant comparison is the *baseline*
+  cost of storing ~2M never-reused keys as owned `Vec<u8>` versus whatever a
+  small-string/interned representation would cost instead.
+- **A Zero/One/Many `source_index` representation** (only meaningful when
+  most keys have very few dependents): `persist_bench`'s ~683
+  dependents/key makes every bucket "Many" unconditionally — nothing to
+  measure. `hospital_bench`'s ~1 dependent/key is exactly the shape such a
+  representation targets; this benchmark is what would need to be re-run
+  before/after that change to show a win.
+- **Source-request bundling/dedup within an `eval_all` batch** (a
+  `compSrcExecuteBatch`-style hook collapsing several requests bundled
+  against one source instance into a single round trip): needs a source
+  with real latency to show anything at zero cost per call, bundling is
+  unmeasurable regardless of shape — exactly why `persist_bench`'s
+  zero-latency `MemKvSource` could never evaluate this candidate.
+  `hospital_bench`'s concurrency-demo phase already demonstrates the
+  *opportunity*: at 10 patients / 2,000 µs latency, `vitals` alone served
+  6,010 requests with a concurrency high-water mark of 6,000 — i.e.
+  essentially every one of those requests was in flight at once, each
+  paying its own full 2,000 µs delay independently (no engine-level
+  dedup/bundling exists for `Source::execute` today, unlike `Ctx::eval`'s
+  own single-flight dedup for repeated `(comp, param)` pairs). A handful of
+  keys (e.g. `vitals/value/p{p}/v0`) are read twice per patient from two
+  unrelated call paths (`vital(p, 0)` directly, and `patient_summary`'s
+  cross-system batch) — each such pair pays two full round trips today; a
+  bundling layer could collapse them to one.
+
+### Measured table
+
+`uptime` load average **4.4–4.5** (1-min ~4.5, 5-min 4.4, 15-min 4.3) on
+this box at benchmark time — moderately loaded, same rough range as recent
+sessions in this document; read the absolute numbers against that, and
+prefer the relative comparisons (ratios, speedups) over the raw ones.
+`cargo run -p computations --release --example hospital_bench --features
+testutil`, default scale (`HOSPITAL_BENCH_SCALE=1`, `HOSPITAL_BENCH_SRC_LATENCY_US=0`):
+
+| phase | time (ms) | reruns | RSS (MB) |
+|---|---|---|---|
+| 1. cold eval | 3,866 | 1,116,093 | 1,521.3 |
+| 2. live incremental, 1 changed vitals key | 81 | 6 | 1,584.7 |
+| 3. rerun-heavy live update (300 keys mutated) | 524 | 1,444 | 1,594.4 |
+| 4. concurrency demo (10 patients, 2,000 µs/call latency) | 62 | 7,449 | 37.8 |
+
+Source calls after phases 1–2 (achieved instance count matched the analytic
+target exactly, 1,116,093): `adt` 3,001, `vitals` 901,504, `labs` 811,501,
+`pharmacy` 61,501, `notes` 301,501 — total 2,079,008 (the extra 8 over the
+2,079,000 analytic target are phase 2's own re-reads of the mutated
+patient's vitals and cross-system keys). Concurrency high-water mark was
+**1** for every source in phases 1–3 (`HOSPITAL_BENCH_SRC_LATENCY_US=0`, so
+there's no delay for two calls to genuinely overlap inside) — phase 4 is
+where latency-hiding actually shows up: at 2,000 µs/call and 10 patients,
+13,860 total source calls completed in 62 ms wall time against a >= 27,720
+ms fully-sequential estimate (`total_calls * latency`), with high-water
+marks of 6,000 (`vitals`), 5,400 (`labs`), 2,000 (`notes`), 400
+(`pharmacy`), and 10 (`adt`) — i.e. essentially the entire per-source
+request volume was in flight simultaneously, achieved purely through
+`Ctx::eval_all`/`try_join!`'s natural concurrency, no width knob involved.
+
+Rerun-heavy phase: 300 keys mutated (spread across all five sources and the
+full patient/ward range) produced 1,444 reruns in 524 ms (**362.9 µs/
+rerun**) — a smaller reruns/key ratio than the Haskell original's ~7.6–8/key
+because several of this graph's ward-level rollups (`ward_census`,
+`ward_occupancy`) are insensitive to their inputs' *content* (only to
+`admission`'s count/length, which an `adt`-key mutation's length rarely
+changes), so early cutoff suppresses more upward propagation here than in
+the Haskell original's design.
+
+`hospital_bench`'s core work (phases 1–3, ~4.5 s) finishes far faster than
+`persist_bench`'s full ~33 s, ten-child-process run — not because it does
+less (1.12M instances here vs. `persist_bench`'s ~1M, and 2.08M source
+calls vs. ~205K) but because it only needs *one* cold-eval pass: unlike
+`persist_bench`, this benchmark has no persistence/restart machinery to
+exercise, so it never pays for the 8 additional cold-or-warm restart trials
+that make up most of `persist_bench`'s total wall time. Per-instance, it is
+markedly *heavier*, not lighter — see the RSS/instance comparison above —
+which is the more meaningful comparison for a benchmark whose whole point is
+the cost of an unshared-key design, not wall-clock parity with a
+differently-shaped benchmark. `HOSPITAL_BENCH_SCALE=0.02` (~22K instances,
+30 patients) runs in well under a second and is the recommended quick
+sanity check before a full run.
+
+### `persist_bench` reconfirmed unaffected
+
+Re-run in full immediately before/after this stage's changes (`cargo run -p
+computations --release --example persist_bench --features testutil`, same
+loaded box, load average 4.3–5.4 across the two runs):
+
+| phase | baseline (task-stated) | this run | direction |
+|---|---|---|---|
+| cold eval (persistence configured) | ~3.7 s | 3.127 s | −15.5% (faster) |
+| warm restart, no changes | ~1.4 s | 1.204 s / 1.207 s (2 trials) | −14% (faster) |
+| live incremental, no persistence | ~500 ms | 447 ms | −10.6% (faster) |
+| persist_now / db size | 269.49 MB | 269.49 MB | unchanged (exact) |
+| engine-only RSS (no persistence) | ~330 MB | 331.7 MB / 356.1 MB (2 trials) | flat |
+
+Every phase landed at or faster than its stated baseline, nothing
+regressed, and the db size is byte-identical — this stage touched only
+`examples/hospital_bench.rs` and this document, no `src/` change of any
+kind, so this is a pure confirmation rather than a discovery.
+
+### How to run
+
+```text
+# Full default scale (~1.1M instances, ~4.5 s core work, ~1.6 GB peak RSS)
+cargo run -p computations --release --example hospital_bench --features testutil
+
+# Quick sanity check (~22K instances, well under a second)
+HOSPITAL_BENCH_SCALE=0.02 cargo run -p computations --release --example hospital_bench --features testutil
+
+# Exercise the main phase with real source latency (careful — see the module
+# docs' "no width knob" section: latency is paid by every one of ~2M source
+# calls at full scale, so combine with a small HOSPITAL_BENCH_SCALE)
+HOSPITAL_BENCH_SCALE=0.02 HOSPITAL_BENCH_SRC_LATENCY_US=500 \
+  cargo run -p computations --release --example hospital_bench --features testutil
+
+# Tune the rerun-heavy live-update phase
+HOSPITAL_BENCH_RERUN_KEYS=1000 HOSPITAL_BENCH_RERUN_LOOPS=3 \
+  cargo run -p computations --release --example hospital_bench --features testutil
+```
+
+`HOSPITAL_BENCH_PHASE` (`main` or `demo`) is the internal re-exec switch
+(mirrors `PERSIST_BENCH_PHASE`); it isn't meant to be set by hand.
+

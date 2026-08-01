@@ -40,3 +40,7 @@ trybuild = { workspace = true }
 [[example]]
 name = "persist_bench"
 required-features = ["testutil"]
+
+[[example]]
+name = "hospital_bench"
+required-features = ["testutil"]
