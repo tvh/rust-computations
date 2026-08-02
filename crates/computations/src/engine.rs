@@ -47,7 +47,7 @@ use crate::def::{
 use crate::error::CompError;
 use crate::flow::{FlowCompDef, FlowDefAdapter, FlowId, FlowResolver, FlowThunk, flow_aware_param_hash};
 use crate::hashers::IdentityBuildHasher;
-use crate::interner::{SrcDep, SrcKeyId, SrcKeyInterner};
+use crate::interner::{SmallVerBytes, SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult, DefId, Hash128, Hash128Map};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
@@ -807,7 +807,9 @@ impl NodeTable {
     /// practice — the same tradeoff `DefTable::comp_deps`'s docs make for
     /// `SmallVec` fan-in/fan-out lists.
     pub(crate) fn source_deps_contains(&self, r: NodeRef, key_id: SrcKeyId, ver: &[u8]) -> bool {
-        self.source_deps.get(&r).is_some_and(|deps| deps.iter().any(|d| d.key_id == key_id && d.ver == ver))
+        self.source_deps
+            .get(&r)
+            .is_some_and(|deps| deps.iter().any(|d| d.key_id == key_id && d.ver.as_slice() == ver))
     }
 
     pub(crate) fn source_deps_clone(&self, r: NodeRef) -> HashSet<SrcDep> {
@@ -1755,10 +1757,14 @@ impl EngineInner {
         }
         let interned: HashSet<SrcDep> = self.timed(crate::lock_stats::LockSite::RecordSourceDepsIntern, || {
             let mut interner = self.src_key_interner.lock().unwrap();
-            raw.iter()
-                .map(|dep| SrcDep {
-                    key_id: interner.intern(&dep.source, &dep.key),
-                    ver: dep.ver.clone(),
+            // `into_iter` (not `iter`) so `dep.ver`'s `Vec<u8>` moves straight
+            // into `SmallVec::from_vec` instead of being cloned -- `raw` is
+            // owned by this call and unused afterward, so there is nothing to
+            // preserve it for.
+            raw.into_iter()
+                .map(|dep| {
+                    let key_id = interner.intern(&dep.source, &dep.key);
+                    SrcDep { key_id, ver: SmallVerBytes::from_vec(dep.ver) }
                 })
                 .collect()
         });

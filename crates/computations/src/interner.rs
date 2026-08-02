@@ -22,7 +22,10 @@
 //! version far more often than it starts or stops reading a key entirely —
 //! so only the `(SourceId, key)` identity is interned here.
 //! [`crate::interner::SrcDep`] leaves the version as raw bytes alongside the
-//! interned id.
+//! interned id, stored inline via [`SmallVerBytes`] rather than as a
+//! separately-heap-allocated `Vec<u8>` (Stage 15 — see
+//! `docs/persistence-benchmark-notes.md` — the deferred half of Stage 13's
+//! own "versions churn, keys don't" reasoning).
 //!
 //! ## Reclamation
 //!
@@ -61,7 +64,9 @@
 
 use std::collections::HashMap;
 
-use crate::source::{KeyBytes, SourceId, VerBytes};
+use smallvec::SmallVec;
+
+use crate::source::{KeyBytes, SourceId};
 
 /// A dense, process-local id standing in for one `(SourceId, key bytes)`
 /// pair, assigned by [`SrcKeyInterner::intern`]. Never persisted, never
@@ -73,13 +78,35 @@ use crate::source::{KeyBytes, SourceId, VerBytes};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SrcKeyId(u32);
 
+/// Inline storage for a [`SrcDep`]'s version bytes — Stage 15, see
+/// `docs/persistence-benchmark-notes.md`.
+///
+/// Sized at 8 bytes from measurement, not guesswork: an instrumented run of
+/// both benchmarks (`persist_bench`'s ~205,000 source deps, `hospital_bench`'s
+/// ~2.08M) found **every single one** postcard-encodes to exactly 1 byte —
+/// both sources' `Ver` is a plain `u64` counter, and postcard's varint
+/// encoding keeps any value below 128 to 1 byte. 8 was picked, not 1 or 2,
+/// because on this platform `size_of::<SmallVec<[u8; N]>>()` is already 24
+/// bytes (matching `Vec<u8>`'s own header) for any `N` up to 8 — the inline
+/// buffer fits inside space `Vec` already spent on capacity/pointer bookkeeping,
+/// so going from 0 to 8 inline bytes costs nothing beyond that; the next size
+/// class up (9..=23 inline bytes) jumps to 32 bytes, a real 8-byte-per-dep
+/// cost neither benchmark's measured distribution justifies paying for. A
+/// version that doesn't fit (anything over 8 bytes — e.g. `computations-fs`'s
+/// `FsVer::File { mtime_nanos: u128, size: u64 }`, which postcard-encodes to
+/// roughly 11-17 bytes for realistic values) spills to the heap exactly as
+/// today's `Vec<u8>` does: no regression for a workload this benchmark pair
+/// doesn't exercise, just no extra win for it either.
+pub(crate) type SmallVerBytes = SmallVec<[u8; 8]>;
+
 /// A node's dependency on one interned source key: identity via
-/// [`SrcKeyId`], version left as raw bytes — see this module's docs on why
-/// only the key half is interned.
+/// [`SrcKeyId`], version left as raw bytes, stored inline up to
+/// [`SmallVerBytes`]'s capacity — see this module's docs on why only the key
+/// half is interned, and this type's own docs on the inline-capacity choice.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SrcDep {
     pub(crate) key_id: SrcKeyId,
-    pub(crate) ver: VerBytes,
+    pub(crate) ver: SmallVerBytes,
 }
 
 /// Refcounted `(SourceId, key bytes) <-> SrcKeyId` interner — see this
@@ -337,5 +364,34 @@ mod tests {
             interner.release(id);
         }
         assert_eq!(interner.live_len(), 0);
+    }
+
+    /// Stage 15's whole justification for choosing 8 inline bytes over 1,
+    /// 2, or 16: on this platform `SmallVec<[u8; N]>` costs nothing extra
+    /// over `N=0` (i.e. a bare `Vec<u8>`) for any `N` up to 8, so `SrcDep`
+    /// must not have grown past the 32 bytes it was before this stage
+    /// (`SrcKeyId` 4 B + `Vec<u8>` 24 B, rounded to the struct's 8-byte
+    /// alignment) even though `ver` no longer needs a separate heap
+    /// allocation for either benchmark's measured version bytes (both
+    /// 100% 1 byte — see [`SmallVerBytes`]'s docs). A regression here
+    /// (inline capacity bumped past 8 without re-measuring) would silently
+    /// cost 8 extra bytes per source dep at both benchmarks' scale
+    /// (205,000 / 2.08M) for no measured benefit.
+    #[test]
+    fn srcdep_did_not_grow_past_its_pre_stage_15_size() {
+        assert_eq!(
+            std::mem::size_of::<SmallVerBytes>(),
+            std::mem::size_of::<KeyBytes>(),
+            "SmallVerBytes (inline SmallVec) must match Vec<u8>'s own struct size on this platform -- \
+             that's the whole point of an 8-byte inline capacity; a mismatch means the inline capacity \
+             grew past what's free and this stage's sizing rationale needs re-measuring"
+        );
+        assert_eq!(
+            std::mem::size_of::<SrcDep>(),
+            32,
+            "SrcDep grew past its pre-Stage-15 size (SrcKeyId 4B + Vec<u8> 24B, rounded to 32) -- \
+             re-measure both benchmarks' version-byte-length distribution before bumping SmallVerBytes's \
+             inline capacity further"
+        );
     }
 }

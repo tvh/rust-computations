@@ -74,7 +74,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::def::ErasedDef;
 use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable, SourceRefs};
 use crate::flow::FlowId;
-use crate::interner::{SrcDep, SrcKeyId, SrcKeyInterner};
+use crate::interner::{SmallVerBytes, SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
 use crate::sink::{OutBytes, RawOutput, SinkId};
 use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
@@ -367,7 +367,7 @@ impl RawDepRepr {
         Some(RawDepRepr {
             source: source.to_string(),
             key: key.to_vec(),
-            ver: dep.ver.clone(),
+            ver: dep.ver.to_vec(),
         })
     }
 
@@ -1145,7 +1145,7 @@ impl EngineInner {
                 .iter()
                 .map(|dep| SrcDep {
                     key_id: interner.intern_retain(&dep.source, &dep.key),
-                    ver: dep.ver.clone(),
+                    ver: SmallVerBytes::from_slice(&dep.ver),
                 })
                 .collect();
             nodes.extend_source_deps(r, &interned_deps);
@@ -1226,7 +1226,7 @@ async fn probe_restored_source_deps(engine: &EngineInner) -> CompKeySet {
                     .iter()
                     .filter_map(|dep| {
                         let (source, key_bytes) = interner.resolve(dep.key_id)?;
-                        Some((source.clone(), key_bytes.to_vec(), dep.ver.clone()))
+                        Some((source.clone(), key_bytes.to_vec(), dep.ver.to_vec()))
                     })
                     .collect();
                 (key.clone(), deps)

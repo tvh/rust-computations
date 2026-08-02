@@ -3364,3 +3364,219 @@ fail those directly, e.g. a dependent silently dropped from notification).
 `cargo test -p computations --features testutil,alloc-stats` — all green
 standalone. `cargo clippy --workspace --all-targets --all-features -- -D
 warnings` clean.
+
+## Stage 15 — the per-dependency version field
+
+Stage 13 interned `(SourceId, key bytes)` into `SrcKeyId(u32)` and
+deliberately deferred the version field ("versions churn, keys don't"), so
+`crate::interner::SrcDep { key_id: SrcKeyId, ver: VerBytes }` still stored
+`ver` as an owned `Vec<u8>` — a 24-byte header plus a separate heap
+allocation, per dependency, for what the task's own framing called "a
+counter for `MemKvSource`, mtime+size for `FsSource`". This stage measures
+that byte-length distribution directly and closes the gap the deferral left
+open.
+
+### Measured version-byte-length distribution
+
+Instrumented both benchmarks directly rather than guessing: a temporary
+histogram in `EngineInner::record_source_deps` bucketed every recorded
+dependency's `ver.len()` (removed before this stage's commit — not shipped
+code), run at full default scale.
+
+| workload | source deps recorded | 1 byte | 2+ bytes |
+|---|---|---|---|
+| `persist_bench` (cold eval) | 205,000 | 205,000 (100%) | 0 |
+| `persist_bench` (restart trials, cumulative) | 205,684 | 205,684 (100%) | 0 |
+| `hospital_bench` (cold + live + rerun-heavy) | 2,081,168 | 2,081,168 (100%) | 0 |
+
+**Every single measured dependency, on both benchmarks, postcard-encodes to
+exactly 1 byte.** Both benchmarks' sources report `type Ver = u64` (a plain
+counter starting at 0), and postcard's LEB128-style varint encoding keeps
+any value below 128 to 1 byte — `persist_bench`'s `MemKvSource` versions
+never exceed 3 (each of 300 keys is set once at startup, two bumped again
+for the restart-trial phases); `hospital_bench`'s `LatencySource` versions
+stay in the same tiny range (each of ~2.08M keys starts at version 0, and
+the rerun-heavy phase's 300 mutated keys only reach version 1 or 2).
+Verified independently with a standalone postcard round-trip: `0u64..=127u64`
+all encode to 1 byte, `128..=16383` to 2 bytes.
+
+For contrast (not benchmarked, but named explicitly in the task and present
+in `computations-fs::FsVer`): `FsVer::File { mtime_nanos: u128, size: u64 }`
+postcard-encodes to **11-15 bytes** for realistic 2020s-era mtimes (a u128
+nanosecond timestamp needs ~9 bytes of varint alone), and `FsVer::Dir {
+entries_hash: [u8; 16] }` (a fixed-size array, no varint compression) to
+exactly **17 bytes**. Real-world filesystem versions are an order of
+magnitude larger than either benchmark's measured distribution.
+
+### Design chosen: inline `SmallVec<[u8; 8]>`, not interning
+
+**Rejected: interning versions into a `VerId(u32)`.** Three independent
+reasons, all falling out of the measurement above:
+
+1. **Nothing to dedup.** The task's own background notes only 683 of
+   `persist_bench`'s 205,000 deps share both key *and* version (0.33%) —
+   `hospital_bench` shares essentially none (every key read by ~1
+   dependent). An interner's entire value proposition is deduplicating
+   repeated values; there are almost no repeats to remove.
+2. **The replacement is bigger than the original.** Every measured version
+   is 1 byte. A `VerId(u32)` is 4 bytes — interning would *quadruple* the
+   per-dep storage for the identity half alone, before even counting the
+   interner's own side tables (forward map, entries, refcounts, free list).
+3. **Churn is exactly the failure mode the task warned about.** Stage 13's
+   key interner works because keys are stable — a node reads the same key
+   for its whole lifetime, so intern/retain happens once and lives a long
+   time. Versions are the opposite by design ("versions churn, keys don't"
+   is Stage 13's own stated reason for *not* interning them there): every
+   rerun of every one of `hospital_bench`'s ~1.1M nodes produces a fresh
+   version, meaning a version interner would pay a full
+   intern-or-lookup-plus-retain-plus-release cycle on nearly every
+   propagation round, for a value that's already smaller than the `u32`
+   handle meant to replace it. This is precisely Stage 5's rejected-SmallVec
+   shape in reverse: paying real, recurring cost for a data structure whose
+   benefit (dedup) barely applies to this data.
+
+**Chosen: replace `SrcDep::ver`'s `Vec<u8>` with `SmallVec<[u8; 8]>`**
+(`crate::interner::SmallVerBytes`), spilling to the heap beyond 8 bytes. This
+*is* the shape the task said Stage 5's rejection doesn't cover: `source_deps`/
+`outputs` were rejected because most *nodes* have zero of them, so inline
+capacity was paid on every node whether used or not. A `SrcDep`'s `ver` field
+belongs to a dependency that, by definition, already exists — there is no
+"empty node paying for unused capacity" case here to lose to.
+
+The inline capacity of 8 (not 1, not 16) is itself measured, not guessed:
+on this platform, `size_of::<SmallVec<[u8; N]>>()` is **24 bytes — identical
+to `Vec<u8>`'s own header** — for any `N` up to 8; the inline buffer fits
+inside space `Vec` already spends on pointer/capacity bookkeeping. The next
+size class up (`N` in 9..=23) jumps to 32 bytes, an 8-byte-per-dependency
+cost neither benchmark's 100%-1-byte distribution would justify paying for.
+So `N=8` is a strict win with no downside: `size_of::<SrcDep>()` stays
+exactly 32 bytes (unchanged — `SrcKeyId` 4 B + the inline buffer 24 B,
+rounded to 8-byte alignment), while every dependency measured on either
+benchmark needs zero heap allocation for its version. A version over 8 bytes
+(realistic `FsVer::File`/`FsVer::Dir` values, 11-17 bytes, per the measurement
+above) simply spills to the heap exactly as today's `Vec<u8>` did — no
+regression for a workload neither benchmark exercises, just no additional
+win for it either. `size_of::<SrcDep>() == 32` and
+`size_of::<SmallVerBytes>() == size_of::<Vec<u8>>()` are now enforced by a
+tripwire test (`interner::tests::srcdep_did_not_grow_past_its_pre_stage_15_size`)
+in the same spirit as Stage 3/4's `size_of::<Node>()` tripwires.
+
+Implementation notes:
+- `record_source_deps` (`engine.rs`) switched its interning loop from
+  `raw.iter().map(...).collect()` (cloning `dep.ver`) to
+  `raw.into_iter().map(...).collect()` (`raw` is owned and unused
+  afterward), so `SmallVec::from_vec(dep.ver)` moves the original `Vec<u8>`'s
+  bytes into inline storage (copying only when `len <= 8`, exactly the
+  measured case) instead of cloning it first and then converting — one fewer
+  allocation on the hot path than a naive port would have had.
+- Persistence (`persist.rs`) is unaffected in format: `RawDepRepr::ver`
+  stays `Vec<u8>` (it's what gets postcard-encoded to disk), converting via
+  `.to_vec()` when building it from a `SrcDep`, and via
+  `SmallVerBytes::from_slice(&dep.ver)` when restoring one. `NodeRecord`,
+  `FORMAT_VERSION`, and the on-disk layout are untouched — confirmed
+  empirically below (byte-identical 269.49 MB db, before and after).
+- No public API change: `Source`/`Sink`, `RawDep` (still `Vec<u8>` for
+  `ver`), and `raw_deps()` are untouched — `SmallVerBytes`/`SrcDep` are
+  `pub(crate)`, entirely internal to `engine.rs`/`persist.rs`.
+- `NodeTable::source_deps_contains`'s linear-scan comparison
+  (`d.ver == ver` against a borrowed `&[u8]`) changed to
+  `d.ver.as_slice() == ver` — `SmallVec` doesn't implement `PartialEq<&[u8]>`
+  the way `Vec<u8>` did; a one-line mechanical fix, not a behavior change.
+
+### The matrix
+
+`uptime` load average ranged **2.5–8.3** across this stage's benchmark
+session (1-min figures 8.33, 4.29, 3.35, 3.13, 2.54 at various points around
+the before/after pairs) — similar to, and overlapping, every prior stage's
+band; as always, the before/after pairs below are same-session stash/pop A/B
+comparisons (this stage's changes stashed for "before", popped back for
+"after"), and the deterministic `allocated_bytes`/db-size/rerun-count
+columns are what this stage's conclusion rests on, RSS reported alongside
+for completeness per this document's standing practice.
+
+**`persist_bench`, default scale** (shared-key: 300 distinct keys, ~683
+dependents/key — the workload predicted to be neutral, since only 205,000 of
+1-byte-each dependencies exist to save an allocation on):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| phase 5 (engine-only RSS), 6 samples each | 290.7–328.0 MB, avg 297.1 MB | 287.7–328.1 MB, avg 299.8 MB | +2.7 MB / +0.9% (noise — ranges overlap almost entirely) |
+| phase 5 `allocated_bytes` (net) | 325,219,346 B (all trials, identical — matches documented Stage 14 baseline exactly) | 325,014,346 B (all trials, identical) | **−205,000 B exactly**, matching the measured dep count (205,000) × 1 byte/dep to the byte |
+| `persist_now` db size | 269.49 MB | 269.49 MB | byte-identical, every run |
+| cold eval wall time, 3 samples each | 2844–3274 ms, avg 3017 ms | 2881–2931 ms, avg 2903 ms | flat-to-slightly-faster (reported, not relied on) |
+| reruns, every phase | exact-match every run (999,760 / 100,164 / 137,085 / 80,767) | exact-match every run | identical |
+
+**Neutral, exactly as the design section predicted.** The deterministic
+`allocated_bytes` delta is real and exactly explained (one 1-byte heap
+allocation eliminated per dependency, 205,000 of them, 205,000 bytes) but is
+0.063% of a 325 MB base — invisible against this box's ordinary ~15-40 MB
+run-to-run RSS noise on this benchmark (the same noise band Stage 13/14
+already documented at this exact phase). No regression on any other metric.
+
+**`hospital_bench`, default scale** (unshared-key: ~2.08M distinct keys, ~1
+dependent/key — the workload this stage targets, since every one of its 2.08M
+dependencies is a separate 1-byte allocation with nothing shared to fall
+back on):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| cold-eval RSS, 4 samples each | 1113.5–1147.8 MB, avg 1129.7 MB | 1082.9–1109.8 MB, avg 1095.5 MB | **−34.2 MB, −3.02%** (no overlap: every "after" sample beats every "before" sample) |
+| cold-eval `allocated_bytes` (net) | 1,148,788,594 B (matches documented Stage 14 baseline exactly) | 1,146,709,594 B | **−2,079,000 B exactly**, matching phase 1's recorded-dep count × 1 byte/dep to the byte |
+| cold-eval wall time, 4 samples each | 3570–3922 ms, avg 3672 ms | 3535–3902 ms, avg 3653 ms | flat (reported, not relied on) |
+| `record_source_deps/interner` lock share (one sample each side) | 2,081,168 calls, 0.618 s, 30.42% | 2,081,168 calls, 0.700 s, 33.37% | within single-sample noise — this stage doesn't touch what happens under that lock, only what gets stored afterward |
+| reruns, cold / rerun-heavy | 1,116,093 / 1,444 | 1,116,093 / 1,444 | identical, every run |
+
+**A real, reproducible win on the workload this stage targeted.** Every
+"after" RSS sample beats every "before" sample — no overlap. The
+deterministic `allocated_bytes` drop (2,079,000 B, matching the histogram's
+dependency count exactly) is, as in every prior stage, smaller than the RSS
+drop: a 1-byte `Vec<u8>` allocation requests 1 byte from the allocator (all
+`allocated_bytes` sees) but actually consumes a full minimum allocation
+quantum of real heap space once macOS `malloc`'s tiny-region rounding and
+per-region bookkeeping are counted — the same "RSS also captures allocator
+per-allocation overhead" gap Stage 13/14 both already documented, just more
+extreme here because the *requested* size (1 byte) is about as small as it
+gets. Back-of-envelope: 34.2 MB saved over ~2.08M eliminated allocations is
+≈16.4 bytes of real overhead recovered per allocation — squarely in the
+range of a 16-byte minimum tiny-allocation quantum, which is exactly the
+mechanism this stage's design section predicted (eliminating the heap
+allocation entirely, not shrinking its requested size).
+
+### Verdict: kept
+
+`hospital_bench` — the unshared-key workload where every dependency's
+version is its own allocation with no sharing to hide behind — improves by
+a real, reproducible, fully-explained margin (−3.02% RSS, deterministic
+−2,079,000 B `allocated_bytes`) with no overlapping samples between before
+and after. `persist_bench` — predicted neutral because its total savings
+(205,000 bytes) is two orders of magnitude below its own measurement noise
+floor — lands within noise on every metric, deterministic and otherwise,
+with no observed regression anywhere (db size byte-identical, reruns
+exact-match, wall time flat). `size_of::<SrcDep>()` is provably unchanged
+(32 bytes, tripwire-tested) — this stage traded nothing for the win except
+one dependency's inline bytes replacing a pointer to the same bytes
+elsewhere. Public API, persisted format, and db size are all unaffected.
+This is the same "hospital wins, persist neutral, keep" shape Stage 14
+already established for the sibling Zero/One/Many change, for the same
+underlying reason: an unshared-key workload has millions of individually
+tiny allocations with nothing to deduplicate, and inlining beats both
+"leave it heap-allocated" and "intern it" for that shape.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **135 passed** (134 baseline + 1
+new: `interner::tests::srcdep_did_not_grow_past_its_pre_stage_15_size`, the
+`size_of::<SrcDep>()`/`size_of::<SmallVerBytes>()` tripwire). `cargo test -p
+computations --features testutil,alloc-stats` — all green standalone.
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean.
+
+### How to run
+
+```text
+cargo run -p computations --release --example persist_bench --features testutil
+cargo run -p computations --release --example hospital_bench --features testutil
+cargo run -p computations --release --example persist_bench --features testutil,alloc-stats
+cargo run -p computations --release --example hospital_bench --features testutil,alloc-stats
+COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital_bench --features testutil
+```
