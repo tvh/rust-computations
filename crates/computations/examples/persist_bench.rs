@@ -113,6 +113,7 @@ use computations::{Comp, Engine, Fingerprint, PersistOptions, Registry};
 use computations::alloc_stats;
 
 use tracing::{Event, Subscriber};
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
@@ -537,15 +538,38 @@ fn orchestrator_main() {
 async fn worker_main(phase_id: &str) {
     let settle_signal = Arc::new(AtomicU64::new(0));
     let round_signal = Arc::new(AtomicU64::new(0));
+    // Stage 21 (see docs/persistence-benchmark-notes.md): a targeted filter,
+    // not `LevelFilter::INFO` alone -- `"propagation round complete"` is
+    // emitted at DEBUG (see `crate::driver`), so a blanket INFO filter would
+    // silence the very event phase 8's round-timing depends on. Critically,
+    // the filter is applied to *both* `MessageSignal` layers below via
+    // `.with_filter`, not added as a separate, unfiltered top-level layer:
+    // `Layer::enabled`'s default impl (which `MessageSignal` doesn't
+    // override) is unconditionally `true`, so an unfiltered `MessageSignal`
+    // would keep every callsite's combined interest at `Interest::always()`
+    // no matter what any other layer says, defeating the whole point.
+    // Wrapping each event-observing layer in this filter is what lets
+    // `computations::engine`'s per-node `comp.eval` span/event callsites
+    // cache `Interest::never()` -- tracing's actual near-zero disabled
+    // path -- while `computations::driver`'s DEBUG-level events this
+    // harness's settle-detection depends on keep firing.
+    let bench_filter =
+        || Targets::new().with_target("computations::driver", LevelFilter::DEBUG).with_default(LevelFilter::INFO);
     tracing_subscriber::registry()
-        .with(MessageSignal {
-            needle: "initial evaluation complete",
-            counter: settle_signal.clone(),
-        })
-        .with(MessageSignal {
-            needle: "propagation round complete",
-            counter: round_signal.clone(),
-        })
+        .with(
+            MessageSignal {
+                needle: "initial evaluation complete",
+                counter: settle_signal.clone(),
+            }
+            .with_filter(bench_filter()),
+        )
+        .with(
+            MessageSignal {
+                needle: "propagation round complete",
+                counter: round_signal.clone(),
+            }
+            .with_filter(bench_filter()),
+        )
         .init();
 
     // Generous, but bounded: a phase that hasn't settled within 5 minutes

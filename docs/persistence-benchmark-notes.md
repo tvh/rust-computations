@@ -5134,3 +5134,242 @@ clean. No public API surface changed (`RawDeps`/`RawOutputs` are
 (needed for `EngineInner::run`'s dropped-output set-difference) and
 `NodeTable::source_deps`'s `SrcDeps` storage (Stage 18, unrelated to this
 stage) are both untouched.
+
+## Stage 21 — fixing the benchmark harness's tracing confound
+
+**IMPORTANT — corrected baselines start here.** Stage 6 flagged, and Stage
+17 re-confirmed and quantified (~2.8% of `persist_bench`'s cold-eval active
+CPU samples, ~14.0% of `hospital_bench`'s), that both benchmark harnesses
+install a `tracing_subscriber` registry with no level filter at all: every
+`comp.eval` span (`debug_span!`, one per node evaluation, ~1M/run) pays full
+`Registry`/`sharded_slab` cost instead of tracing's designed near-zero
+disabled path, and — worse — `tracing::enabled!(Level::DEBUG)` returns
+`true` unconditionally with no max-level hint in play, so the Stage-4 lazy
+param-rendering closure (`format!("{param:?}")`) runs **eagerly on every
+node**, not only when something is actually listening. **Every wall-time
+figure in Stages 0-20 of this document was measured with this tax
+present.** This stage fixes the harness (not the engine) and re-establishes
+the baseline; any future stage comparing against pre-Stage-21 numbers is
+comparing against a different, slower harness, not a slower engine.
+
+### Design
+
+The trap the task flagged up front, confirmed while implementing: both
+harnesses detect phase/round completion by watching for `crate::driver`
+log events via a custom `MessageSignal` layer, and `"propagation round
+complete"` is emitted at DEBUG (`"initial evaluation complete"` is already
+INFO). A naive `LevelFilter::INFO` would silence the DEBUG event phases 7/8
+(persist_bench)/the live-incremental phase (hospital_bench) depend on to
+detect a completed round, hanging those phases' `wait_for_signal` polling
+loop forever.
+
+The fix, applied identically in both `examples/persist_bench.rs` and
+`examples/hospital_bench.rs`:
+
+```rust
+let bench_filter = || Targets::new()
+    .with_target("computations::driver", LevelFilter::DEBUG)
+    .with_default(LevelFilter::INFO);
+tracing_subscriber::registry()
+    .with(MessageSignal { needle: "initial evaluation complete", counter: settle_signal.clone() }
+        .with_filter(bench_filter()))
+    .with(MessageSignal { needle: "propagation round complete", counter: round_signal.clone() }
+        .with_filter(bench_filter()))
+    .init();
+```
+
+**The subtlety that makes this correct rather than a no-op**: the filter is
+applied *to each `MessageSignal` layer itself* via `.with_filter`, not
+added as a third, separate, unfiltered layer alongside the two existing
+ones. `tracing_subscriber::Layer::enabled`'s default implementation (which
+`MessageSignal` doesn't override) is unconditionally `true` — so an
+unfiltered `MessageSignal` layer sitting in the same `Layered` stack as a
+`Targets` filter would still report `Interest::always()` for every
+callsite (tracing's per-callsite interest is the *union* across every layer
+in the stack: if any one layer is unconditionally interested, the whole
+stack's cached interest is `Interest::always()`, and the expensive path
+runs regardless of what any other layer's filter says). Wrapping each
+`MessageSignal` in the *same* `Targets` filter (via `Layer::with_filter`,
+producing a `Filtered<MessageSignal, Targets, S>` for each) means every
+layer in the stack independently reports "not interested" for a
+`computations::engine`-targeted DEBUG callsite, so the combined interest
+for `comp.eval`'s callsite caches as `Interest::never()` — tracing's actual
+near-zero disabled path — while a `computations::driver`-targeted DEBUG
+callsite (`"propagation round complete"`) is unconditionally allowed by the
+`Targets` rule and fires normally. This is exactly the mechanism the task's
+own framing pointed at without spelling out the trap: getting this wrong
+(one filtered layer, one unfiltered) produces code that *looks* like a
+level filter but changes nothing, because the unfiltered layer alone keeps
+every callsite's interest at "always."
+
+**Verified functionally correct before trusting any timing number**: both
+harnesses' full phase sequences were run end to end after the change,
+confirming every phase still detects settle/round-completion correctly —
+identical rerun counts to the pre-fix baseline on every phase
+(`persist_bench`: 999,760 / 0 / 0 / 100,164 / 137,085 / 999,760 / 999,760 /
+80,767 / 80,767 across phases 1, 3x2, 4x2, 5x2, 6, 7, 8; `hospital_bench`:
+1,116,093 / 6 / 1,444 / 7,449 across phases 1-4) and a byte-identical
+`persist_now` database (269.49 MB) on every trial — no phase hung, no
+phase under- or over-counted reruns, and no engine code was touched (this
+is a benchmark-harness-only change, `examples/*.rs` exclusively).
+
+### Measurements
+
+`uptime` load average ranged **~3.6-5.9** across this stage's session — a
+calmer session than Stage 20's, though still shared. Both sides are
+same-session, stash/pop A/B pairs (this stage's filter change stashed for
+"before" — i.e., Stages 0-20's unfiltered harness — popped back for
+"after"), **4 trials per side** on every phase (8 samples per phase where a
+phase reports two trials per run, e.g. phase 5's trial 1/2).
+
+**`persist_bench`, wall time, 4 runs each side** (ms; phases with two
+trials/run report 8 samples):
+
+| phase | before (range, mean) | after (range, mean) | Δ |
+|---|---|---|---|
+| 1. cold initial eval (persistence configured) | 3169-3295, 3222.3 | 2604-2745, 2673.0 | **-17.0%**, non-overlapping |
+| 5. cold restart, no persistence (8 samples) | 2498-2713, 2616.8 | 1900-2211, 1997.0 | **-23.7%**, non-overlapping |
+| 6. restart, fingerprint mismatch (full revalidation) | 4060-4619, 4294.8 | 3507-3847, 3713.5 | **-13.5%**, non-overlapping |
+| 7. live incremental, no persistence | 464-484, 470.0 | 377-450, 407.5 | **-13.3%** |
+| 8. live incremental, WITH persistence | 560-685, 603.0 | 490-578, 530.0 | **-12.1%** |
+| 4. restart, 1 changed input (8 samples, ~10-14% of nodes rerun) | 1525-1752, 1640.3 | 1469-1813, 1597.8 | -2.6%, ranges overlap |
+| 3. warm restart, no changes (8 samples, 0 reruns) | 1122-1261, 1164.3 | 1128-1319, 1233.3 | +5.9%, ranges overlap — noise (see below) |
+| `persist_now` db size, reruns every phase | 269.49 MB, exact-match every trial | 269.49 MB, exact-match every trial | unchanged |
+| phase 5 gross `allocated_bytes` | 2,843,319,499 B, identical every trial | 2,730,364,115 B, identical every trial | **-112,955,384 B, -3.97%**, deterministic |
+| phase 1 gross `allocated_bytes` | 3,954,625,665 B, identical every trial | 3,841,670,281 B, identical every trial | **-112,955,384 B** (identical absolute delta to phase 5 — same per-node span/field-formatting cost, same ~999,760-node count) |
+| net `allocated_bytes` (either phase) | unchanged to within ~5 KB | unchanged to within ~5 KB | as expected — the removed allocations (formatted debug strings, span field storage) were transient |
+
+Phases 3 and 4 — the two phases with the fewest actual re-evaluations
+(phase 3: 0 reruns, every node is a pure cache-hit restored straight from
+the database with `comp.eval`'s span never entered at all; phase 4: only
+10-14% of 999,760 nodes rerun) — land within noise, exactly as the
+mechanism predicts: there is little to no `comp.eval` span/field-formatting
+cost in those phases to remove in the first place. Every phase that
+actually re-evaluates most or all of the graph (1, 5, 6, 7, 8) shows a
+clean, non-overlapping (or nearly so) double-digit-percent improvement.
+
+**`hospital_bench`, wall time, 4 runs each side**:
+
+| phase | before (range, mean) | after (range, mean) | Δ |
+|---|---|---|---|
+| 1. cold eval | 3842-4003, 3912.0 | 3416-3757, 3577.8 | **-8.5%**, non-overlapping |
+| 2. live incremental, 1 changed vitals key (6 reruns) | 92-108, 100.3 | 92-114, 99.5 | neutral (6 reruns — almost nothing to save) |
+| 3. rerun-heavy live update (1,444 reruns) | 519-624, 548.0 | 515-623, 544.8 | neutral, within noise |
+| 4. concurrency demo (I/O-latency-bound, not CPU-bound) | 55-62, 59.5 | 68-74, 69.75 | +17.2%, but see note below |
+| reruns, every phase | 1,116,093 / 6 / 1,444 / 7,449, exact every trial | identical, exact every trial | unchanged |
+| phase 1 gross `allocated_bytes` | 5,600,639,186 B, identical every trial | 5,526,664,606 B, identical every trial | **-73,974,580 B, -1.32%**, deterministic |
+| net `allocated_bytes` | unchanged to within ~5 KB | unchanged to within ~5 KB | as expected |
+
+`hospital_bench`'s cold eval win (-8.5%) is smaller in relative terms than
+`persist_bench`'s (-17.0% to -23.7%) despite Stage 17 measuring a *larger*
+CPU-percentage tax on `hospital_bench` (14.0% vs 2.8%) — not a
+contradiction: `hospital_bench`'s cold eval is also dominated by
+`liveness_gc`'s mark-sweep pass and the `src_key_interner` lock (Stage 17's
+own lock-hold table: 19-20% and 31-33% of total lock time respectively),
+neither touched by this stage, so a large *relative CPU-sample* cost still
+translates to a smaller *fraction of total wall time* once those other
+large, fixed costs are accounted for. Phase 4 (concurrency demo)'s +17.2%
+is a ~10ms move on a ~60ms, I/O-latency-simulation-dominated phase
+(`tokio::time::sleep`-based, per the benchmark's own "no width/concurrency
+knob" design) — reported honestly rather than suppressed, but not
+interpreted as a real regression: this phase's timing is governed by
+simulated latency and scheduling width, not `comp.eval`'s CPU cost, and a
+10ms move on 60ms is well inside what this shared box's scheduling noise
+alone produces elsewhere in this document.
+
+### Why the wall-clock win is bigger than Stage 17's own CPU-percentage estimate — and ties back to Stage 20
+
+Stage 17 estimated this confound's cost at ~2.8%/~14.0% of active CPU
+*samples*. The actual measured wall-clock deltas above (-17.0% to -23.7%
+on `persist_bench`'s fully-re-evaluating phases, -8.5% on
+`hospital_bench`'s cold eval) are substantially larger. Two compounding
+reasons, not previously separable without an actual A/B removal:
+
+1. **A static leaf-sample profile under-counts this specific cost.** The
+   eagerly-evaluated `format!("{param:?}")` closures (Stage 4's lazy
+   rendering, defeated by `enabled!(Level::DEBUG)` returning `true`
+   unconditionally) show up in a CPU profile as generic string-formatting/
+   allocator frames, not as anything Stage 6/17's line-by-line
+   `tracing`/`sharded_slab` summation would recognize and attribute to "the
+   tracing confound" — so that estimate was always a lower bound on the
+   fix's real cost, not a ceiling.
+2. **This is the mirror image of Stage 20's own Amdahl's-law finding, in
+   the opposite direction.** Stage 20's `raw_deps` fix touched a leaf-level,
+   per-source-read cost that runs unlocked and in parallel across many
+   concurrent tasks — removing it freed CPU capacity without shortening the
+   wall-clock critical path, because that path was actually gated by
+   `prepare`/`run/finish_success`'s locks elsewhere. `comp.eval`'s span, by
+   contrast, wraps **every single node evaluation at every dependency
+   level** — for `persist_bench`'s 10-level, `FAN_IN`-3 graph, that includes
+   every level-9-depends-on-level-8-depends-on-...-depends-on-level-0 step
+   along the actual critical path, not just parallel leaf work. Shaving
+   fixed per-call overhead off a cost that is incurred at *every level of
+   the dependency chain*, rather than only at its parallel leaves, shows up
+   in wall-clock time close to proportionally — which is exactly what the
+   measurements above show, and exactly why this stage's numbers are far
+   larger and far cleaner (non-overlapping trial ranges) than Stage 20's.
+
+### Corrected baselines (supersede Stages 0-20's figures for wall time)
+
+The task's own "Post-Stage-19 baselines" line (and every wall-time figure
+in Stages 0-20 above it) was measured through the unfiltered harness this
+stage fixes. Going forward, compare against these instead:
+
+- **`persist_bench`** (4-trial means, this session, `~3.6-5.9` load): phase
+  1 (cold, persistence configured) **~2.6-2.7s** (was ~3.2s); phase 5
+  (cold, no persistence) **~2.0s** (was ~2.6s); phase 6 (fingerprint
+  mismatch) **~3.7s** (was ~4.3s); phase 3 (warm restart) **~1.1-1.3s**,
+  unchanged within noise; phases 7/8 (live incremental) **~380-530ms**
+  (was ~470-685ms); db size **269.49 MB**, unchanged; phase 5 gross
+  `allocated_bytes` **~2,730.4 MB** (net **~296.3 MB**, unchanged — Stage
+  18/19's own figure is a *net* figure and is therefore still accurate
+  post-Stage-21, only the *gross*/transient-allocation figure moved).
+- **`hospital_bench`**: cold eval **~3.4-3.8s** (was ~3.9-4.0s); live
+  incremental **~90-115ms**, unchanged within noise; rerun-heavy
+  **~515-625ms**, unchanged within noise; phase 1 gross `allocated_bytes`
+  **~5,526.7 MB** (net **~1,099.5 MB**, unchanged, same net-vs-gross
+  reasoning as above).
+- Engine-only RSS figures (both benchmarks) are **not** revised by this
+  stage — this is a CPU/allocation-only fix (fewer transient allocations
+  freed within the same phase, not a change to any structure's steady-state
+  size), and RSS was already the noisier, load-dependent metric this
+  document has preferred `allocated_bytes` over since Stage 6.
+
+**Practical note for future stages**: any stage that profiles or times
+either benchmark from this commit forward is measuring the corrected
+harness; any comparison against a wall-time number from Stages 0-20 (or
+against Stage 6/17's CPU profiles, which were also captured through the
+unfiltered harness) should either re-measure the "before" side fresh in the
+same session or explicitly flag the mismatch, exactly as this stage has
+just done for the numbers it supersedes.
+
+### Verdict: kept
+
+Every phase that does real work shows a real, mostly non-overlapping
+wall-time improvement (13-24% on `persist_bench`, 8.5% on `hospital_bench`'s
+cold eval); the phases that land within noise (persist_bench's warm
+restart and low-rerun-fraction phases, hospital_bench's low-rerun-count
+phases, the I/O-latency-bound concurrency demo) do so for a mechanistically
+predicted reason (little to no `comp.eval` span cost in those phases to
+begin with), not because the fix is unreliable. Gross allocations dropped
+deterministically and byte-identically across every trial on both
+benchmarks. Every phase's rerun count and the persisted database's byte
+size matched exactly before and after, confirming the harness still
+measures the identical workload and still detects settle/round completion
+correctly — this is measurement hygiene, not an engine change, and it
+removes a confound (flagged since Stage 6, unfixed for fifteen stages) from
+every number this document reports from here on.
+
+### Correctness
+
+No `crates/computations/src/*.rs` file changed — this stage is scoped
+entirely to `crates/computations/examples/persist_bench.rs` and
+`examples/hospital_bench.rs`, per the task's explicit instruction to fix
+the harness rather than the engine's own instrumentation. `cargo test
+--workspace --all-features` — **135 passed**, unchanged (no engine test
+touches either benchmark example). `cargo test -p computations --features
+testutil,alloc-stats` — all green standalone. `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean (examples are included
+in `--all-targets`). Both harnesses' full phase sequences were re-run and
+their rerun counts/db sizes verified identical to the pre-fix baseline (see
+Measurements above) before any timing number in this section was trusted.

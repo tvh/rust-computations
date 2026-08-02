@@ -136,6 +136,7 @@ use computations::{Comp, Dep, Engine, Registry, Request, Source, SourceBase, Sou
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
@@ -1078,15 +1079,29 @@ fn orchestrator_main() {
 async fn worker_main(phase_id: &str) {
     let settle_signal = Arc::new(AtomicU64::new(0));
     let round_signal = Arc::new(AtomicU64::new(0));
+    // Stage 21 (see docs/persistence-benchmark-notes.md): see
+    // `persist_bench.rs`'s identical setup for why the filter must be
+    // applied to *both* `MessageSignal` layers via `.with_filter`, not
+    // bolted on as a separate, unfiltered layer -- an unfiltered
+    // `MessageSignal` would keep every callsite's combined interest at
+    // `Interest::always()` regardless of any other layer's filter.
+    let bench_filter =
+        || Targets::new().with_target("computations::driver", LevelFilter::DEBUG).with_default(LevelFilter::INFO);
     tracing_subscriber::registry()
-        .with(MessageSignal {
-            needle: "initial evaluation complete",
-            counter: settle_signal.clone(),
-        })
-        .with(MessageSignal {
-            needle: "propagation round complete",
-            counter: round_signal.clone(),
-        })
+        .with(
+            MessageSignal {
+                needle: "initial evaluation complete",
+                counter: settle_signal.clone(),
+            }
+            .with_filter(bench_filter()),
+        )
+        .with(
+            MessageSignal {
+                needle: "propagation round complete",
+                counter: round_signal.clone(),
+            }
+            .with_filter(bench_filter()),
+        )
         .init();
 
     let phase_timeout = Duration::from_secs(300);
