@@ -3873,3 +3873,624 @@ correctness tests (137 total) passed, `cargo test -p computations
 --features testutil,alloc-stats` passed standalone, and `cargo clippy
 --workspace --all-targets --all-features -- -D warnings` was clean — the
 mechanism was correct; it was rejected on cost/benefit, not on a bug.
+
+## Stage 17 — re-profiling after the campaign
+
+Stages 13-16 (source-key interning, Zero/One/Many `source_index`, inlined
+version bytes, and the reverted single-flight experiment) landed since
+Stage 6's CPU profile, which is now stale. This stage re-profiles both
+benchmarks at HEAD (`9bf2451`, 135 tests), re-runs the Stage 12 instruments
+(lock-hold attribution, allocation deltas) to confirm they still match
+their last-documented baselines, adds a temporary capacity-based
+memory-accounting instrument (reverted, per this stage's own acceptance
+criteria), and ranks what's actually left.
+
+### Tooling and load context
+
+Same recipe as Stage 6: `cargo build -p computations --profile profiling
+--example {persist_bench,hospital_bench} --features testutil`, `samply
+record --save-only --unstable-presymbolicate`, offline leaf-sample
+resolution against the `.syms.json` sidecar. The analysis script was
+rewritten from scratch this stage (Stage 6's own copy was, per its own
+notes, "kept in the scratchpad, not committed") with one addition Stage 6
+didn't need: `known_addresses` sometimes resolves a sampled address to a
+bare source-file path (no demangled symbol -- typically heavily-inlined
+generic/async-state-machine code) or to the literal string `"UNKNOWN"`;
+falling back to the presymbolication sidecar's coarser `symbol_table`
+rva-range lookup in exactly those two cases turned a nonsensical top entry
+(39% of one profile's active samples attributed to a bare
+`.../harness.rs` path) into the expected
+`tokio::runtime::task::harness::Harness<T,S>::poll`, and -- more
+importantly -- fixed idle-park detection itself: `--hide-idle`'s walk
+matches full-stack frame *names* against `tokio::runtime::park`, so a
+mis-resolved intermediate frame silently defeated the whole idle filter
+(one early sanity run mis-reported 11% idle where the range-corrected
+version reports 46%). Verified against a `PERSIST_BENCH_SCALE=0.02` sanity
+run before trusting full-scale output, same discipline as Stage 6.
+
+`uptime` load average ranged **~2.0-4.3** across this stage's entire
+session (1-minute figures from 2.0 up to 4.3 at various points) --
+lighter than most prior stages in this document (several ran at 4.6-30)
+but this box is still shared, so, per this document's standing practice,
+absolute times below are reported for context only; the relative shares
+(self-time percentages, lock-hold percentages, byte deltas) are what this
+stage's conclusions rest on. `alloc_stats`-measured net-allocated-bytes
+figures (deterministic, load-independent) are used in preference to RSS
+wherever both are available, for the same reason.
+
+### (a) `persist_bench` cold eval, no persistence -- top hotspots (phase 5-1, whole process, 3637 leaf samples, 46.1% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 12.23% | `<sip::Hasher as Hasher>::write` | **SipHash -- but now on `RawDep`, not `Hash128`** (see below) |
+| 10.04% | `tokio::runtime::task::harness::Harness<T,S>::poll` | tokio task polling |
+| 7.70% | `futures_task::waker::clone_arc_raw` | waker-clone churn |
+| 4.43% | `hashbrown::raw::RawTableInner::free_buckets` | HashSet/HashMap teardown |
+| 4.08% | `NodeTable::id_of` | node-table lookup (now identity-hashed) |
+| 2.75% | `harness::poll_future::{{closure}}` | tokio |
+| 2.45% | `persist_bench::main` | benchmark harness itself |
+| 1.99% | `UnsafeCell::with_mut` | tokio loom shim |
+| 1.78% | `pthread_mutex_lock` | lock acquisition (the global `Mutex<NodeTable>`) |
+| 1.63% | `Shared<Fut>::poll` | single-flight join machinery |
+| 1.38% | `<T as ToString>::to_string` | `CompKey` debug/param formatting |
+| 1.33% | `postcard::ser::serialize_with_flavor` | postcard encode |
+| 1.27% | `_platform_memcmp` | alloc/compare noise |
+| 1.17% | `EngineInner::run::{{closure}}` | driver |
+| 1.02% | `source::raw_deps::{{closure}}` | **the fresh finding -- see below** |
+| 0.87% | `NodeTable::source_deps_clone` | node-table/side-table access |
+| ~2.78% (11 entries, listed together) | `tracing`/`sharded_slab` (`Instrumented::drop`, `Pool::create_with`, `DataInner::clear`, `Dispatch::get_default`, span init/release, ...) | **tracing instrumentation confound, still present** |
+| ~0.97% | `blake3::hash` + `ChunkState::update` | blake3 hashing |
+
+### (b) `persist_bench` warm restart, with persistence -- top hotspots (phase 3-1, whole process, 1726 leaf samples, 35.5% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 8.80% | `persist::restore_nodes` | persist: decode + wire restored nodes |
+| 5.75% | `harness::poll_future::{{closure}}` | tokio |
+| 4.31% | `<Arc<T> as Hash>::hash` | `SourceId`/`DefId` hashing (restore-time lookups) |
+| 3.68% | `BuildHasher::hash_one` | HashMap hashing (SipHash) |
+| 3.23% | `pread` | redb (mmap'd file reads) |
+| 3.14% | `<Vec<T> as Hash>::hash` | **`HashSet<RawDep>`/`HashSet<RawOutput>` construction -- see below** |
+| 2.33% | `Filter::fold` | iterator-adapter overhead (def-name lookups?) |
+| 1.89% | `Harness<T,S>::poll` | tokio |
+| 1.71% | `Global::allocate` | allocator |
+| 1.62% | `str::converts::from_utf8` | def-name string decode |
+| 1.26% | `<SinkId as Hash>::hash` | `RawOutput` hashing (restore path) |
+| 1.17% | `HashMap::insert` | node-table/index rebuild |
+| 1.08% | `def::column_write` | typed value column write |
+
+### (c) `persist_bench` live incremental, with persistence -- settle/flush windows (small-sample; consistent with Stage 6's shape)
+
+Settle-only window (602 active samples): propagation/persist-pending-map
+churn (`liveness_gc`, `propagate`/`propagate_tier`, `persister_loop`,
+`HashMap::insert`) plus the same `hash_one`/tracing signature as (a) -- no
+redb symbols, confirming the async-debounced design still holds. Flush-only
+window (2015 active samples, 0.7% idle): still **redb/IO-dominated**
+(`fcntl` 5.26%, `pwrite` 4.81%, `LeafMutator::insert` 1.79%, plus
+`RawTable::drop`/hashing for the def-name/pending-map bookkeeping around
+the transaction) -- no change from Stage 6's "not the redb write path"
+verdict; listed for completeness, not as a new finding.
+
+### `hospital_bench` cold eval -- top hotspots (window ~190-3828ms of the `main`-phase recording, proportional to the phase's own printed `RESULT` timing; 5494 leaf samples, 33.5% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 7.88% | `drop_in_place<Instrumented<EngineInner::eval<..>::{{closure}}>>` | **tracing span teardown** |
+| 6.68% | `liveness_gc::{{closure}}::{{closure}}` | mark-sweep GC self-time (own CPU cost, not just lock-hold) |
+| 4.22% | `drop_in_place<Fuse<slab::Drain<Option<Waker>>>>` | tokio task-slab teardown |
+| 3.15% | `start` | process/thread startup |
+| 2.93% | `record_source_deps::{{closure}}` | interning + `HashSet<SrcDep>` construction |
+| 2.90% | `CompDef::write_value` | typed value column write |
+| 2.85% | `Core<T,S>::poll` | tokio |
+| 2.82% | `Vec::pop` | free-list reuse |
+| 1.97% | `drop_in_place<HashSet<String,RandomState>>` | ad hoc `String`-keyed set teardown |
+| 1.70% | `RawTable::reserve_rehash` | HashMap growth |
+| 1.15% | `drop_in_place<Span>` | tracing |
+| 0.99% | `Dispatch::subscriber` | tracing |
+| 0.93% | `postcard::try_push_varint_u64` | postcard encode |
+| 0.88% | `drop_in_place<RefMut<DataInner>>` (sharded_slab) | tracing span-storage pool |
+| **~14.0% (24 entries, summed)** | every `tracing`/`sharded_slab`/`Span` line in this window | **the confound, much worse here than on `persist_bench`** |
+
+### `hospital_bench` rerun-heavy (300 keys mutated) -- top hotspots (window ~3911-4451ms of the same recording; 471 leaf samples, 9.8% idle-park excluded)
+
+| % self | function | subsystem |
+|---|---|---|
+| 30.12% | `BuildHasher::hash_one` | SipHash -- 78/128 caller-traced samples (61%) resolve through `source::raw_deps`, the rest through `liveness_gc`/postcard |
+| 13.65% | `liveness_gc::{{closure}}::{{closure}}` | mark-sweep self-time |
+| 10.12% | `postcard::serialize_with_flavor` | postcard encode |
+| 9.88% | `drop_in_place<Fuse<slab::Drain<Waker>>>` | tokio |
+| 7.06% | `Option::is_some_and` | dirty-check branch |
+| 5.18% | `drop_in_place<Instrumented<..>>` | tracing |
+| **4.71%** | **`source::raw_deps` (self, direct)** | **the fresh finding, in the flesh** |
+| 3.29% | `JoinAll::poll` | `Ctx::eval_all` fan-out |
+| 1.41% | `drop_in_place<UnsafeCell<SrcKeyInterner>>` | interner teardown (per-process, once) |
+
+### What Stages 13-15 demonstrably eliminated, and what took its place
+
+- **SipHash on `Hash128` keys: eliminated as designed, but a *different*
+  SipHash cost immediately backfills the same profiler line.** Stage 6's
+  addendum (identity hashing for `Hash128`) is confirmed still doing its
+  job: `NodeTable::id_of` (the per-def `Hash128Map` lookup) sits at 4.08%
+  of persist_bench's active samples, essentially unchanged from Stage 6's
+  original 3.6% pre-fix figure and nowhere near the ~5.6-8.7%
+  *SipHash-family* share Stage 6 measured before the fix -- that specific
+  cost is gone from the *stored index* structures it targeted. But
+  `sip::Hasher::write` is back at **#1** (12.23%) in this fresh profile,
+  and caller-tracing shows why: 153 of ~240 samples under it resolve
+  through `<RawDep as Hash>::hash` -- `crate::source::raw_deps` (`source.rs`,
+  called from every `Ctx::src_req`) builds a fresh `HashSet<RawDep>` on
+  *every single source read*, hashing `SourceId` + full postcard key/version
+  bytes through `std`'s default SipHash, entirely independent of Stage
+  13-15's interning (which only ever sees the `HashSet<RawDep>` *after*
+  it's built). This is a genuinely new finding, not a stale one: Stage 6's
+  own SipHash discussion was scoped to `HashMap<Hash128, _>`/`HashMap<CompKey,
+  _>` index structures and explicitly listed `RawDep`-keyed side tables as
+  "deliberately left untouched... string/byte-keyed, not `Hash128`-dominated
+  -- still need `std`'s HashDoS-resistant SipHash" (correct reasoning for
+  *why identity hashing doesn't apply* -- but nobody had yet noticed that a
+  `HashSet` doesn't need to exist there *at all* for the measured common
+  case; see candidate 1 below). Confirmed the same shape recurs in
+  `restore_nodes` (`<Vec<T> as Hash>::hash`/`<SinkId as Hash>::hash` in
+  profile (b) -- restoring a node rebuilds `HashSet<RawDep>`/`HashSet<RawOutput>`
+  from its persisted record the identical way) and in `hospital_bench`'s
+  rerun-heavy window (`raw_deps` appears **directly**, as a named leaf, at
+  4.71% self-time, with 61% of the window's dominant `hash_one` line
+  tracing back through it by caller analysis).
+- **blake3's relative share shrank** (~3.3% at Stage 6 -> ~0.97% combined
+  here), but this reads as *dilution*, not a real speedup: blake3 hashes
+  the same param/result bytes on the same call pattern as before (nothing
+  in Stages 13-15 touched `CompKey`/result hashing), and this profile's own
+  idle-park share (46.1%) is higher than Stage 6's (38.7%) on a lighter-
+  loaded box, both symptoms of the same underlying shift -- Stage 13's
+  interning step and the confound below now occupy more of the *active*
+  sample budget, shrinking blake3's percentage of a differently-composed
+  whole without it doing less absolute work. Reported factually, not as an
+  optimization win.
+- **The tracing confound Stage 6 flagged and left unfixed is still exactly
+  present -- worse on the benchmark that didn't exist yet at Stage 6.**
+  Quantified fresh, by summing every tracing/`sharded_slab`/`Instrumented`/
+  `Span` line in each window: **~2.8% of `persist_bench`'s cold-eval active
+  samples**, in the same ballpark as Stage 6's original ~4-5% estimate
+  (small-sample noise plus this run's different composition explains the
+  gap), but **~14.0% of `hospital_bench`'s cold-eval active samples** --
+  roughly 5x higher. This tracks structurally: `hospital_bench`'s comp
+  bodies are shorter and more source-request-heavy per instance than
+  `persist_bench`'s (most comps do one source read and return, versus
+  `persist_bench`'s FAN_IN=3 aggregation), so the *same* fixed per-span
+  cost (`debug_span!`'s field formatting, `sharded_slab` storage,
+  `Registry::enter`) is a larger fraction of each individual comp's total
+  work. Stage 6's candidate 2 (give the benchmark's two `MessageSignal`
+  layers a `Targets`/`EnvFilter`) was never applied; it is re-proposed
+  below with a fresh, larger number behind it.
+- **Node-table bookkeeping's other half (`record_call_dep`) has genuinely
+  gotten cheap** -- it doesn't surface as a distinct leaf in either
+  benchmark's top-25 self-time list at all (a `SmallVec` push under an
+  already-held lock, apparently now cheap enough to not show up on its own
+  in a 1kHz sample), even though `record_call_dep`'s *lock-held* time is
+  still a substantial 19.28% (persist) / 5.63% (hospital) share in the
+  fresh lock-stats tables below -- the two metrics measure different
+  things (wall-clock self-time-when-sampled vs. total time spent inside a
+  named critical section, including calls to other cheap functions), and
+  the discrepancy is itself informative: this specific site's *own*
+  instructions are cheap; what's expensive is everything happening while
+  the lock across `prepare`+`record_call_dep`+`run/finish_success` is held,
+  which lock-stats already attributes correctly and CPU-profiling
+  necessarily smears across whichever leaf happens to be running at each
+  1kHz tick.
+- **Warm restart's cost is still redb I/O + hashing, not probing** -- same
+  verdict as Stage 6 (`probe_versions` doesn't appear in the top 25 here
+  either), just with the hashing half now traceable to the *same*
+  `HashSet<RawDep>`/`HashSet<RawOutput>` construction pattern identified
+  above, this time inside `restore_nodes` rather than `raw_deps` (both
+  call sites build the identical shape of transient hash set from
+  postcard-decoded bytes). See "durability tiers" under candidates below
+  for what this implies about that specific proposal.
+- **The flush window and the settle-only window are unchanged in shape**
+  from Stage 6 -- redb-dominated and propagation/pending-map-dominated,
+  respectively. Confirms nothing about the flush path moved.
+
+### Fresh lock-hold and allocation baselines (confirms no regression since Stage 15)
+
+`persist_bench` phase 1 (cold eval, persistence configured), fresh run,
+`COMPUTATIONS_LOCK_STATS=1`:
+
+| site | calls | total (s) | mean (ns) | % of total |
+|---|---|---|---|---|
+| `run/finish_success` | 999,760 | 0.596 | 595.9 | 37.26% |
+| `prepare` | 2,385,278 | 0.567 | 237.6 | 35.45% |
+| `record_call_dep` | 2,385,277 | 0.308 | 129.3 | 19.28% |
+| `record_source_deps/nodes` | 205,000 | 0.043 | 209.6 | 2.69% |
+| `run/set_inflight` | 999,760 | 0.027 | 27.1 | 1.69% |
+| `record_source_deps/source_index` | 205,000 | 0.027 | 130.1 | 1.67% |
+| `record_source_deps/interner` | 205,000 | 0.026 | 128.0 | 1.64% |
+| `remove_stale_source_index` | 205,000 | 0.005 | 24.0 | 0.31% |
+| `record_outputs` | 1,000 | 0.0002 | 232.7 | 0.01% |
+
+Essentially unchanged from Stage 13's post-interning numbers for this exact
+phase (interner 1.37%->1.64%, `source_index` ~1.7% either side) -- confirms
+`persist_bench`'s lock-hold picture has been stable since Stage 13 landed,
+through Stages 14-16.
+
+`hospital_bench`, cumulative phases 1-3, fresh run:
+
+| site | calls | total (s) | mean (ns) | % of total |
+|---|---|---|---|---|
+| `record_source_deps/interner` | 2,081,168 | 0.666 | 320.0 | 32.51% |
+| `liveness_gc/mark_sweep` | 6 | 0.401 | 66,762,798.5 | 19.55% |
+| `prepare` | 1,372,788 | 0.318 | 231.6 | 15.52% |
+| `record_source_deps/nodes` | 2,081,168 | 0.267 | 128.2 | 13.02% |
+| `run/finish_success` | 1,117,543 | 0.148 | 132.8 | 7.24% |
+| `record_call_dep` | 1,371,337 | 0.115 | 84.2 | 5.63% |
+| `record_source_deps/source_index` | 2,081,168 | 0.085 | 40.8 | 4.15% |
+| `run/set_inflight` | 1,117,543 | 0.030 | 26.7 | 1.46% |
+| `remove_stale_source_index` | 753,000 | 0.017 | 23.1 | 0.85% |
+
+`source_index`'s share is down further from Stage 13's post-interning
+33.60%->6.39% to **4.15%** here (Stage 14's Zero/One/Many landed in
+between and shrank it again, as that stage's own table predicted:
+6.41%->4.68%, now reconfirmed a third time at 4.15% on top of everything
+else that's changed since). `interner`'s share is up correspondingly
+(30.17%->32.51%) -- same lock, more of the total, exactly Stage 13's own
+"the expensive work moved off `source_index`, not away" finding, still
+holding three stages later.
+
+`alloc_stats` net-allocated-bytes, both benchmarks, matched their
+last-documented values **to the byte**: `persist_bench` phase 5 (no
+persistence) 325,014,346 B / 325,014,586 B (two trials -- Stage 15's
+documented baseline was 325,014,346 B, identical on trial 1); `hospital_bench`
+cold eval 1,146,709,594 B (Stage 15's documented baseline, exact match).
+Nothing has silently regressed or improved at the allocation level between
+Stage 15 and this HEAD.
+
+### Memory accounting: where the rest actually goes
+
+Stage 5's per-row byte accounting summed `DefTable`'s *logical* column
+lengths (135 B/row, common columns) against a *measured* RSS figure,
+leaving a ~177 B/row gap attributed qualitatively to "`NodeRef` doubling",
+"splitting one HashMap into 50", and unaccounted side tables. This stage
+closes that gap with actual numbers: a temporary diagnostic
+(`NodeTable::debug_memory_breakdown`/`SrcKeyInterner::debug_byte_estimate`,
+added to `engine.rs`/`interner.rs`, wired into an `eprintln!` in each
+benchmark, reverted before this stage's commit -- see "Correctness" below)
+summed real `Vec`/`HashMap` **capacities** (not lengths) across every live
+structure, run once per benchmark at the same point `alloc_stats`' net
+figure was captured.
+
+**`persist_bench`, 999,760 rows, phase 5 (no persistence), net-allocated
+325.1 MB:**
+
+| structure | measured bytes | B/row | % of total |
+|---|---|---|---|
+| `DefTable` dense columns, real capacity (`param_hash`/`result_hash`/`flags`/`param_off`/`param_len`/`comp_deps`/`rdeps`/`free`, summed via `.capacity()` across all 51 `DefTable`s) | 215.14 MB | 215.2 | 66.2% |
+| per-def `index: Hash128Map<u32>` (51 tables) | 29.66 MB | 29.7 | 9.1% |
+| `NodeTable::source_deps` (outer `HashMap<NodeRef, HashSet<SrcDep>>` shell + 205,000 inner `HashSet`s' real capacity) | 33.37 MB (13.07 + 20.30) | 33.4 | 10.3% |
+| `param_arena` (all 51 defs) | 3.56 MB | 3.6 | 1.1% |
+| `src_key_interner` | 0.04 MB | 0.04 | 0.01% |
+| **named total** | **281.8 MB** | **281.9** | **86.7%** |
+| unaccounted (typed value column, `outputs`/`inflight`/`flow_ids`, `VecSink`, tokio/futures scaffolding -- not instrumented this round) | ~43.3 MB | ~43.3 | 13.3% |
+
+Two concrete findings inside this table that Stage 5 didn't have numbers
+for:
+
+- **Real `Vec` capacity is 215.2 B/row against Stage 5's 135 B/row
+  *logical*-length sum for the same 7 columns (excluding the near-empty
+  `free` list)** -- a **~80 B/row (37%)** gap that is pure capacity slack:
+  `DefTable::insert` never reserves ahead of a population it can't know in
+  advance, so every column's backing buffer sits wherever its last
+  power-of-two doubling landed relative to the def's final row count.
+- **`NodeTable::source_deps` -- every one of its 205,000 entries holds
+  exactly one `SrcDep`** (confirmed independently by a second temporary
+  instrument, a call-count histogram of `raw_deps()`'s input size: **100%**
+  of `persist_bench`'s 205,000 calls and **99.9998%** of `hospital_bench`'s
+  2,081,000 calls pass exactly one `Dep`). hashbrown allocates capacity for
+  **3** items even to hold a `HashSet` of 1 (the smallest non-empty group
+  size, rounded for its ~87.5% max load factor), so each of these
+  single-dependency nodes pays **~99 B of real heap** (3 slots x
+  (32 B `SrcDep` + 1 B control byte)) to store one 32-byte value -- a 3x
+  over-allocation *on top of* paying for a hash table at all where a
+  `SourceRefs`-style `One`/`Many` enum (Stage 14's own pattern, applied to
+  the *other* side table) would cost zero heap bytes in the common case.
+
+**`hospital_bench`, 1,116,093 rows, phase 1 cold eval, net-allocated
+1,146.7 MB:**
+
+| structure | measured bytes | B/row | % of total |
+|---|---|---|---|
+| `DefTable` dense columns, real capacity (18 defs) | 266.82 MB | 239.1 | 23.3% |
+| per-def `index` (18 tables) | 38.12 MB | 34.2 | 3.3% |
+| `NodeTable::source_deps` (753,000 entries, 2,079,000 total `SrcDep`s, outer shell + inner capacity) | 127.04 MB (52.30 + 74.75) | 113.8 | 11.1% |
+| `param_arena` | 4.21 MB | 3.8 | 0.4% |
+| `src_key_interner` | **253.58 MB** | 227.3 | **22.1%** |
+| **named total** | **689.8 MB** | **618.2** | **60.2%** |
+| unaccounted (18 defs' typed value columns, `comp_deps`/`rdeps` spillover, `outputs`, tracing's `sharded_slab` span-storage pool, tokio/futures scaffolding) | ~456.9 MB | ~409.5 | 39.8% |
+
+The single biggest concretely-named structure of either benchmark:
+
+- **`src_key_interner` costs 253.58 MB -- 22.1% of `hospital_bench`'s
+  entire measured footprint -- for a genuine, previously-unflagged
+  duplication inside the interner itself.** `SrcKeyInterner::intern`
+  (`interner.rs`) calls `key.to_vec()` **twice** for every newly-seen key:
+  once into `entries: Vec<Option<(SourceId, KeyBytes)>>` (kept for reverse
+  lookup -- persistence, `Source::unregister`) and once more into
+  `forward`'s nested `HashMap<KeyBytes, SrcKeyId>` (the forward-lookup
+  index). On `persist_bench`'s 300-distinct-key workload this doubling is
+  free either way; on `hospital_bench`'s ~2.08M-distinct-key,
+  zero-sharing workload, every key's bytes (~18-24 raw bytes for a string
+  like `"vitals/value/p1234/v5"`) are stored **twice**, independently, each
+  copy paying its own malloc-quantum overhead (per Stage 15's own "~16.4 B
+  of real overhead recovered per eliminated tiny allocation" finding --
+  doubled here, not eliminated). This is exactly the kind of duplication
+  Stage 13 set out to remove from `NodeTable`/`source_index` -- it simply
+  reappeared one layer further in, inside the fix itself, on the one
+  workload with no sharing to hide it.
+- **`NodeTable::source_deps` costs 127.0 MB (11.1%) here too**, though the
+  shape differs from `persist_bench`: only 1,500 of 753,000 entries hold
+  exactly one `SrcDep` (average 2.76/entry -- `hospital_bench`'s comps
+  batch multiple source reads per instance, e.g. `vitals` reads
+  value+unit+range in one body), so a strict `One`/`Many` enum would help a
+  smaller fraction of entries than on `persist_bench`; a `SmallVec<[SrcDep;
+  N]>`-style representation (rather than a two-armed enum) would still
+  recover the hashbrown-minimum-table tax that every one of these 753,000
+  entries pays regardless of its own element count.
+- **Real column capacity is 239.1 B/row against the same 135 B/row
+  logical baseline** -- a **~104 B/row (43%)** gap, larger than
+  `persist_bench`'s 37%, consistent with `hospital_bench`'s 18 defs having
+  more unevenly-sized populations (some defs at 1,500 rows, others at
+  ~900,000) and therefore more of them landing badly relative to their own
+  next-power-of-two capacity boundary.
+- The larger unaccounted residual here (39.8% vs. `persist_bench`'s 13.3%)
+  is plausibly: the 18 defs' typed value columns (all small -- `u64` or
+  `(WardId, u32)` tuples, confirmed by inspecting every `Comp<P, R>`
+  registration in `hospital_bench.rs`; no `String` results, so this is
+  individually cheap but multiplied across up to ~900,000 rows for the
+  largest def); the ~63,092 nodes (5.65%) whose `comp_deps`/`rdeps` spilled
+  past their 4-element `SmallVec` inline capacity (`transfer_candidates`
+  alone fans out over all 1,500 patients via two separate `eval_all`
+  calls; `note_digest`/`risk_score` fan into ~100-240 children per patient,
+  1,500 such nodes each -- a real, if secondary, structural cost this
+  diagnostic surfaced but didn't fully attribute); and -- flagged, not
+  quantified this round given the effort budget -- tracing's
+  `sharded_slab` span-storage pool, whose drops appear directly in this
+  stage's own CPU profile of this exact phase (`drop_in_place<RefMut
+  <DataInner>>`, `drop_in_place<Span>`), meaning the same "no `EnvFilter`"
+  confound already measured as a CPU cost plausibly costs some non-zero,
+  unmeasured amount of memory too (`sharded_slab`'s storage grows to
+  accommodate historical span-slot high-water marks and isn't guaranteed
+  to shrink back down).
+
+### Ranked optimization candidates
+
+Ranked by estimated impact x confidence, given this stage's evidence.
+
+1. **Skip `HashSet<RawDep>`/`HashSet<RawOutput>` construction for the
+   (measured) common single-element case.** Evidence: a temporary
+   histogram (mirroring Stage 15's own version-byte-length methodology)
+   found **100%** of `persist_bench`'s 205,000 `raw_deps()` calls and
+   **99.9998%** of `hospital_bench`'s 2,081,000 calls carry exactly one
+   `Dep` -- every one of them still builds a full SipHash-backed
+   `HashSet<RawDep>` purely to hold that single element.
+   `<RawDep as Hash>::hash` (via `sip::Hasher::write`) is `persist_bench`
+   cold-eval's **#1** self-time line (12.23% of active samples, 64%
+   caller-traced directly to it); on `hospital_bench`'s rerun-heavy
+   window, `raw_deps` plus its `hash_one` calls account for **~23%** of
+   active samples. The identical pattern recurs in
+   `persist::restore_nodes` (profile (b)'s `<Vec<T> as Hash>::hash`/
+   `<SinkId as Hash>::hash`) and in `ctx.rs`'s `sink_req` (lower priority
+   -- 1,000-1,800 calls/run on both benchmarks, two to three orders of
+   magnitude fewer than source reads). **Fix**: change `raw_deps`'s return
+   type (and `record_source_deps`'s parameter) to a `SmallVec<[RawDep;
+   1]>`-style representation with a linear dedup fallback only when
+   `len() > 1` -- safe because `Source::execute`'s own typed
+   `HashSet<Dep<K,V>>` (a public-API requirement, unchanged) already
+   deduplicates by key before `raw_deps` ever sees it, so a `Vec`/`SmallVec`
+   preserves that uniqueness for free. Apply the same shape to
+   `SourceAdapter::wait_changes` (identical construction) and
+   `restore_nodes`'s per-record `HashSet<RawDep>`/`HashSet<RawOutput>`
+   (`persist.rs`). **Estimated win**: removes the single largest CPU line
+   item on one benchmark and a top-3 item on the other -- roughly 5-12% of
+   active self-time depending on workload, the highest-confidence CPU
+   candidate on this list (direct, repeated, caller-traced evidence on
+   both benchmarks and in both the live and restore paths). **Files**:
+   `crates/computations/src/source.rs` (`raw_deps`, `SourceAdapter::wait_changes`),
+   `crates/computations/src/engine.rs` (`record_source_deps`'s `raw`
+   parameter type), `crates/computations/src/persist.rs` (`restore_nodes`),
+   `crates/computations/src/ctx.rs` (`sink_req`, lower priority).
+
+2. **Apply Stage 14's `SourceRefs` (Zero/One/Many) pattern to
+   `NodeTable::source_deps`, the *other* side table Stage 14 didn't touch.**
+   Stage 14 fixed `source_index` (key -> dependents); `source_deps` (node ->
+   its own deps) has the identical "mostly-one-element `HashSet`" shape,
+   just never measured before this stage. Evidence: the temporary capacity
+   diagnostic found `source_deps`'s 205,000 `persist_bench` entries are
+   **100%** single-`SrcDep`, costing 33.4 MB (10.3% of `persist_bench`'s
+   total) for values that would cost zero heap bytes as an inline enum
+   variant; hashbrown's 3-slot minimum-table allocation means each
+   single-element entry pays ~99 B of real heap for one 32-byte value.
+   `hospital_bench`'s 753,000 entries average 2.76 `SrcDep`s each (multi-key
+   comp bodies), so a strict two-armed enum helps a smaller fraction there
+   -- a `SmallVec<[SrcDep; 2]>`-style representation generalizes better
+   across both workloads' measured distributions while still avoiding the
+   hashbrown per-table minimum-size tax that all 753,000 of hospital's
+   entries pay regardless of their own arity. **Estimated win**: ~25-30 MB
+   (~8-9%) of `persist_bench`'s memory; a smaller *relative* but likely
+   larger *absolute* share of `hospital_bench`'s 127 MB `source_deps` cost
+   (the hashbrown-minimum-table tax alone, independent of arity, is paid
+   753,000 times). **File**: `crates/computations/src/engine.rs`
+   (`NodeTable::source_deps`'s type, `record_source_deps`/
+   `reconcile_source_deps`/`liveness_gc`'s touch points, mirroring exactly
+   Stage 14's own call-site list for `source_index`), plus
+   `crates/computations/src/persist.rs` (`restore_nodes`'s rebuild path).
+
+3. **Fix the benchmark harness's tracing confound (Stage 6 candidate 2,
+   still unapplied) -- now quantified worse than Stage 6 estimated, on the
+   benchmark that didn't exist yet at Stage 6.** Evidence: summing every
+   tracing/`sharded_slab`/`Instrumented`/`Span` self-time line in this
+   stage's own profiles gives **~2.8%** of `persist_bench`'s cold-eval
+   active samples (in Stage 6's original ~4-5% ballpark) but **~14.0%** of
+   `hospital_bench`'s -- roughly 5x higher, because `hospital_bench`'s
+   shorter, more source-request-heavy comp bodies make the same fixed
+   per-span cost a larger fraction of each comp's total work. **Fix**:
+   give both benchmarks' two `MessageSignal` `tracing_subscriber::Layer`s
+   a `Targets`/`EnvFilter` (or override `max_level_hint`) so
+   `debug_span!`/`debug!` skip tracing's near-zero disabled-path -- a
+   benchmark-only change (`persist_bench.rs`/`hospital_bench.rs`), zero
+   engine-code risk. **Estimated win**: same order as the measured share,
+   ~3-14% of wall time depending on workload -- and, independently of any
+   wall-time win, this is measurement hygiene: every future profiling pass
+   on this codebase inherits this confound until it's fixed. **Files**:
+   `crates/computations/examples/persist_bench.rs`,
+   `crates/computations/examples/hospital_bench.rs`.
+
+4. **Stop double-copying key bytes inside `SrcKeyInterner` itself.**
+   Evidence: the temporary capacity diagnostic measured `src_key_interner`
+   at **253.58 MB -- 22.1% of `hospital_bench`'s entire footprint**, the
+   single largest concretely-named structure of either benchmark, on a
+   workload with ~2.08M distinct keys and zero sharing.
+   `SrcKeyInterner::intern` (`interner.rs`) calls `key.to_vec()` twice per
+   newly-seen key -- once into `entries: Vec<Option<(SourceId, KeyBytes)>>`,
+   once more into `forward`'s nested `HashMap<KeyBytes, SrcKeyId>` -- two
+   independent heap allocations holding identical bytes, each paying its
+   own malloc-quantum overhead. **Fix**: share one allocation between the
+   two structures -- store `Arc<[u8]>` (cheap under the same
+   `Mutex<SrcKeyInterner>` this all already lives behind) in both
+   `entries` and as `forward`'s inner-map key, via `Arc<[u8]>: Borrow<[u8]>`
+   to preserve the module's own documented "a hit never allocates a probe
+   key" property. **Estimated win**: roughly half of the interner's own
+   footprint on a zero-sharing workload -- call it ~100-125 MB (~9-11% of
+   `hospital_bench`'s total memory), effectively zero on `persist_bench`
+   (300 keys either way, negligible base cost) -- the same
+   "`hospital_bench`-wins, `persist_bench`-neutral" shape Stages 13-15
+   already established repeatedly. **File**:
+   `crates/computations/src/interner.rs` (`SrcKeyInterner::forward`/
+   `entries`, `intern`/`intern_retain`/`release`).
+
+5. **Reserve (or `shrink_to_fit`) `DefTable`'s dense columns instead of
+   growing them via unreserved `push()`.** Evidence: measured real
+   `.capacity()` sums are 215.2 B/row (`persist_bench`) and 239.1 B/row
+   (`hospital_bench`) against Stage 5's 135 B/row *logical*-length
+   accounting for the same 7 columns -- **~80 B/row (37%)** and **~104
+   B/row (43%)** of pure Vec-growth capacity slack, respectively, because
+   `DefTable::insert` never reserves ahead of a population it can't
+   predict. **Fix options**: (a) an optional per-registration size hint
+   threaded through `Registry`/`EngineBuilder` so `DefTable::new` can
+   `Vec::with_capacity` up front, for callers who know their own scale
+   (both benchmarks' level/patient counts are known before `build()`); or
+   (b) `shrink_to_fit()` every `DefTable` column at a natural "settled"
+   checkpoint (e.g. after `Engine::run`'s initial `eval_root` resolves),
+   trading one one-time realloc-and-copy per column per def for reclaiming
+   the doubling slack once a population stabilizes. **Estimated win**: up
+   to the full measured gap in the best case (~24-25% of `DefTable`-column
+   memory), realistically less since (a) only helps where a caller can
+   predict scale and (b) has to weigh its own copy cost against the RSS
+   win. **Files**: `crates/computations/src/engine.rs` (`DefTable::insert`,
+   `DefTable` struct, `EngineBuilder`/`Registry` for the size-hint variant).
+
+### The task's four named candidates, evaluated
+
+- **The tracing confound** -- **IN**, see ranked candidate 3 above: real,
+  now quantified on both benchmarks (worse on `hospital_bench` than Stage
+  6's original estimate), cheap to fix, zero engine risk.
+- **A packed `u32` `NodeRef` or same-def-local `u32` edge representation**
+  -- Stage 5 predicted low value for `persist_bench`'s cross-def topology
+  and declined to attempt it; this stage checked whether `hospital_bench`'s
+  topology differs, per the task's explicit ask. It doesn't, in the
+  direction that would matter: `comp_deps_spilled`/`rdeps_spilled` (nodes
+  whose edge count exceeds the 4-element inline `SmallVec` capacity) are
+  **5.65%**/**0.13%** of `hospital_bench`'s 1,116,093 nodes -- a small
+  minority -- and `hospital_bench`'s edges are, if anything, *more*
+  cross-def than `persist_bench`'s by construction (a patient's chain runs
+  admission -> vital/lab/pharmacy/note -> note_digest/risk_score ->
+  patient_summary -> ward rollups -> hospital rollup, crossing distinct
+  defs at nearly every hop, unlike `persist_bench`'s own doc noting most of
+  its edges already cross defs level-to-level). **RULED OUT**, same
+  conclusion as Stage 5, now confirmed against the second benchmark rather
+  than merely asserted. A packed-`u32` `NodeRef` specifically remains
+  additionally undesirable for the reason Stage 5 gave (silently tightens
+  the deliberately-generous `u16` `DefIndex` limit to 256 defs) for a
+  saving that, per this same evidence, only matters inside an
+  already-small minority of edges.
+- **Durability tiers (skip probing high-durability keys on restart)** --
+  the task asked to quantify probing's actual share of warm restart's
+  ~1.2-1.4s first. This stage's profile (b) answers that a third time
+  (Stage 6 found the same thing): `probe_versions` does not appear
+  anywhere in the top-25 self-time list of either benchmark's restore
+  path. Warm restart's cost is `pread`/`restore_nodes`/hashing (the same
+  un-fixed `HashSet<RawDep>`/`HashSet<RawOutput>` construction from
+  candidate 1, now inside `restore_nodes` instead of `raw_deps`) --
+  confirmed independently by lock-stats, where phase 3 (warm restart)
+  barely touches any of the 16 instrumented critical sections at all
+  (`restore_nodes` takes `nodes`/`src_key_interner` locks directly,
+  outside `EngineInner::timed`'s instrumented sites). **RULED OUT on the
+  evidence available from both current benchmarks** -- there is nothing
+  expensive in probing for a durability tier to skip. This is a real
+  limitation of both benchmarks' in-memory, zero-latency sources rather
+  than a claim that probing could never matter: a source with a genuine
+  per-key round-trip cost at restore time (e.g. `computations-fs`'s
+  `FsSource` against a cold filesystem cache) is exactly the shape that
+  would need to exist before this candidate could be evaluated honestly.
+- **Eviction to the redb store** -- not attempted; this stage's own memory
+  accounting found no evidence of runaway *per-node* overhead that an
+  eviction architecture would specifically fix, only concretely-named,
+  in-place-fixable structures (interner duplication, `source_deps`
+  HashSet-per-element overhead, `DefTable` capacity slack -- candidates
+  1-2, 4-5 above). `persist_bench` (the one benchmark with persistence
+  even configured) is the *smaller*-memory workload of the two (325 MB vs.
+  `hospital_bench`'s ~1,100 MB), and `hospital_bench`'s memory pressure has
+  nothing to do with persistence -- it doesn't have persistence configured
+  in this benchmark at all. **DEFERRED, not ruled out in principle** (a
+  workload with more distinct live nodes than fits in RAM would need
+  something like this eventually), but not supported as *the next move*
+  by either benchmark's evidence: the cheaper, already-identified,
+  in-place fixes above would need to be exhausted first, and neither
+  benchmark here is memory-constrained enough today to demonstrate
+  eviction's value the way turbo-tasks' own workload apparently was.
+
+### Honest read: diminishing returns, but not uniformly
+
+`persist_bench` -- the workload most of Stages 5-16 were tuned against --
+is genuinely approaching diminishing returns: its own largest remaining
+named candidates (source_deps Zero/One/Many at ~8-9% of its memory, the
+raw_deps hashing fix at a few percent of CPU, the tracing confound at
+~2.8%) are real but each individually modest, and its lock-hold/allocation
+profile has been stable since Stage 13. A fifth stage chasing
+`persist_bench` specifically would be manufacturing wins, not finding
+them.
+
+**`hospital_bench` has not reached that point.** The unshared-key
+workload Stage 11 added specifically to expose costs `persist_bench`
+structurally cannot -- and which Stages 13-15 partially, not fully,
+addressed -- still has substantial, concretely-identified headroom: the
+interner's own internal duplication alone (~253 MB, 22% of total memory,
+candidate 4) is larger than `persist_bench`'s *entire* engine-only memory
+footprint; the tracing confound costs ~14% of active CPU samples on its
+cold-eval path (candidate 3); and the `raw_deps`/`source_deps` HashSet-per-
+request pattern (candidates 1-2) is directly visible as this workload's
+single largest CPU line item in its own rerun-heavy phase. Combined,
+candidates 1-4 plausibly reclaim a meaningful double-digit percentage of
+`hospital_bench`'s memory and CPU time -- this is not a "fifth stage for
+its own sake" list. If there is a next stage, the evidence here points at
+prioritizing `hospital_bench`'s named candidates (1-4) specifically, not
+re-profiling `persist_bench` again.
+
+### Correctness
+
+Two temporary diagnostics were added and fully reverted before this
+stage's commit, per its own acceptance criteria: a call-count histogram in
+`source::raw_deps` (mirroring Stage 15's version-byte-length measurement
+methodology, used to establish the 100%/99.9998% single-`Dep` figures
+above) and a capacity-based memory-accounting instrument
+(`NodeTable::debug_memory_breakdown`, `SrcKeyInterner::debug_byte_estimate`,
+and one `pub fn Engine::debug_memory_breakdown` entry point, plus one
+`eprintln!` call site in each benchmark). `git diff --stat` against HEAD
+is empty for every source file touched during measurement
+(`crates/computations/src/source.rs`, `engine.rs`, `interner.rs`,
+`crates/computations/examples/persist_bench.rs`, `hospital_bench.rs`) --
+confirmed via `git checkout --` immediately after capturing this stage's
+numbers, before writing up any of the sections above. `cargo test
+--workspace --all-features` -- 135 passed (unchanged from Stage 15/16:
+this stage is read-only against the committed source tree). `cargo clippy
+--workspace --all-targets --all-features -- -D warnings` clean. `samply`'s
+own artifacts (`*.json`/`*.syms.json`) and the rewritten
+`analyze_profile.py` were kept in the session scratchpad, not the repo,
+per Stage 6's own "artifacts kept out of git" precedent and the existing
+`.gitignore` entries from that stage.
