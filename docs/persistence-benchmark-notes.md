@@ -3580,3 +3580,296 @@ cargo run -p computations --release --example persist_bench --features testutil,
 cargo run -p computations --release --example hospital_bench --features testutil,alloc-stats
 COMPUTATIONS_LOCK_STATS=1 cargo run -p computations --release --example hospital_bench --features testutil
 ```
+
+## Stage 16 — single-flight dedup for source requests
+
+The last unevaluated candidate from `haskell-computations` (their `778180d`
+"Bundle same-instance source requests within one applicative batch",
+refined by `76166c8`): `Ctx::src_req` (`crates/computations/src/ctx.rs`)
+calls `source.execute(req).await` directly on every call, with no check for
+an identical request already in flight — unlike `Ctx::eval`, which has
+had computation-level single-flight dedup (the `inflight` map in
+`engine.rs`, joined via `futures::future::Shared`) since the very first
+stage of this engine. This stage builds the source-request analogue,
+measures it honestly on both benchmarks, and — the numbers below are
+unambiguous — reverts it.
+
+### Design (implemented, measured, then reverted)
+
+Mirrored the existing computation-level `inflight` pattern exactly, one
+layer down the call stack:
+
+- A new `EngineInner::src_inflight: Mutex<HashMap<(SourceId, TypeId),
+  Arc<dyn Any + Send + Sync>>>` field, keyed by source instance *and*
+  request type (`Request` only requires `R: Eq + Hash` for one concrete
+  type at a time — two unrelated request types sharing one `HashMap<R, _>`
+  could in principle compare equal by coincidence, so the `TypeId` half
+  kept every request type's bucket separate, exactly the hazard the task
+  flagged up front). Each value, downcast back to its concrete
+  `Arc<Mutex<HashMap<R, SharedSrcExec>>>`, was created once per
+  `(SourceId, R)` pairing and never removed — cheap, same lifecycle as the
+  `defs` map.
+- `EngineInner::src_execute<S: Source<R>, R: Request>` did the
+  check-or-insert/join-or-run dance `EngineInner::run` already does for
+  computations: lock the per-`(source, request-type)` bucket, join an
+  existing `Shared` future if `req` was already a key in it, otherwise
+  build one (`Box::pin(async move { source.execute(...).await })`, boxed
+  and `.shared()`), insert it, and run it. Dependencies were erased to
+  `RawDep` *inside* the shared future itself (using the concrete
+  `S::Key`/`S::Ver` still in scope there) before boxing the result, so
+  every joining caller — not just whichever one happened to run it — got
+  the identical, complete dependency set back and recorded it against its
+  own `CompKey`, exactly as `Ctx::src_req` always has.
+- The bucket entry was removed unconditionally the instant the shared
+  future settled, success or failure alike (mirroring `EngineInner::run`'s
+  `RunFinishSuccess`/`RunFinishError` arms, which both clear the
+  computation-level `inflight` entry) — so a failed request never left a
+  stuck entry that could hang a later identical call or replay a stale
+  error forever, and matched this engine's existing "errors are not
+  memoized" behavior instead of introducing a new one.
+- Three new `lock_stats::LockSite` variants (`SrcInflightBucket`,
+  `SrcInflightCheck`, `SrcInflightRemove`) instrumented the new locks the
+  same way every other critical section in this engine already is, so the
+  cost this stage was worried about ("you will have added a lock
+  acquisition and a hash per source read for nothing") would be directly
+  visible rather than inferred.
+- No public API change: `Ctx::src_req`'s signature was untouched; a
+  plugin author reading/writing sources never needed to know this
+  machinery existed.
+
+Two tests were written and passed before the revert decision, specifically
+targeting the two hazards the task called out by name:
+
+- `src_req_dedup_records_deps_for_every_joining_caller`: two *different*
+  computations issue the identical concurrent `Ctx::src_req` against a
+  source whose `execute` has a genuine `.await` (unlike this crate's
+  `testutil::MemKvSource`, whose `execute` never yields and so can never
+  leave a real overlap window open — this test used a small dedicated
+  fixture with a `tokio::time::sleep` inside `execute` for exactly that
+  reason). Asserted both: `Source::execute` ran exactly once (the dedup
+  itself), and — the sharper check — both callers' own nodes each had the
+  shared key recorded as a source dependency, referencing the *same*
+  interned `SrcKeyId` (proof the joiner's caller-side bookkeeping ran as
+  fully as the runner's, not just that both got the right return value).
+- `failed_src_req_does_not_poison_the_dedup_bucket`: two concurrent
+  identical requests that dedup into a *failing* execution both observed
+  the error (not one `Ok`/one hang, not a panic); a follow-up call issued
+  only after that shared future had fully settled ran the source fresh
+  (bumping a call counter) rather than joining a stuck entry or replaying
+  the cached error — proof the removal-on-failure path actually worked.
+
+Both tests, and the full `cargo test --workspace --all-features` suite
+(135 baseline + these 2 = 137) plus `--features testutil,alloc-stats`
+standalone, passed; `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` was clean throughout. The implementation was correct. It
+just didn't pay.
+
+### Instrumentation used for measurement, then reverted with everything else
+
+`hospital_bench`'s `LatencySource` already had a call counter
+(`call_count`, Stage 11) — no change needed there, per the task's own
+observation. `persist_bench`'s `MemKvSource` (via `computations::testutil`)
+had no equivalent, so this stage added one (`MemKvSource::call_count()`, an
+`AtomicU64` bumped in `execute`) plus a `report_src_calls` line printed
+after every phase in `examples/persist_bench.rs` — this is what produced
+the `source_calls` numbers in the tables below. Per this stage's
+keep-or-revert instructions ("if reverted, commit the documentation of the
+negative result only"), this instrumentation was reverted along with the
+engine-level mechanism rather than kept on its own: `testutil.rs` and
+`persist_bench.rs` are byte-identical to their pre-Stage-16 state in the
+committed tree. The gap it would have closed (`MemKvSource` having no call
+counter, unlike `hospital_bench`'s source) is real and independent of this
+stage's keep/revert outcome; it is flagged here as a candidate for a future
+small, standalone patch rather than folded into this revert.
+
+### Why it doesn't pay: measured, not guessed
+
+The task's own "honest possibility" section named the exact failure mode
+this section confirms: *"if waves don't actually overlap those 683 reads
+in time, the in-flight map will mostly miss."* It does, on both
+benchmarks, for two different structural reasons.
+
+**`persist_bench` (shared-key, 300 keys, ~683 dependents/key, zero-latency
+`MemKvSource`)**: `MemKvSource::execute` never awaits anything internally
+(a plain `std::sync::Mutex` lock, a `HashMap` read, done) — when boxed and
+polled as the dedup layer's `Shared` future, it resolves on its very
+*first* poll, before the async executor can schedule any other task to
+reach the same bucket's check. There is no wall-clock window open for a
+second, genuinely concurrent identical request to observe, regardless of
+how many of the 683 dependents the driver's wave logically activates at
+once. Measured directly: `src_execute`'s new `join_or_run`/`remove` lock
+sites recorded **exactly as many calls as `MemKvSource::call_count()`
+reported source calls, in every phase** — 205,000 on cold eval, 683 on
+each restart-with-one-changed-key trial (this exact "up to 683 concurrent
+reads" scenario the design was written for), 205,000 on the two
+no-persistence/fingerprint-mismatch phases, 205,684 on the live-incremental
+phases. A dedup join, had one ever happened, would have made the
+`join_or_run`/`remove` call count *lower* than `call_count()`. It never
+did — a **0% hit rate**, on the single benchmark shape this feature was
+built to help.
+
+**`hospital_bench` (unshared-key, ~2.08M distinct keys, ~1 dependent/key,
+`LatencySource` with a real `.await` point in `execute` even at zero
+configured latency)**: unshared keys are unshared by explicit design (see
+Stage 11) — the one deliberate exception is `patient_summary`'s
+cross-system 5-key re-read of the same sub-id-0 keys `vital(p,0)`/
+`lab_result(p,0)`/`med_order(p,0)`/`note(p,0)`/`admission(p)` already read
+directly. Tracing the dependency graph shows why even *that* never
+overlaps: `patient_summary`'s body `try_join!`s `risk_score`/`admission`/
+`note_digest` *first*, and only after all three fully settle does it issue
+its own direct re-reads of the identical keys — `risk_score` alone already
+transitively evaluates `vital(p, 0)` (via `vital_window`) to completion
+before `patient_summary`'s second `try_join!` ever runs. The "shared key"
+read is sequential, not concurrent, by construction of the graph itself,
+so this benchmark's one built-in redundancy is invisible to a
+concurrency-only dedup layer (a *batching* layer, which does not need
+temporal overlap, could still collapse it — see below). Measured directly:
+per-source call totals were **byte-identical before and after**
+(`adt` 3,001, `vitals` 901,504, `labs` 811,501, `pharmacy` 61,501, `notes`
+301,501, total 2,079,008) and `src_execute`'s `join_or_run`/`remove` call
+counts matched `record_source_deps`'s own call count exactly (2,081,168) —
+again a **0% hit rate**, on the benchmark built specifically to make a
+non-zero hit rate visible if one existed.
+
+### Cost: measured, not negligible
+
+With zero benefit on either benchmark, the only question left is how much
+the new locks cost. Also measured directly, via
+`COMPUTATIONS_LOCK_STATS=1`:
+
+- **`persist_bench`**, phase 1 (cold eval, 205,000 source calls): the three
+  new sites (`SrcInflightBucket`/`SrcInflightCheck`/`SrcInflightRemove`)
+  totaled **2.52% of tracked lock-held time** (0.45% + 1.06% + 1.01%),
+  ≈199 ns of new fixed overhead per source read (36+84+80 ns mean per
+  site). Against a ~3 s phase dominated by 2.4M `prepare`/`record_call_dep`
+  calls, this is small enough to disappear into this box's own run-to-run
+  noise band — cold-eval wall time landed at 2,926–3,147 ms across three
+  after-runs, inside the 2,938–3,382 ms already seen across before-runs and
+  this document's own documented ~3.1–3.7 s range.
+- **`hospital_bench`**, phases 1–3 cumulative (2,081,168 source calls): the
+  same three sites totaled **17.63% of tracked lock-held time** (2.76% +
+  7.40% + 7.47%) — an order of magnitude larger share than on
+  `persist_bench`, because this workload issues roughly 10x more source
+  calls with almost no shared computation-level work to amortize the new
+  locks against. This shows up in wall time, not just the lock breakdown:
+  cold-eval time was **3,587–3,667 ms across two before-runs and
+  4,411–4,828 ms across three after-runs — no overlap at all**, a
+  reproducible **~20–30% regression**, even though the after-runs ran at
+  *equal or lower* system load than the before-runs (`uptime` 1-minute
+  figures 5.56/4.14 before vs 8.76/4.55/4.10 after — the slowdown survives
+  the load comparison, not just an artifact of a busier box).
+- `allocated_bytes` (deterministic, load-independent) confirms the
+  regression is pure lock/CPU overhead, not allocation churn: phase 5's
+  net alloc on `persist_bench` moved by **+584 B** (325,014,346 →
+  325,014,930, matching Stage 15's documented baseline before this stage's
+  change to the byte) and `hospital_bench`'s cold-eval net alloc moved by
+  **+2,044 B** (1,146,709,594 → 1,146,711,638, likewise matching Stage 15's
+  documented baseline exactly) — both changes are ~2,000x too small to
+  explain the wall-time deltas above, and both are fully accounted for by
+  the one-time `(SourceId, TypeId)` bucket-map entries this stage's design
+  creates once per source/request-type pairing, not per request.
+- Reruns and db size were unaffected on both benchmarks in every
+  configuration (999,760/100,164/137,085/80,767 on `persist_bench`;
+  1,116,093/1,444/6 on `hospital_bench`; db size byte-identical at 269.49
+  MB) — the regression is a pure latency tax on every source read, with no
+  correctness or persistence-format effect of any kind.
+
+### Before/after tables
+
+**`persist_bench`, default scale** (`uptime` 1-minute load 5.19–5.70 across
+this stage's before/after runs — moderately loaded, same session,
+same-session stash/pop A/B per this document's standing practice):
+
+| phase | source calls (before) | source calls (after) | time before (ms) | time after (ms) |
+|---|---|---|---|---|
+| 1. cold eval | 205,000 (no counter existed) | 205,000 | 3,117 / 2,938 | 2,926 / 2,989 |
+| 3. warm restart (both trials) | 0 | 0 | 1,047–1,151 | 1,047–1,069 |
+| 4. restart, 1 changed input (both trials) | 683 (implicit) | 683 | 1,411–1,574 | 1,390–1,574 |
+| 5. cold, no persistence (both trials) | 205,000 (implicit) | 205,000 | 2,306–2,362 | 2,342–2,595 |
+| 6. fingerprint mismatch | 205,000 (implicit) | 205,000 | 3,776–3,832 | 3,819–4,061 |
+| 7/8. live incremental (both) | 205,684 (implicit) | 205,684 | 402–486 | 395–508 |
+| phase 5 `allocated_bytes` (net) | 325,014,346 B | 325,014,930 B | — | **+584 B** |
+| db size | 269.49 MB | 269.49 MB | — | unchanged |
+
+**`hospital_bench`, default scale** (`uptime` 1-minute load 5.56/4.14
+before, 4.55/4.10/8.76 after):
+
+| phase | source calls (before) | source calls (after) | time before (ms) | time after (ms) |
+|---|---|---|---|---|
+| 1. cold eval | 2,079,008 | 2,079,008 | 3,587–3,667 | 4,411–4,828 |
+| 2. live incremental (1 key) | (included above) | (included above) | 79–81 | 79–87 |
+| 3. rerun-heavy (300 keys) | (included above) | (included above) | 430–439 | 430–540 |
+| 4. concurrency demo (10 pat., 2000 µs/call) | 13,860 | 13,860 | 56 | 80–86 |
+| cold-eval `allocated_bytes` (net) | 1,146,709,594 B | 1,146,711,638 B | — | **+2,044 B** |
+| cumulative lock-held time on new sites (phases 1–3) | n/a | 17.63% of total | — | — |
+
+Both tables tell the same story from two different angles: **source call
+counts are identical, byte for byte, in every phase of both benchmarks** —
+proof of a 0% dedup hit rate, not just an absence of measured benefit —
+while `hospital_bench`'s wall-clock time moved by a reproducible,
+non-overlapping ~20–30% in the wrong direction.
+
+### Relationship to the deliberately-dropped Haxl batching
+
+This is explicitly the **dedup axis, not the batching axis** the Sources &
+prior art section's Haxl citation refers to. Marlow et al.'s *There is no
+fork* gets its concurrency win from **batching**: combining multiple
+*different*, independently-issued requests against one data source into a
+single round trip via `ApplicativeDo` desugaring, something this port
+deliberately dropped in favor of explicit `Ctx::eval_all`/`try_join!`
+concurrency (Stage 11's own "Adapted, not transliterated" section). Dedup
+— collapsing multiple *identical* concurrent requests into one — is a
+narrower, logically separate mechanism that doesn't need batching
+machinery at all, which is exactly why this stage could be evaluated on
+its own without reopening that decision. The finding here is that, absent
+batching, dedup alone needs genuine temporal overlap of *literally
+identical* requests to ever fire — and neither benchmark's actual
+execution schedule produces any: `persist_bench`'s source is too fast
+(zero-latency, non-yielding) to leave a window open at all, and
+`hospital_bench`'s one built-in same-key redundancy
+(`patient_summary`'s cross-system re-read) is masked by a sequential
+dependency chain, not concurrent access. This is not evidence that dedup
+could never help *any* workload — a source with real network-scale
+latency (tens of ms, genuinely yielding) *and* genuine concurrent
+key-sharing (e.g. an HTTP-cache-style source read by several independent
+concurrent dependents for the same URL) is exactly the shape Haxl's own
+dedup targets, and where this mechanism would likely earn its keep. It is
+evidence that **neither of this codebase's two representative benchmarks
+is that shape today**, and that shipping the mechanism anyway would mean
+paying a permanent, measured tax on every source read in exchange for a
+benefit this codebase currently has no way to demonstrate.
+
+### Verdict: reverted
+
+**Reverted.** Zero dedup hit rate on both benchmarks, a measured (not
+inferred) lock-time cost that is small-but-present on `persist_bench`
+(2.52% of tracked lock time, invisible in wall time) and large and
+wall-clock-visible on `hospital_bench` (17.63% of tracked lock time, a
+reproducible ~20–30% cold-eval regression with no overlapping before/after
+samples) — for a benefit neither benchmark can show even once. This is
+squarely the negative result the task's own "Honest possibility this
+doesn't pay" section anticipated, now confirmed rather than assumed. The
+implementation (`EngineInner::src_inflight`/`src_bucket`/`src_execute`,
+the `Ctx::src_req` call-site change, the three new `LockSite` variants,
+the `MemKvSource::call_count()`/`report_src_calls` measurement
+instrumentation, and the two correctness tests) was fully built, tested
+green, measured on both benchmarks, and then reverted in its entirety in
+the same session — every source file this stage touched
+(`crates/computations/src/engine.rs`, `ctx.rs`, `lock_stats.rs`,
+`testutil.rs`, `examples/persist_bench.rs`) is byte-identical to its
+pre-Stage-16 state in the committed tree. What survives is this section —
+the measured call-count-identical, lock-time-costly result — so nobody
+re-proposes source-level single-flight dedup on this codebase's current
+two benchmarks without first checking whether either one's workload shape
+has changed.
+
+### Correctness
+
+`cargo test --workspace --all-features` — 135 passed (unchanged from
+Stage 15's count: the revert restores the exact pre-Stage-16 source tree,
+so no new tests remain in the committed state). During implementation and
+measurement, before the revert, the full suite plus the two new
+correctness tests (137 total) passed, `cargo test -p computations
+--features testutil,alloc-stats` passed standalone, and `cargo clippy
+--workspace --all-targets --all-features -- -D warnings` was clean — the
+mechanism was correct; it was rejected on cost/benefit, not on a bug.
