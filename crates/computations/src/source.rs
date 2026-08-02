@@ -13,6 +13,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use smallvec::SmallVec;
 
 use crate::error::SourceError;
 
@@ -138,13 +139,35 @@ pub struct RawDep {
     pub ver: VerBytes,
 }
 
+/// A small, ordinarily single-element collection of [`RawDep`]s (Stage 20 —
+/// see `docs/persistence-benchmark-notes.md`).
+///
+/// Every internal call site that used to build a `HashSet<RawDep>` — one per
+/// source read, across every node in the graph — did so purely to satisfy a
+/// container type, never because duplicate detection was actually load-
+/// bearing there: the input this crate ever constructs a `RawDep` batch
+/// from, [`SourceBase::wait_changes`]/[`Source::execute`]'s own
+/// `HashSet<Dep<K, V>>`, is already deduplicated by (key, ver) equality
+/// before [`raw_deps`] ever sees it, and postcard's deterministic encoding
+/// (already relied on elsewhere, e.g. persisted key verification) means
+/// distinct `Dep`s serialize to distinct `RawDep`s — so mapping element-for-
+/// element into an ordered collection preserves that uniqueness for free,
+/// with no `HashSet`, no hashing, and no allocation at all in the
+/// overwhelmingly common single-element case (measured 100%/99.9998%
+/// single-`Dep` on this crate's two benchmarks — see Stage 17's own
+/// histogram). Every consumer of a `RawDeps` (`EngineInner::record_source_deps`,
+/// `NodeTable::extend_source_deps`, `persist::restore_nodes`) tolerates a
+/// duplicate gracefully regardless (idempotent `insert`), so this is a pure
+/// performance type, not a new correctness invariant.
+pub(crate) type RawDeps = SmallVec<[RawDep; 1]>;
+
 /// Object-safe, byte-erased view of a [`SourceBase`].
 ///
 /// The engine and driver store sources heterogeneously behind this trait and
 /// only need untyped operations.
 pub(crate) trait ErasedSource: Send + Sync {
     fn instance_id(&self) -> SourceId;
-    fn wait_changes(&self) -> BoxFuture<'_, HashSet<RawDep>>;
+    fn wait_changes(&self) -> BoxFuture<'_, RawDeps>;
     fn unregister(&self, keys: &[KeyBytes]);
     /// Byte-erased counterpart of [`SourceBase::probe_versions`]. Keys that
     /// fail to deserialize as `S::Key` are simply skipped (mirrors
@@ -164,7 +187,7 @@ impl<S: SourceBase> ErasedSource for SourceAdapter<S> {
         self.0.instance_id()
     }
 
-    fn wait_changes(&self) -> BoxFuture<'_, HashSet<RawDep>> {
+    fn wait_changes(&self) -> BoxFuture<'_, RawDeps> {
         Box::pin(async move {
             let deps = self.0.wait_changes().await;
             raw_deps(&self.0.instance_id(), &deps)
@@ -208,7 +231,11 @@ impl<S: SourceBase> ErasedSource for SourceAdapter<S> {
 
 /// Erases a set of typed deps into their postcard-encoded, source-tagged
 /// form, for the engine to store and match heterogeneously.
-pub(crate) fn raw_deps<K, V>(source: &SourceId, deps: &HashSet<Dep<K, V>>) -> HashSet<RawDep>
+///
+/// Returns [`RawDeps`] (an ordinarily-inline `SmallVec`), not a `HashSet` —
+/// see that type's docs for why building a hash set here was pure waste on
+/// this crate's measured workloads (Stage 20).
+pub(crate) fn raw_deps<K, V>(source: &SourceId, deps: &HashSet<Dep<K, V>>) -> RawDeps
 where
     K: Serialize,
     V: Serialize,

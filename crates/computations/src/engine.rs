@@ -51,8 +51,8 @@ use crate::interner::{SmallVerBytes, SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult, DefId, Hash128, Hash128Map};
 use crate::persist::{PersistHandle, PersistOptions};
 use crate::registry::Registry;
-use crate::sink::{OutBytes, RawOutput, SinkBase, SinkId};
-use crate::source::{RawDep, SourceBase};
+use crate::sink::{OutBytes, RawOutput, RawOutputs, SinkBase, SinkId};
+use crate::source::{RawDeps, SourceBase};
 
 /// The result of one execution: the (erased) value, its content hash, and
 /// how long the body itself took to run (for the `comp.eval` tracing
@@ -940,7 +940,15 @@ impl NodeTable {
     /// [`SourceRefs`]'s docs on why a vacant entry never starts as `Many`)
     /// if this is its first one. A no-op for an empty `raw`, so a node that
     /// never reads any source never gets an entry at all.
-    pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &HashSet<SrcDep>) {
+    ///
+    /// Takes a plain slice, not a `HashSet<SrcDep>` (Stage 20 — see
+    /// `docs/persistence-benchmark-notes.md`): every caller already has its
+    /// deps in an ordered, pre-deduplicated collection (`RawDeps`'s
+    /// element-for-element interning in `record_source_deps`, or
+    /// `persist::restore_nodes`'s identical reconstruction), and `SrcDeps::insert`
+    /// below is already idempotent against an accidental duplicate, so
+    /// nothing here ever needed hash-set semantics.
+    pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &[SrcDep]) {
         if raw.is_empty() {
             return;
         }
@@ -976,8 +984,11 @@ impl NodeTable {
         self.outputs.remove(&r).unwrap_or_default()
     }
 
-    /// Merges `raw` into `r`'s output set — see [`Self::extend_source_deps`].
-    pub(crate) fn extend_outputs(&mut self, r: NodeRef, raw: &HashSet<RawOutput>) {
+    /// Merges `raw` into `r`'s output set — see [`Self::extend_source_deps`]
+    /// (takes a slice for the identical reason: the stored set itself is
+    /// unaffected, only the transient input no longer needs to be a
+    /// `HashSet` on its way in).
+    pub(crate) fn extend_outputs(&mut self, r: NodeRef, raw: &[RawOutput]) {
         if raw.is_empty() {
             return;
         }
@@ -1880,23 +1891,31 @@ impl EngineInner {
     /// only once this run settles, in [`Self::reconcile_source_deps`],
     /// which is the one place that actually knows whether a given identity
     /// is new to `caller` or one it already held.
-    pub(crate) fn record_source_deps(&self, caller: &CompKey, raw: HashSet<RawDep>) {
+    pub(crate) fn record_source_deps(&self, caller: &CompKey, raw: RawDeps) {
         if raw.is_empty() {
             return;
         }
-        let interned: HashSet<SrcDep> = self.timed(crate::lock_stats::LockSite::RecordSourceDepsIntern, || {
-            let mut interner = self.src_key_interner.lock().unwrap();
-            // `into_iter` (not `iter`) so `dep.ver`'s `Vec<u8>` moves straight
-            // into `SmallVec::from_vec` instead of being cloned -- `raw` is
-            // owned by this call and unused afterward, so there is nothing to
-            // preserve it for.
-            raw.into_iter()
-                .map(|dep| {
-                    let key_id = interner.intern(&dep.source, &dep.key);
-                    SrcDep { key_id, ver: SmallVerBytes::from_vec(dep.ver) }
-                })
-                .collect()
-        });
+        // `interned` is a `SmallVec`, not a `HashSet` (Stage 20 — see
+        // `docs/persistence-benchmark-notes.md`): `raw` arrived already
+        // deduplicated (see `RawDeps`'s docs), and interning is a 1:1
+        // element map, so the result is unique for free. This is what
+        // removes `sip::Hasher::write` from this call's cost entirely in
+        // the measured-common single-element case, not just the interning
+        // step Stage 13 already optimized.
+        let interned: SmallVec<[SrcDep; 1]> =
+            self.timed(crate::lock_stats::LockSite::RecordSourceDepsIntern, || {
+                let mut interner = self.src_key_interner.lock().unwrap();
+                // `into_iter` (not `iter`) so `dep.ver`'s `Vec<u8>` moves straight
+                // into `SmallVec::from_vec` instead of being cloned -- `raw` is
+                // owned by this call and unused afterward, so there is nothing to
+                // preserve it for.
+                raw.into_iter()
+                    .map(|dep| {
+                        let key_id = interner.intern(&dep.source, &dep.key);
+                        SrcDep { key_id, ver: SmallVerBytes::from_vec(dep.ver) }
+                    })
+                    .collect()
+            });
         let caller_r = self.timed(crate::lock_stats::LockSite::RecordSourceDepsNodes, || {
             let mut nodes = self.nodes.lock().unwrap();
             let r = nodes.id_of(caller);
@@ -1919,7 +1938,7 @@ impl EngineInner {
         });
     }
 
-    pub(crate) fn record_outputs(&self, caller: &CompKey, raw: HashSet<RawOutput>) {
+    pub(crate) fn record_outputs(&self, caller: &CompKey, raw: RawOutputs) {
         if raw.is_empty() {
             return;
         }

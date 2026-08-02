@@ -6,7 +6,6 @@
 //! the computation currently executing (`self.caller`), which is what lets
 //! the engine rebuild its dynamic dependency graph on every run.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::def::Comp;
@@ -14,7 +13,7 @@ use crate::engine::EngineInner;
 use crate::error::CompError;
 use crate::flow::FlowId;
 use crate::key::{CompKey, CompParam, CompResult};
-use crate::sink::{RawOutput, Sink};
+use crate::sink::{RawOutput, RawOutputs, Sink};
 use crate::source::{Request, Source, raw_deps};
 
 /// The context passed to a running computation body.
@@ -136,7 +135,7 @@ impl Ctx {
         let (outs, result) = sink.execute(req).await;
         let result = result?;
         if let Some(caller_key) = &self.caller {
-            let raw: HashSet<RawOutput> = outs
+            let raw: RawOutputs = outs
                 .iter()
                 .map(|out| RawOutput {
                     sink: sink.instance_id(),

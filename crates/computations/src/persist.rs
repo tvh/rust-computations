@@ -69,6 +69,7 @@ use std::time::{Duration, Instant};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::def::ErasedDef;
@@ -76,8 +77,8 @@ use crate::engine::{DirtyPriority, EngineInner, NodeRef, NodeTable, SourceRefs};
 use crate::flow::FlowId;
 use crate::interner::{SmallVerBytes, SrcDep, SrcKeyId, SrcKeyInterner};
 use crate::key::{CompKey, CompKeyMap, CompKeySet, DefId, Hash128};
-use crate::sink::{OutBytes, RawOutput, SinkId};
-use crate::source::{KeyBytes, RawDep, SourceId, VerBytes};
+use crate::sink::{OutBytes, RawOutput, RawOutputs, SinkId};
+use crate::source::{KeyBytes, RawDep, RawDeps, SourceId, VerBytes};
 
 /// The on-disk record format version.
 ///
@@ -1027,8 +1028,8 @@ impl EngineInner {
             value_bytes: Vec<u8>,
             erased_def: Arc<dyn ErasedDef>,
             comp_dep_keys: Vec<CompKey>,
-            source_deps: HashSet<RawDep>,
-            outputs: HashSet<RawOutput>,
+            source_deps: RawDeps,
+            outputs: RawOutputs,
             flow_ids: Vec<FlowId>,
         }
 
@@ -1091,8 +1092,17 @@ impl EngineInner {
 
             let comp_dep_keys: Vec<CompKey> =
                 record.comp_deps.iter().filter_map(|dep| dep.to_key(&self.def_names)).collect();
-            let source_deps: HashSet<RawDep> = record.source_deps.iter().map(RawDepRepr::to_dep).collect();
-            let outputs: HashSet<RawOutput> = record.outputs.iter().map(RawOutputRepr::to_output).collect();
+            // `RawDeps`/`RawOutputs`, not `HashSet`s (Stage 20 — see
+            // `docs/persistence-benchmark-notes.md`): `record.source_deps`/
+            // `record.outputs` were themselves snapshotted from an
+            // already-deduplicated set (`PendingRecord::snapshot`), so this
+            // is another instance of the identical "1:1 map preserves
+            // uniqueness for free" reasoning `raw_deps` relies on, this time
+            // on the warm-restart path Stage 17's profile (b) caught paying
+            // the same `HashSet<RawDep>`/`HashSet<RawOutput>` construction
+            // cost.
+            let source_deps: RawDeps = record.source_deps.iter().map(RawDepRepr::to_dep).collect();
+            let outputs: RawOutputs = record.outputs.iter().map(RawOutputRepr::to_output).collect();
 
             pending.push(PendingNode {
                 key,
@@ -1140,7 +1150,7 @@ impl EngineInner {
                 continue;
             }
             nodes.set_result(r, p.result_hash);
-            let interned_deps: HashSet<SrcDep> = p
+            let interned_deps: SmallVec<[SrcDep; 1]> = p
                 .source_deps
                 .iter()
                 .map(|dep| SrcDep {

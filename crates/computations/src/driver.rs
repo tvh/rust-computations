@@ -40,7 +40,7 @@ use crate::flow::FlowId;
 use crate::interner::SrcKeyId;
 use crate::key::{CompKey, CompKeySet, CompParam, CompResult};
 use crate::sink::{OutBytes, RawOutput, SinkId};
-use crate::source::{KeyBytes, RawDep, SourceId};
+use crate::source::{KeyBytes, RawDep, RawDeps, SourceId};
 
 /// Summary of one `propagate` round, for the `driver.propagate` span's
 /// round-summary event.
@@ -332,7 +332,7 @@ impl EngineInner {
     /// every call, so nothing is lost by discarding the unfinished ones.
     /// If no sources are registered, this never resolves (there is nothing
     /// to wait for).
-    async fn wait_for_any_change(&self) -> HashSet<RawDep> {
+    async fn wait_for_any_change(&self) -> RawDeps {
         let sources: Vec<Arc<dyn crate::source::ErasedSource>> = self.registry.sources().cloned().collect();
         if sources.is_empty() {
             return std::future::pending().await;
@@ -341,7 +341,7 @@ impl EngineInner {
             sources = ?sources.iter().map(|s| s.instance_id()).collect::<Vec<_>>(),
             "awaiting source changes"
         );
-        let futs: Vec<BoxFuture<'_, HashSet<RawDep>>> = sources.iter().map(|s| s.wait_changes()).collect();
+        let futs: Vec<BoxFuture<'_, RawDeps>> = sources.iter().map(|s| s.wait_changes()).collect();
         let (changed, _idx, _rest) = select_all(futs).await;
         changed
     }
@@ -350,7 +350,7 @@ impl EngineInner {
     /// computations that depend on them, skipping any dep whose reported
     /// version is already the one recorded on the node (a spurious wake:
     /// the node's last run already observed this exact version).
-    fn affected_keys(&self, changed: &HashSet<RawDep>) -> CompKeySet {
+    fn affected_keys(&self, changed: &[RawDep]) -> CompKeySet {
         // Resolved to `SrcKeyId` first, in its own critical section, kept
         // separate from the `source_index`/`nodes` one below (Stage 13 —
         // see `docs/persistence-benchmark-notes.md`): a dep whose key was
@@ -469,7 +469,11 @@ impl EngineInner {
     /// new arrived).
     fn poll_pending_input_changes(&self) -> CompKeySet {
         let sources: Vec<Arc<dyn crate::source::ErasedSource>> = self.registry.sources().cloned().collect();
-        let mut changed: HashSet<RawDep> = HashSet::new();
+        // A plain `Vec`, not a `HashSet`: each source is polled at most once
+        // here, so `RawDep`'s own `source` field already keeps two sources'
+        // reported deps distinct — there is nothing for a hash set to
+        // deduplicate, only cost to pay building one (see `RawDeps`'s docs).
+        let mut changed: Vec<RawDep> = Vec::new();
         for source in &sources {
             if let Some(deps) = source.wait_changes().now_or_never() {
                 changed.extend(deps);

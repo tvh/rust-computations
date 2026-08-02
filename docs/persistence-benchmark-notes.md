@@ -4845,3 +4845,292 @@ leaves entirely unchanged; only the private storage representation moved).
 `cargo test -p computations --features testutil,alloc-stats` — all green
 standalone. `cargo clippy --workspace --all-targets --all-features -- -D
 warnings` clean.
+
+## Stage 20 — the `raw_deps()` hashing hotspot
+
+Stage 17's ranked candidate 1, and the first genuinely *time*-motivated
+stage in this document (Stages 13-19 all optimized memory): `sip::Hasher::write`
+was Stage 17's fresh profile's **#1** self-time line on `persist_bench`'s
+cold eval (12.23% of active samples), traced to `<RawDep as Hash>::hash`
+inside `crate::source::raw_deps` — a `HashSet<RawDep>` built fresh on
+*every* source read (205,000 calls on `persist_bench`, 2,081,168 on
+`hospital_bench`), purely to hold, per Stage 17's own histogram, **100%**
+/**99.9998%** single-element sets. The identical shape recurred in
+`persist::restore_nodes` (`HashSet<RawDep>`/`HashSet<RawOutput>` rebuilt
+per persisted record) and in `record_source_deps`'s own `HashSet<SrcDep>`
+collect step.
+
+### Design
+
+Per the task's stated order of preference, fixed **without touching the
+public trait**: `Source::execute`'s public `HashSet<Dep<K, V>>` return type
+is untouched (a plugin author's code compiles and behaves identically) —
+only the *internal* conversion into an erased, per-node representation
+changed.
+
+`crate::source::RawDeps` (a `pub(crate)` type alias) replaces `HashSet<RawDep>`
+at every internal construction site:
+
+```rust
+pub(crate) type RawDeps = smallvec::SmallVec<[RawDep; 1]>;
+```
+
+and `crate::sink::RawOutputs` does the identical job for `RawOutput`:
+
+```rust
+pub(crate) type RawOutputs = smallvec::SmallVec<[RawOutput; 1]>;
+```
+
+- **`crate::source::raw_deps`** (called from `Ctx::src_req` and
+  `SourceAdapter::wait_changes`, both erasing a plugin's typed
+  `HashSet<Dep<K, V>>`) now `.collect()`s straight into a `RawDeps` — no
+  `HashSet` is built, so `RawDep`'s `Hash` impl is never invoked on this
+  path at all. **Uniqueness is preserved for free, not merely hoped for**:
+  the input `HashSet<Dep<K, V>>` is already deduplicated by (key, ver)
+  equality before `raw_deps` ever sees it, and postcard's deterministic
+  encoding (already relied on elsewhere — persisted key verification,
+  `CompParam`'s own determinism requirement) means distinct `Dep`s encode
+  to distinct `RawDep`s. The map is 1:1, so no dedup step was ever doing
+  real work here — Stage 17's own writeup anticipated exactly this
+  ("a `Vec`/`SmallVec` preserves that uniqueness for free").
+- **`EngineInner::record_source_deps`**'s `raw` parameter is `RawDeps`
+  instead of `HashSet<RawDep>`, and the interning step's own output
+  (`interned`) is a `SmallVec<[SrcDep; 1]>` instead of `HashSet<SrcDep>` —
+  this second change matters more than it looks: that `.collect()` happens
+  **while `src_key_interner`'s lock is held** (inside the
+  `RecordSourceDepsIntern`-timed closure), so removing its hashing shrinks
+  a genuinely lock-serialized critical section, not just per-task CPU work
+  that happens to run in parallel across cores.
+- **`NodeTable::extend_source_deps`/`extend_outputs`** now take a plain
+  slice (`&[SrcDep]`/`&[RawOutput]`) instead of `&HashSet<_>` — a pure
+  signature relaxation, since `SrcDeps::insert`/the stored `HashSet`'s own
+  `.extend()` were already idempotent against an accidental duplicate, so
+  neither ever needed hash-set semantics on its *input* side. The **stored**
+  types (`NodeTable::source_deps: HashMap<NodeRef, SrcDeps>`,
+  `NodeTable::outputs: HashMap<NodeRef, HashSet<RawOutput>>`) are completely
+  unchanged — `outputs`' true set semantics (`EngineInner::run`'s dropped-
+  output diff via `.contains()`) still need a real `HashSet` there, and this
+  stage doesn't touch it.
+- **`persist::restore_nodes`** rebuilds `source_deps`/`outputs` as
+  `RawDeps`/`RawOutputs` (from `Vec<RawDepRepr>`/`Vec<RawOutputRepr>`, which
+  were themselves snapshotted from an already-deduplicated set — the same
+  1:1-map argument applies) and its own `interned_deps` step as
+  `SmallVec<[SrcDep; 1]>` — this is the profile-(b)/warm-restart-path
+  instance of the identical pattern Stage 17 flagged
+  (`<Vec<T> as Hash>::hash`/`<SinkId as Hash>::hash`, 3.14%/1.26% of that
+  profile).
+- **`Ctx::sink_req`** (explicitly lower priority per the task, 1,000-1,800
+  calls/run on both benchmarks — two to three orders of magnitude below
+  `raw_deps`) picked up the identical `RawOutputs` treatment essentially for
+  free, since `record_outputs`/`extend_outputs`'s signatures had to change
+  for `restore_nodes` anyway.
+- **`driver.rs`**'s `ErasedSource::wait_changes`/`wait_for_any_change`/
+  `affected_keys` follow the same type through (`RawDeps` end to end,
+  `affected_keys` relaxed to `&[RawDep]`); `poll_pending_input_changes`'s
+  per-source-poll accumulator changed from `HashSet<RawDep>` to a plain
+  `Vec<RawDep>` — sound because each source is polled at most once per
+  call, so `RawDep`'s own `source` field already keeps two sources' reports
+  distinct; there was never anything to deduplicate.
+- **No public API change anywhere**: `RawDeps`/`RawOutputs` are `pub(crate)`;
+  `Source`/`SourceBase`/`Sink`/`SinkBase`'s public trait signatures are
+  byte-for-byte unchanged.
+
+**Identity hashing (Stage 6's `hashers::IdentityHasher`, applied to
+`Hash128`/`SrcKeyId`) was considered and ruled out for `RawDep`/`SrcDep`
+directly**, per the task's explicit ask — not attempted here, and this is a
+restatement of `hashers.rs`'s own existing module docs, not a new finding:
+`RawDep`'s key/version bytes are arbitrary, plugin-supplied data (a
+filesystem path, a database row id, whatever a source's `Key`/`Ver` types
+serialize to) — not a uniformly-distributed content hash like `Hash128`, nor
+a dense process-local handle like `SrcKeyId`. Identity-hashing
+low-entropy, potentially attacker-influenced bytes would reintroduce the
+exact HashDoS surface `std`'s SipHash exists to close, for a hasher this
+stage's fix mostly avoids invoking at all in the common case anyway (see
+below) — the right fix here was never "hash `RawDep` more cheaply," it was
+"don't build a hash-keyed container to hold one element."
+
+### Measurements
+
+`uptime` load average ranged **~2.1-7.9** across this stage's session
+(1-minute figures as low as 2.14, spiking to 7.87 mid-session and briefly
+7.24 again later) — a noisier session than most of Stages 14-19, and, as
+the numbers below show, noisy enough to swamp this specific change's
+wall-clock signal on a couple of individual batches. Every side-by-side
+comparison below is a same-session, stash/pop A/B pair (this stage's
+changes stashed for "before", popped back for "after"), and — because this
+stage is explicitly a *time* optimization, unlike Stages 13-19 — wall time
+was measured with **10 trials** on `persist_bench` phase 5 and **6 trials**
+on each `hospital_bench` phase, interleaved across two batches specifically
+because the first batch alone showed a misleading result (see below).
+
+**`persist_bench` phase 5 (cold restart, no persistence), 10 trials each
+side** (orchestrator-run `RESULT` wall times, `phase 5-1`/`5-2` per run x 5
+runs):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| wall time, 10 trials | 2242-2314 ms, mean 2285.4 | 2253-2469 ms, mean 2320.8 | +35.4 ms / +1.6% (ranges overlap substantially — not a clean signal either way) |
+| gross `allocated_bytes` (phase 5) | 2,927,131,499 B, identical every trial | 2,843,319,499 B (2 of 3 sampled trials byte-identical; one trial +228-462 KB) | **-83.8 MB, -2.86%**, deterministic and reproducible |
+| net `allocated_bytes` (phase 5) | 296,311,174 B, identical every trial | 296,311,174 B (same tiny run-to-run variation as gross) | unchanged, as expected (removed allocations were transient, freed within the same phase) |
+| `persist_now` db size (phase 2) | 269.49 MB | 269.49 MB | byte-identical |
+| reruns, every phase | exact-match every run (999,760 / 100,164 / 137,085 / 80,767) | exact-match every run | identical |
+
+**`record_source_deps/interner` lock-held mean time**, isolated single-phase
+runs (`PERSIST_BENCH_PHASE=1`, `COMPUTATIONS_LOCK_STATS=1`, 3 trials each,
+205,000 calls/run — this is the specific critical section the `interned`
+`SmallVec` change targets, since it runs *inside* the interner lock):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| mean time/call | 120.4 / 121.7 / 133.8 ns | 99.2 / 89.7 / 101.9 ns | **-22.6% relative**, non-overlapping across all 3x3 trial pairs |
+| phase 1 wall time (same instrumented runs) | 3209 / 3418 / 3556 ms | 3529 / 3230 / 3609 ms | overlapping — `COMPUTATIONS_LOCK_STATS`'s own `Instant::now()` overhead and this box's load dominate at this sample size |
+
+**CPU profile confirmation** (`samply record --unstable-presymbolicate`,
+`profiling` profile, `PERSIST_BENCH_PHASE=5-1`, same offline leaf-sample
+script as Stage 17): `sip::Hasher::write` — Stage 17's **#1** line at
+**12.23%** of active samples (3637 active, 46.1% idle) — is **0.08%** in
+this stage's fresh "after" capture (2632 active samples, 34.8% idle);
+`raw_deps`/`RawDep`/`SrcDep` do not appear anywhere else in the top ~200
+resolved leaf functions. **This stage recovers essentially all of the
+measured 12.23%** (12.15 of 12.23 percentage points, ~99.3%) via the
+internal, non-breaking fix.
+
+**`hospital_bench` cold eval, 6 trials each side** (interleaved in two
+batches of 3 after the first batch alone showed a misleading ~2.7%
+"regression" that a load spike, not the code change, produced — see the
+note below the table):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| wall time, 6 trials | 3540-4170 ms, mean 3833.3 | 3622-4055 ms, mean 3824.0 | -9.3 ms / -0.24% — neutral, ranges overlap fully |
+| gross `allocated_bytes` (cold eval) | 6,449,129,186 B, reproducible | 5,600,639,186 B, byte-identical across all 3 sampled trials | **-848.5 MB, -13.16%**, the largest deterministic effect measured this stage |
+| net `allocated_bytes` (cold eval) | 1,099,488,918-982 B | 1,099,488,918 B, identical across all 3 sampled trials | unchanged, as expected |
+| reruns (cold / rerun-heavy) | 1,116,093 / 1,444, every trial | 1,116,093 / 1,444, every trial | identical |
+
+Batch 1 alone (before: 3563/3540/3553 ms, after: 3677/3648/3622 ms) looked
+like a real ~2.7% regression with non-overlapping ranges — the reason this
+stage insisted on a second, interleaved batch rather than trusting 3
+same-order samples: batch 2 (before: 4082/4092/4170 ms, after:
+3984/3958/4055 ms) shows the *opposite* ordering, equally non-overlapping.
+Background load on this shared box moved by more between batches (this
+stage's own 2.1-7.9 range) than this specific change moves either
+benchmark's wall time, which is exactly why this document has insisted on
+deterministic `allocated_bytes`/lock-hold metrics as the load-bearing
+evidence since Stage 6 — this stage is the sharpest illustration of that
+practice paying off yet, since here even a 6-sample, two-batch wall-time
+comparison flips sign between batches.
+
+**`record_source_deps/interner` lock-held mean, `hospital_bench`**
+(`HOSPITAL_BENCH_PHASE=main`, `COMPUTATIONS_LOCK_STATS=1`, 2 trials each,
+2,081,168 calls/run, cumulative phases 1-3):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| mean time/call | 362.3 / 361.2 ns | 321.6 / 328.4 ns | **-10.2% relative**, non-overlapping |
+| `TOTAL` lock-held time (all sites) | 2.254 / 2.242 s | 2.131 / 2.163 s | **-4.5% relative** |
+| cold-eval wall time (same instrumented runs) | 4164 / 4151 ms | 3953 / 4030 ms | **-4.0% relative, non-overlapping** (before min 4151 > after max 4030) — with `COMPUTATIONS_LOCK_STATS`'s fixed overhead applied identically to both sides, this specific pair of runs shows the win this stage's mechanism predicts |
+| rerun-heavy gross `allocated_bytes` | ~303.13-303.14 MB | ~302.18-302.19 MB | -0.96 MB, -0.31% (small: rerun-heavy only mutates 300 keys -> 1,444 reruns, so far fewer `raw_deps` calls than cold eval's 2.08M) |
+
+**CPU profile, `hospital_bench`** (`HOSPITAL_BENCH_PHASE=main`, `profiling`
+profile, aggregate over the whole cold+live+rerun-heavy run rather than a
+window-isolated capture like Stage 17's — noted so this isn't read as a
+precise apples-to-apples replacement for Stage 17's own rerun-heavy-window
+table): `sip::Hasher::write` is **0.08%** of 5,161 active samples (35.4%
+idle) in this stage's "after" capture, down from Stage 17's **directly**
+measured 4.71% self-time for `source::raw_deps` itself (plus the majority
+of a separate 30.12% `hash_one` line) in that stage's window-isolated
+rerun-heavy profile. The two figures aren't measuring the identical window,
+but the direction and near-total disappearance from the leaf-sample list
+either way corroborates `persist_bench`'s cleaner before/after comparison.
+
+### Reading the wall-time result honestly
+
+**Wall-clock time did not measurably improve on either benchmark's
+top-line number** — every comparison above either overlaps fully or flips
+sign between batches. This does not mean the fix is a no-op: `sip::Hasher::write`
+genuinely disappeared from the CPU profile (12.23% -> 0.08%), gross
+allocations genuinely and deterministically dropped (-2.86%/-13.16%), and
+the one lock-held critical section this change actually touches
+(`record_source_deps/interner`) is reproducibly 10-23% faster per call on
+both benchmarks. The honest explanation, not available from a CPU
+self-time percentage alone, is an Amdahl's-law point specific to a
+concurrent, lock-serialized engine: CPU self-time sums *active
+CPU-seconds across every worker thread*, but wall-clock time is bounded by
+whichever *serialized* resource is the actual critical path. Stage 17's own
+lock-hold table already answers which resource that is: on `persist_bench`,
+`run/finish_success` + `prepare` + `record_call_dep` are ~92% of total
+lock-held time and this stage touches none of them — `record_source_deps`'s
+three sub-sites combined were only ~5% before this stage and stay small
+after it, so even fully eliminating hashing there removes a small slice of
+a small slice of the actual critical path. Most of `raw_deps`'s own
+12.23% CPU-sample share was spent in the *unlocked* portion of each task
+(`Ctx::src_req`, before any lock is taken) — real work, genuinely removed,
+but work that was already running in parallel across this benchmark's
+worker threads rather than serializing the whole engine, so freeing that
+CPU capacity doesn't shorten the wall-clock critical path the way removing
+work from `prepare`/`run/finish_success` would. `hospital_bench` is the
+partial exception that proves the rule: there, `record_source_deps/interner`
+*is* a dominant lock (32-33% of total lock-held time, per Stage 17's own
+table), and the one apples-to-apples comparison that controls for
+measurement overhead identically on both sides (the `COMPUTATIONS_LOCK_STATS`
+runs) shows a clean, non-overlapping 4.0% wall-time win — consistent with
+this change mattering most where the interner lock is actually a bigger
+share of the critical path, and mattering least (at the wall-clock level)
+where it isn't.
+
+### The task's second fix-order candidate, evaluated
+
+The task asked, if any hashing cost remained inside the *plugin's* own
+`HashSet<Dep<K, V>>` construction (unfixable without a breaking trait
+change), to quantify it rather than touch the trait. Per the CPU-profile
+numbers above, the answer is: **negligible — 0.08% of active samples on
+both benchmarks**, matching exactly what's left of `sip::Hasher::write`
+after this stage's internal fix. This residual is `testutil::MemKvSource`/
+`hospital_bench::LatencySource`'s own `Source::execute` building a
+one-element `HashSet<Dep<K, V>>` per read, per the public trait's mandated
+return type — the same "hash set to hold one element" shape this stage
+just fixed on the *engine* side, now visible on the *plugin* side instead,
+at two orders of magnitude smaller a cost than before this stage. This is
+not worth a breaking `Source`/`SourceBase` trait change under this task's
+scope; it is recorded here, as instructed, as motivation for the
+separately-queued source-contract reshaping work that is already planned
+to touch that surface.
+
+### Verdict: kept
+
+No metric regressed on either benchmark: reruns matched exactly on every
+trial, the persisted database was byte-identical, `net allocated_bytes` was
+unchanged (as expected — the removed allocations were transient), and every
+wall-time comparison landed within this box's own demonstrated noise band
+(as sharp as flipping sign between two batches of the same measurement).
+Against that, this stage has multiple independent, deterministic,
+reproducible signals of a genuine improvement: the #1-ranked CPU hotspot
+from Stage 17's profile is gone (12.23% -> 0.08%), gross allocations fell
+by a real and repeatable margin on both benchmarks (most dramatically
+-13.16% on `hospital_bench`'s cold eval), and the one lock-held critical
+section this change touches is reproducibly faster on both benchmarks
+(-22.6% / -10.2%), with a clean, overhead-controlled 4.0% wall-time win on
+`hospital_bench` once `COMPUTATIONS_LOCK_STATS` puts both sides on equal
+footing. Combined with zero public API change, zero persisted-format
+change, and zero behavioral change (every existing test passes unmodified),
+this clears the bar this document has used since Stage 14: a change that is
+never worse and, on the metrics that aren't swamped by this shared
+machine's noise floor, measurably better, is kept even where the intuitive
+top-line number (wall time) doesn't move enough to see through the noise on
+every benchmark.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **135 passed** (unchanged count:
+`RawDeps`/`RawOutputs`/the `SmallVec<[SrcDep; 1]>` interning step are
+internal representation changes with no new observable behavior — existing
+`record_source_deps`/`extend_source_deps`/`restore_nodes`/`reconcile_source_deps`
+tests already cover the paths this stage touches, transitively, the same
+reasoning Stages 14/18 gave for `SourceRefs`/`SrcDeps`). `cargo test -p
+computations --features testutil,alloc-stats` — all green standalone.
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean. No public API surface changed (`RawDeps`/`RawOutputs` are
+`pub(crate)`); `NodeTable::outputs`'s true `HashSet<RawOutput>` storage
+(needed for `EngineInner::run`'s dropped-output set-difference) and
+`NodeTable::source_deps`'s `SrcDeps` storage (Stage 18, unrelated to this
+stage) are both untouched.

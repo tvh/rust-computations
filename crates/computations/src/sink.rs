@@ -12,6 +12,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use smallvec::SmallVec;
 
 use crate::error::SinkError;
 use crate::source::Request;
@@ -88,6 +89,16 @@ pub struct RawOutput {
     pub sink: SinkId,
     pub out: OutBytes,
 }
+
+/// A small, ordinarily single-element collection of [`RawOutput`]s — the
+/// output-side counterpart of `crate::source::RawDeps` (Stage 20, see
+/// `docs/persistence-benchmark-notes.md`), used wherever a batch of
+/// `RawOutput`s is only ever being built and handed off (`Ctx::sink_req`,
+/// `persist::restore_nodes`), never diffed as a true set. The engine's
+/// *stored* per-node output set (`NodeTable::outputs`) is unaffected — it is
+/// still a real `HashSet<RawOutput>`, since `EngineInner::run`'s dropped-
+/// output detection genuinely needs set difference there.
+pub(crate) type RawOutputs = SmallVec<[RawOutput; 1]>;
 
 /// Object-safe, byte-erased view of a [`SinkBase`].
 ///
