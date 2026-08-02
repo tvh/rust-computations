@@ -4494,3 +4494,182 @@ own artifacts (`*.json`/`*.syms.json`) and the rewritten
 `analyze_profile.py` were kept in the session scratchpad, not the repo,
 per Stage 6's own "artifacts kept out of git" precedent and the existing
 `.gitignore` entries from that stage.
+
+## Stage 18 — single-element source_deps
+
+Stage 17's ranked candidate 2: `NodeTable::source_deps`
+(`HashMap<NodeRef, HashSet<SrcDep>>`) is the *other* interned side table —
+`source_index` (key -> dependents) got Stage 14's `One`/`Many` treatment;
+`source_deps` (node -> its own deps) never did. Stage 17's own capacity
+diagnostic measured it at 33.4 MB (10.3% of `persist_bench`'s total) and
+127.0 MB (11.1% of `hospital_bench`'s total) — hashbrown allocates a
+3-slot minimum table even to hold a `HashSet` of one 32-byte `SrcDep`, so
+every single-dependency entry pays ~99 B of real heap to store one 32-byte
+value.
+
+### Design
+
+`crate::engine::SrcDeps` replaces `HashSet<SrcDep>` as `NodeTable::source_deps`'s
+value type, reusing Stage 14's `SourceRefs` shape verbatim:
+
+```rust
+pub(crate) enum SrcDeps {
+    One(SrcDep),
+    Many(HashSet<SrcDep>),
+}
+```
+
+- **Promotion** (`One -> Many`) happens in place, in `SrcDeps::insert`, the
+  first time a second *distinct* `SrcDep` is recorded against a node — used
+  by `NodeTable::extend_source_deps` (both the live `record_source_deps`
+  path and `persist::restore_nodes`'s cold rebuild path share this one
+  method, exactly as before). A vacant map entry always starts life as
+  `One`, never an implicit empty `Many` — there is no `Default` impl for
+  `SrcDeps`, matching `SourceRefs`.
+- **Demotion (`Many -> One`) is not implemented**, following Stage 14's own
+  precedent and the task's explicit direction to do the same unless
+  measurement showed a reason not to. Measurement (below) showed no such
+  reason.
+- **External call sites are unchanged.** `NodeTable::source_deps_clone`/
+  `take_source_deps` still return an owned `HashSet<SrcDep>` — the shape
+  `EngineInner::reconcile_source_deps`'s `old == new` early-return and
+  key-id diff, `crate::persist::PendingRecord::snapshot`'s iteration, and
+  `crate::persist::probe_restored_source_deps`'s per-key grouping are all
+  already typed against. `SrcDeps::into_hashset`/`clone_to_hashset` do the
+  conversion at the two points that need it: `Many` moves (or clones) its
+  already-allocated `HashSet` with no rebuild; `One` pays a fresh
+  single-element `HashSet` allocation, the same cost `take_source_deps`
+  always had for a node with exactly one dependency. This means
+  `EngineInner::run`, `driver::liveness_gc`, and every `crate::persist`
+  touch point (`PendingRecord::snapshot`, `restore_nodes`,
+  `probe_restored_source_deps`) needed **zero** changes beyond what
+  `NodeTable`'s own methods do internally — the enum is entirely contained
+  inside `engine.rs`.
+- `source_deps_iter`/`source_deps_contains` go through a new `SrcDeps::iter`/
+  `SrcDepsIter` (a two-armed iterator, `Option<&SrcDep>` for `One`,
+  `HashSet`'s own `Iter` for `Many`), mirroring `SourceRefsIter` exactly.
+
+**Contrast with Stage 5's rejected experiment, stated explicitly per the
+task's request:** Stage 5 measured-and-reverted `SmallVec<[NodeRef; N]>` for
+`source_deps`/`outputs` because *most nodes have zero* of either — a node
+that reads no sources is common, and an inline-capacity container pays its
+slot unconditionally whether or not it's ever used, losing to a
+never-allocated empty `HashSet`. This stage's `source_deps` entries are
+never in that position: `NodeTable::extend_source_deps` is a no-op for an
+empty `raw` (a node with zero source reads never gets a map entry at all,
+exactly as before), so there is no "wasted inline slot on an empty
+container" case here either — only "one slot suffices for the common case,
+promote when a second distinct dependency shows up," the same shape Stage
+14 found paid off for `source_index`.
+
+**A more important distinction, specific to this stage and flagged by the
+task explicitly so it isn't conflated with the shape above:** the task's
+own framing cited "100% single-element on `persist_bench`, 99.9998%
+single-element on `hospital_bench`" as this stage's motivating evidence.
+The `persist_bench` figure is exactly right — Stage 17's own capacity table
+found all 205,000 entries hold exactly one `SrcDep`. The `hospital_bench`
+figure, on closer reading of Stage 17's own numbers, describes a
+*different* measurement: **99.9998% single-`Dep` refers to `raw_deps()`'s
+per-call arity** (Stage 17's ranked candidate 1, `crate::source::raw_deps`
+building a fresh `HashSet<RawDep>` per source read), not to
+`NodeTable::source_deps`'s own final per-node entry size. Stage 17's own
+capacity-diagnostic table for `source_deps` itself says the opposite for
+this benchmark: **753,000 entries hold 2,079,000 total `SrcDep`s, averaging
+2.76 per entry** — `hospital_bench`'s comp bodies read multiple keys per
+instance (e.g. `vitals` reads value+unit+range in one body, each call to
+`record_source_deps` contributing one dep to the same node's cumulative
+set), so only ~1,500 of 753,000 entries (~0.2%) are actually single-`SrcDep`.
+This stage implements the `One`/`Many` enum exactly as instructed regardless
+— it is still a strict improvement (no workload's entries get worse, some
+get zero-heap), and Stage 17's own ranked-candidate write-up already
+anticipated this exact distinction ("a `SmallVec<[SrcDep; N]>`-style
+representation generalizes better... while still avoiding the
+hashbrown-minimum-table tax that all 753,000 entries pay regardless of
+their own arity") — but the measured win on `hospital_bench` specifically
+should be read against the *true* 0.2%-single distribution, not the
+misattributed 99.9998% figure, and the numbers below report exactly that.
+
+### Measurements
+
+`uptime` load average ranged **~4.4–10.5** across this stage's benchmark
+session (1-minute figures from 4.37 up to 10.49 at various points, this
+box's heaviest band since Stage 6/13) — heavier than Stage 17's own
+2.0–4.3 session, so per this document's standing practice the deterministic
+`allocated_bytes`/db-size/rerun-count figures below are what this stage's
+conclusion rests on, with RSS reported for context. Both sides are
+same-session, stash/pop A/B pairs (this stage's `SrcDeps` change stashed
+for "before", popped back for "after").
+
+**`persist_bench`, default scale** (205,000 `source_deps` entries, **100%**
+single-`SrcDep` per Stage 17's own table):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| phase 5 (engine-only RSS), 6 samples before / 8 after | 290.2–312.0 MB, avg 299.7 MB | 257.2–282.1 MB, avg 265.2 MB | **−34.5 MB, −11.5%** (ranges do not overlap) |
+| phase 5 `allocated_bytes` (net), 2 trials each, identical within each side | 325,014,346 B | 296,314,346 B | **−28,700,000 B, −8.83%** (matches Stage 17's own ~8-9% estimate) |
+| `persist_now` db size | 269.49 MB | 269.49 MB | byte-identical |
+| `record_source_deps/nodes` lock share, phase 1 | 2.29–3.49% across sampled runs | 2.29% | unchanged within run-to-run spread |
+| `record_source_deps/source_index`, `/interner` lock shares | 1.91–2.79% / 1.24–2.04% | 1.91% / 1.24% | unchanged |
+| reruns, every phase | exact-match every run (999,760 / 100,164 / 137,085) | exact-match every run | identical |
+
+**A real, reproducible win — every "after" RSS sample beats every "before"
+sample**, and the deterministic `allocated_bytes` delta lands almost
+exactly on Stage 17's own predicted 8-9% range for this benchmark, since
+100% of its entries convert to the zero-heap `One` variant.
+
+**`hospital_bench`, default scale** (753,000 `source_deps` entries, only
+**~0.2%** single-`SrcDep`, average 2.76/entry per Stage 17's own table):
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| cold-eval RSS, 3 samples each | 1088.0–1099.2 MB, avg 1094.2 MB | 1096.0–1099.3 MB, avg 1098.1 MB | +3.9 MB / +0.4% (ranges fully overlap — noise) |
+| cold-eval `allocated_bytes` (net) | 1,146,709,594 B | 1,146,499,594 B | **−210,000 B, −0.018%** (matches Stage 17's baseline to 7 significant figures) |
+| `record_source_deps/nodes` lock share (phases 1-3) | 11.87% | 12.13% | unchanged within noise |
+| `record_source_deps/interner`, `liveness_gc/mark_sweep` lock shares | 33.24% / 21.36% | 33.29% / 20.93% | unchanged within noise |
+| cold-eval wall time | 4140-4242 ms | 4140-4167 ms | flat |
+| reruns, cold / rerun-heavy | 1,116,093 / 1,444 | 1,116,093 / 1,444 | identical, every run |
+
+**Neutral, exactly as the corrected distribution above predicts.** With
+only ~1,500 of 753,000 entries actually single-`SrcDep`, the other 751,500
+stay `Many` and pay the identical `HashSet` cost they always did — the
+measured −0.018% `allocated_bytes` delta is the right order of magnitude
+for saving ~99 B on ~1,500 entries against a 1.1 GB base (≈150 KB, swamped
+by run-to-run allocator noise at this scale), not a meaningfully-sized win,
+but also not a regression: no lock share, RSS sample, or rerun count moved
+outside its own noise band.
+
+### Verdict: kept
+
+`persist_bench` improves by a real, reproducible, non-overlapping margin on
+both RSS and the deterministic `allocated_bytes` metric, matching Stage
+17's own estimate almost exactly; `hospital_bench` — correctly understood
+against its true ~0.2%-single distribution rather than the task's
+misattributed 99.9998% figure — lands within noise on every metric, with no
+observed regression on any of RSS, `allocated_bytes`, lock-hold shares, wall
+time, or rerun counts. This is the same "one benchmark wins clearly, the
+other is a documented, explained no-op" shape Stage 14 established (there,
+in the opposite direction: `hospital_bench` won, `persist_bench` was
+neutral) — a real win on one workload with zero regression on the other
+clears this campaign's own bar for keeping a change. Persisted format and
+db size are unaffected (`source_deps`'s *storage shape* was never part of
+the on-disk record — only `NodeRecord::source_deps: Vec<RawDepRepr>`, which
+this stage does not touch).
+
+If a future workload needs `hospital_bench`'s own multi-key-per-node shape
+addressed, Stage 17's own alternative suggestion — `SmallVec<[SrcDep; N]>`
+instead of a strict two-armed enum, so a `Many`-shaped entry with 2-3
+elements still avoids the hashbrown-minimum-table allocation — remains
+exactly where to look next; it was not attempted here because the task
+specified reusing Stage 14's own enum pattern, and this stage's evidence
+doesn't show a workload-specific reason to deviate from that instruction.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **135 passed** (unchanged count:
+`SrcDeps`'s behavior is already covered transitively by every existing
+`source_deps`-touching test, the same reasoning Stage 14 gave for
+`SourceRefs` — a wrong promotion/iteration/conversion would fail
+`reconcile_source_deps`, `liveness_gc` reclamation, or `persist::restore_nodes`
+directly). `cargo test -p computations --features testutil,alloc-stats` —
+all green standalone. `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` clean.

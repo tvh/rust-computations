@@ -252,6 +252,111 @@ impl Iterator for SourceRefsIter<'_> {
     }
 }
 
+/// Small-size optimization for `NodeTable::source_deps`'s value (Stage 18 —
+/// see `docs/persistence-benchmark-notes.md`) — the same `One`/`Many` shape
+/// [`SourceRefs`] (Stage 14) applies to `source_index`, this time on the
+/// *other* side table Stage 14 didn't touch: a node's own recorded source
+/// dependencies, keyed by [`NodeRef`] instead of [`SrcKeyId`].
+///
+/// A `source_deps` entry's "zero" state is already the absent map entry
+/// (`NodeTable::extend_source_deps` never creates one for an empty `raw`,
+/// and `NodeTable::remove_by_id` purges it outright), so every entry that
+/// exists has **at least one** recorded dependency. Stage 17's own
+/// measurement found `persist_bench`'s 205,000 entries **100%**
+/// single-`SrcDep` — every one of them was still paying a `HashSet`'s
+/// hashbrown-minimum (3-slot) backing-table allocation to hold one 32-byte
+/// value. `hospital_bench`'s 753,000 entries are *not* the same shape —
+/// only ~1,500 (0.2%) are single-`SrcDep`, averaging 2.76 each, because its
+/// comp bodies read multiple keys per instance (e.g. `vitals` reads
+/// value+unit+range in one body) — so this stage's own measurements below
+/// report that difference honestly rather than assuming Stage 14's
+/// hospital-favoring result repeats here; see this stage's writeup for the
+/// actual numbers.
+///
+/// **Not Stage 5's rejected `SmallVec` experiment**, for the identical
+/// reason [`SourceRefs`]'s own docs give: `source_deps` entries don't exist
+/// at all until a node has a first source read, so there is no "wasted
+/// inline slot on an empty container" case here — only "one slot suffices
+/// for the common single-dependency case, promote when a second *distinct*
+/// dependency shows up."
+///
+/// Promotion (`One -> Many`) is one-way, matching Stage 14's own choice —
+/// see [`SourceRefs`]'s docs for why neither of this crate's two benchmarks
+/// has a workload shape that would justify demotion's added complexity.
+#[derive(Debug)]
+pub(crate) enum SrcDeps {
+    One(SrcDep),
+    Many(HashSet<SrcDep>),
+}
+
+impl SrcDeps {
+    /// Inserts `dep`, promoting `One -> Many` in place the first time a
+    /// second *distinct* dependency is recorded against this node — mirrors
+    /// [`SourceRefs::insert`].
+    fn insert(&mut self, dep: SrcDep) {
+        match self {
+            SrcDeps::One(existing) => {
+                if *existing != dep {
+                    let mut set = HashSet::with_capacity(2);
+                    set.insert(existing.clone());
+                    set.insert(dep);
+                    *self = SrcDeps::Many(set);
+                }
+            }
+            SrcDeps::Many(set) => {
+                set.insert(dep);
+            }
+        }
+    }
+
+    fn iter(&self) -> SrcDepsIter<'_> {
+        match self {
+            SrcDeps::One(dep) => SrcDepsIter::One(Some(dep)),
+            SrcDeps::Many(set) => SrcDepsIter::Many(set.iter()),
+        }
+    }
+
+    /// Converts into an owned `HashSet<SrcDep>` — the shape every existing
+    /// caller (`EngineInner::reconcile_source_deps`'s `old == new` check and
+    /// key-id diff, `crate::persist`'s restore/probe paths) is already typed
+    /// against, so this stage doesn't need to touch any of those call sites.
+    /// `Many` moves its already-allocated set out with no reallocation;
+    /// `One` pays a fresh single-element `HashSet` allocation, same as
+    /// `NodeTable::take_source_deps` always has for a node with exactly one
+    /// dependency.
+    fn into_hashset(self) -> HashSet<SrcDep> {
+        match self {
+            SrcDeps::One(dep) => HashSet::from([dep]),
+            SrcDeps::Many(set) => set,
+        }
+    }
+
+    /// The borrowing counterpart of [`Self::into_hashset`], used by
+    /// `NodeTable::source_deps_clone`.
+    fn clone_to_hashset(&self) -> HashSet<SrcDep> {
+        match self {
+            SrcDeps::One(dep) => HashSet::from([dep.clone()]),
+            SrcDeps::Many(set) => set.clone(),
+        }
+    }
+}
+
+pub(crate) enum SrcDepsIter<'a> {
+    One(Option<&'a SrcDep>),
+    Many(std::collections::hash_set::Iter<'a, SrcDep>),
+}
+
+impl<'a> Iterator for SrcDepsIter<'a> {
+    type Item = &'a SrcDep;
+
+    fn next(&mut self) -> Option<&'a SrcDep> {
+        match self {
+            SrcDepsIter::One(opt) => opt.take(),
+            SrcDepsIter::Many(it) => it.next(),
+        }
+    }
+}
+
 /// The small set of mutually-exclusive/boolean bits packed into one byte
 /// per row: `state` (2 bits, 3 values), `dirty_priority` (2 bits, `None`
 /// plus 2 values), `last_changed` (1 bit), `has_result` (1 bit — Tier 2's
@@ -563,8 +668,10 @@ pub(crate) struct NodeTable {
     /// 13 — see `docs/persistence-benchmark-notes.md`); still hashed with
     /// `std`'s default `SipHash`, not `IdentityBuildHasher`, because
     /// [`SrcDep`] carries raw version bytes (see `crate::hashers`'s docs on
-    /// why that disqualifies it, same as `RawDep`).
-    source_deps: HashMap<NodeRef, HashSet<SrcDep>>,
+    /// why that disqualifies it, same as `RawDep`). Value is [`SrcDeps`], a
+    /// `One`/`Many` small-size optimization for the common single-dependency
+    /// entry (Stage 18 — see `docs/persistence-benchmark-notes.md`).
+    source_deps: HashMap<NodeRef, SrcDeps>,
     outputs: HashMap<NodeRef, HashSet<RawOutput>>,
     inflight: HashMap<NodeRef, SharedExec>,
     /// A flow-argument node's ordered [`FlowId`]s (Stage 9 — see
@@ -797,7 +904,7 @@ impl NodeTable {
     // -- sparse side tables (`source_deps`/`outputs`/`inflight`) --
 
     pub(crate) fn source_deps_iter(&self, r: NodeRef) -> impl Iterator<Item = &SrcDep> {
-        self.source_deps.get(&r).into_iter().flatten()
+        self.source_deps.get(&r).map(SrcDeps::iter).into_iter().flatten()
     }
 
     /// Whether `r` currently has a dependency on exactly `key_id` at
@@ -812,25 +919,47 @@ impl NodeTable {
             .is_some_and(|deps| deps.iter().any(|d| d.key_id == key_id && d.ver.as_slice() == ver))
     }
 
+    /// Clones `r`'s source deps into an owned `HashSet<SrcDep>` — the shape
+    /// `EngineInner::reconcile_source_deps`'s equality/diff logic and
+    /// `crate::persist`'s probe path are typed against; see
+    /// [`SrcDeps::clone_to_hashset`].
     pub(crate) fn source_deps_clone(&self, r: NodeRef) -> HashSet<SrcDep> {
-        self.source_deps.get(&r).cloned().unwrap_or_default()
+        self.source_deps.get(&r).map(SrcDeps::clone_to_hashset).unwrap_or_default()
     }
 
-    /// Removes and returns `r`'s source deps (empty if it had none),
-    /// leaving no entry behind — the side-table equivalent of clearing a
-    /// plain field.
+    /// Removes and returns `r`'s source deps as an owned `HashSet<SrcDep>`
+    /// (empty if it had none), leaving no entry behind — the side-table
+    /// equivalent of clearing a plain field. See [`SrcDeps::into_hashset`]
+    /// for why the common `Many` case is a free move, not a reallocation.
     pub(crate) fn take_source_deps(&mut self, r: NodeRef) -> HashSet<SrcDep> {
-        self.source_deps.remove(&r).unwrap_or_default()
+        self.source_deps.remove(&r).map(SrcDeps::into_hashset).unwrap_or_default()
     }
 
-    /// Merges `raw` into `r`'s source-dep set, creating the entry if this
-    /// is its first one. A no-op for an empty `raw`, so a node that never
-    /// reads any source never gets an entry at all.
+    /// Merges `raw` into `r`'s source-dep set, creating the entry (starting
+    /// life as [`SrcDeps::One`], never an implicit empty `Many` — see
+    /// [`SourceRefs`]'s docs on why a vacant entry never starts as `Many`)
+    /// if this is its first one. A no-op for an empty `raw`, so a node that
+    /// never reads any source never gets an entry at all.
     pub(crate) fn extend_source_deps(&mut self, r: NodeRef, raw: &HashSet<SrcDep>) {
         if raw.is_empty() {
             return;
         }
-        self.source_deps.entry(r).or_default().extend(raw.iter().cloned());
+        match self.source_deps.entry(r) {
+            Entry::Vacant(v) => {
+                let mut iter = raw.iter().cloned();
+                let first = iter.next().expect("raw was checked non-empty above");
+                let mut deps = SrcDeps::One(first);
+                for dep in iter {
+                    deps.insert(dep);
+                }
+                v.insert(deps);
+            }
+            Entry::Occupied(mut o) => {
+                for dep in raw.iter().cloned() {
+                    o.get_mut().insert(dep);
+                }
+            }
+        }
     }
 
     pub(crate) fn outputs_iter(&self, r: NodeRef) -> impl Iterator<Item = &RawOutput> {
