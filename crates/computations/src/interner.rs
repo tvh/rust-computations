@@ -61,12 +61,34 @@
 //! bytes (see `crate::persist::RawDepRepr`, unchanged by this module), and
 //! restoring a node re-interns its keys fresh, exactly as a live
 //! `record_source_deps` call would.
+//!
+//! ## One allocation per key, not two (Stage 19)
+//!
+//! `entries` (the reverse `id -> (source, key)` lookup persistence and
+//! `Source::unregister` need) and `forward`'s inner map (the forward
+//! `key -> id` lookup this module's own hot path needs) both need their own
+//! logical copy of a key's bytes, but there is no reason for that to mean
+//! two independent *heap allocations*: [`Self::intern`] builds one `Arc<[u8]>`
+//! per newly-seen key and stores a cheap `Arc::clone` (an atomic refcount
+//! bump, not a byte copy) in each of the two maps, rather than the pair of
+//! independent `key.to_vec()` calls the pre-Stage-19 version paid (one for
+//! `entries`, one for `forward`). This matters most on a zero-sharing
+//! workload: `hospital_bench`'s ~2.08M
+//! distinct keys each used to pay for two independent small allocations
+//! (each with its own malloc-quantum overhead) purely to hold the same
+//! bytes twice; now they pay for one. `Arc<[u8]>: Borrow<[u8]>` preserves
+//! this module's original, load-bearing property (documented on
+//! [`SrcKeyInterner`] below): a lookup that hits — the common case once a
+//! workload's key set has stabilized — still probes with a borrowed `&[u8]`
+//! and allocates nothing, on both the forward map (as before) and the new
+//! `Arc` itself (which is only ever *constructed* on a genuine miss).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::source::{KeyBytes, SourceId};
+use crate::source::SourceId;
 
 /// A dense, process-local id standing in for one `(SourceId, key bytes)`
 /// pair, assigned by [`SrcKeyInterner::intern`]. Never persisted, never
@@ -113,22 +135,27 @@ pub(crate) struct SrcDep {
 /// module's docs for the reclamation design.
 ///
 /// `forward` is nested (`SourceId -> (key bytes -> id)`) rather than a flat
-/// `HashMap<(SourceId, KeyBytes), SrcKeyId>` so that
+/// `HashMap<(SourceId, Arc<[u8]>), SrcKeyId>` so that
 /// [`Self::intern`]'s common case — the key has been seen before, which is
 /// every call once a workload's key set has stabilized — never allocates a
-/// probe key: the inner map's `Vec<u8>` keys are looked up through a
-/// borrowed `&[u8]` via `Vec<u8>: Borrow<[u8]>`, so a hit costs one hash of
+/// probe key: the inner map's `Arc<[u8]>` keys are looked up through a
+/// borrowed `&[u8]` via `Arc<[u8]>: Borrow<[u8]>`, so a hit costs one hash of
 /// the caller's own bytes and nothing else. Only a genuine miss (a key seen
-/// for the first time) pays for an owned `key.to_vec()`.
+/// for the first time) pays for one `Arc::from(key)` allocation, shared (via
+/// `Arc::clone`, not a byte copy) with `entries` below — see this module's
+/// "One allocation per key, not two" docs (Stage 19).
 #[derive(Default)]
 pub(crate) struct SrcKeyInterner {
-    forward: HashMap<SourceId, HashMap<KeyBytes, SrcKeyId>>,
+    forward: HashMap<SourceId, HashMap<Arc<[u8]>, SrcKeyId>>,
     /// `SrcKeyId(i) -> Some((source, key))` while live, `None` once
     /// [`Self::release`] has freed slot `i` back to `free`. Needed to
     /// serialize real bytes back out (persistence, `Source::unregister`)
     /// without keeping every consumer holding its own copy, and to know
-    /// which `forward` bucket to clean up on release.
-    entries: Vec<Option<(SourceId, KeyBytes)>>,
+    /// which `forward` bucket to clean up on release. Shares its `Arc<[u8]>`
+    /// allocation with `forward`'s own key for the same id (Stage 19) — this
+    /// is a second *reference* to one heap allocation, not a second copy of
+    /// the bytes.
+    entries: Vec<Option<(SourceId, Arc<[u8]>)>>,
     refcounts: Vec<u32>,
     /// Freed slot indices, available for [`Self::intern`] to reuse before
     /// growing `entries`.
@@ -151,19 +178,25 @@ impl SrcKeyInterner {
         if let Some(&id) = self.forward.get(source).and_then(|m| m.get(key)) {
             return id;
         }
+        // A genuine miss: the one place this call pays for real bytes at
+        // all. `Arc::from(key)` allocates and copies once; every other use
+        // of these bytes (the `entries` slot below, `forward`'s own key) is
+        // an `Arc::clone` -- an atomic refcount bump, not a second
+        // allocation (Stage 19 -- see this module's docs).
+        let key: Arc<[u8]> = Arc::from(key);
         let id = match self.free.pop() {
             Some(slot) => {
-                self.entries[slot as usize] = Some((source.clone(), key.to_vec()));
+                self.entries[slot as usize] = Some((source.clone(), key.clone()));
                 self.refcounts[slot as usize] = 0;
                 SrcKeyId(slot)
             }
             None => {
-                self.entries.push(Some((source.clone(), key.to_vec())));
+                self.entries.push(Some((source.clone(), key.clone())));
                 self.refcounts.push(0);
                 SrcKeyId((self.entries.len() - 1) as u32)
             }
         };
-        self.forward.entry(source.clone()).or_default().insert(key.to_vec(), id);
+        self.forward.entry(source.clone()).or_default().insert(key, id);
         id
     }
 
@@ -215,7 +248,7 @@ impl SrcKeyInterner {
     /// The real `(source, key bytes)` an id stands for, `None` if it has
     /// already been released. Never allocates.
     pub(crate) fn resolve(&self, id: SrcKeyId) -> Option<(&SourceId, &[u8])> {
-        self.entries[id.0 as usize].as_ref().map(|(source, key)| (source, key.as_slice()))
+        self.entries[id.0 as usize].as_ref().map(|(source, key)| (source, key.as_ref()))
     }
 
     /// Looks up `(source, key)`'s id without creating one — for a caller
@@ -381,7 +414,7 @@ mod tests {
     fn srcdep_did_not_grow_past_its_pre_stage_15_size() {
         assert_eq!(
             std::mem::size_of::<SmallVerBytes>(),
-            std::mem::size_of::<KeyBytes>(),
+            std::mem::size_of::<Vec<u8>>(),
             "SmallVerBytes (inline SmallVec) must match Vec<u8>'s own struct size on this platform -- \
              that's the whole point of an 8-byte inline capacity; a mismatch means the inline capacity \
              grew past what's free and this stage's sizing rationale needs re-measuring"

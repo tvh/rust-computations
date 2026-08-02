@@ -4673,3 +4673,175 @@ doesn't show a workload-specific reason to deviate from that instruction.
 directly). `cargo test -p computations --features testutil,alloc-stats` —
 all green standalone. `cargo clippy --workspace --all-targets --all-features
 -- -D warnings` clean.
+
+## Stage 19 — de-duplicating interner key storage
+
+Stage 17's single biggest concretely-named finding, ranked candidate 4:
+`SrcKeyInterner` (`crates/computations/src/interner.rs`) stored every
+key's bytes **twice** — once in `entries` (the `id -> (source, key)`
+reverse lookup persistence and `Source::unregister` need) and again as the
+key of `forward`'s nested `HashMap<KeyBytes, SrcKeyId>` (the `key -> id`
+forward lookup the hot path needs). Stage 17's temporary capacity
+diagnostic measured this at **253.58 MB — 22.1% of `hospital_bench`'s
+entire footprint** — on a workload with ~2.08M distinct keys and zero
+sharing, where every single one of those keys' ~18-24 raw bytes was stored
+as two independent heap allocations rather than one.
+
+### Design
+
+`SrcKeyInterner` now stores each key's bytes as a single `Arc<[u8]>`,
+shared (via `Arc::clone`) between `entries` and `forward`'s inner-map key,
+rather than two independent `Vec<u8>`s:
+
+```rust
+pub(crate) struct SrcKeyInterner {
+    forward: HashMap<SourceId, HashMap<Arc<[u8]>, SrcKeyId>>,
+    entries: Vec<Option<(SourceId, Arc<[u8]>)>>,
+    refcounts: Vec<u32>,
+    free: Vec<u32>,
+}
+```
+
+- **`Self::intern`'s miss path** now does exactly one `Arc::from(key)`
+  (allocates and copies the bytes once) and clones the resulting `Arc`
+  (an atomic refcount bump, not a byte copy) into both `entries` and
+  `forward`. The pre-Stage-19 version called `key.to_vec()` twice — once
+  per map — for the identical bytes.
+- **Cache-hit lookups stay allocation-free**, the property Stage 13's own
+  docs call out as load-bearing: `Arc<[u8]>: Borrow<[u8]>` (the same
+  blanket impl the task's own writeup names) lets `forward.get(key: &[u8])`
+  probe with the caller's own borrowed slice exactly as `Vec<u8>: Borrow<[u8]>`
+  did before — a hit costs one hash of the caller's bytes and nothing else,
+  no `Arc` is constructed or cloned unless a genuine miss occurs. Verified
+  both by the lock-hold table below (`record_source_deps/interner`'s share
+  is unchanged to within 0.1 percentage points) and by inspection: nothing
+  on the hit path touches `Arc::from`/`Arc::clone` at all.
+- **Reclamation is unaffected**: `Self::release`'s `forward.get_mut(&key).remove(&key)`
+  still works unchanged (`Arc<[u8]>: Borrow<Arc<[u8]>>` is the trivial
+  reflexive impl every type gets), and dropping the last `Arc` reference
+  (one in `entries`, taken by `Option::take`, and one in `forward`, removed
+  by `HashMap::remove`) frees the shared allocation exactly once, whichever
+  of the two drops last.
+- **Persistence is untouched by construction**: `crate::persist` never
+  reads `SrcKeyInterner`'s internal storage directly — every persisted
+  `source_deps` entry already round-trips through `SrcKeyInterner::resolve`
+  (returns `&[u8]` regardless of the backing storage) into `RawDepRepr`'s
+  own `Vec<u8>` fields, so `FORMAT_VERSION`, the on-disk layout, and
+  `persist_now`'s db size are unaffected — confirmed empirically below
+  (269.49 MB, byte-identical before and after, exactly as Stage 13
+  established for the original interning change).
+- The public option considered and not taken: hashbrown's raw-entry API
+  (`forward` keyed on a hash of the bytes, `entries` as sole owner). The
+  task's own framing asserted the workspace "already depends on hashbrown
+  transitively" — checked directly (`cargo tree --workspace --all-features
+  --target all -e normal,build,dev`) rather than assumed, and that claim
+  does not hold up: `hashbrown` appears in `Cargo.lock` (pulled in by
+  `indexmap`, itself pulled in by `toml`), but `cargo tree -i hashbrown`
+  resolves to nothing for every workspace member — it is not actually a
+  compiled dependency of anything in this workspace's build graph today,
+  and (contrary to the plausible-sounding assumption) `std`'s own `HashMap`
+  does not depend on the crates.io `hashbrown` crate either — it vendors an
+  internal fork with no `Cargo.toml` dependency edge at all. Using
+  hashbrown's raw-entry API here would therefore mean adding a genuinely
+  new direct dependency, not leaning on one already present. `Arc<[u8]>`
+  was chosen instead because it achieves the identical "store once, look up
+  twice" goal with a stdlib-only change, no new dependency, and no
+  unsafe/raw-entry API surface to maintain — strictly the better choice
+  once the "already a dependency" premise turned out not to be true.
+
+### Measurements
+
+`uptime` load average ranged **~3.7–10.3** across this stage's benchmark
+session (1-minute figures from 3.67 up to 10.29 at various points) — the
+heaviest band this document has seen since early stages, so per this
+document's standing practice the deterministic `allocated_bytes`/db-size/
+rerun-count figures below are what this stage's conclusion rests on, RSS
+reported for context only. Both sides are same-session, stash/pop A/B
+pairs, built **on top of Stage 18** (i.e. "before" already includes
+`SrcDeps`'s `One`/`Many` `source_deps` — this stage's interner change
+stashed for "before", popped back for "after").
+
+**`persist_bench`, default scale** (300 distinct keys — the workload
+predicted to see essentially no effect, since 300 keys' duplicated bytes
+were never a meaningful cost either way):
+
+| metric | before (Stage 18 only) | after (+ Stage 19) | Δ |
+|---|---|---|---|
+| phase 5 (engine-only RSS), 4 samples each | 258.0–293.0 MB, avg 269.4 MB | 259.8–277.5 MB, avg 269.5 MB | +0.1 MB — noise, ranges overlap fully |
+| phase 5 `allocated_bytes` (net), 2 trials each, identical within each side | 296,314,346 B | 296,311,174 B | **−3,172 B, −0.001%** — noise floor |
+| `persist_now` db size | 269.49 MB | 269.49 MB | byte-identical |
+| `record_source_deps/interner` lock share, phase 1 | 1.24% | 1.33% | unchanged within run-to-run spread |
+| reruns, every phase | exact-match every run | exact-match every run | identical |
+
+**Neutral, exactly as predicted** — `persist_bench`'s 300 keys were never a
+meaningful share of its footprint (Stage 17's own table put `src_key_interner`
+at 0.04 MB, 0.01% of total, for this benchmark), so removing a duplicate
+copy of a negligible structure has no measurable effect here. This is the
+control this stage's design section predicted, reported as a genuine
+no-op rather than omitted.
+
+**`hospital_bench`, default scale** (~2.08M distinct keys, zero sharing —
+the workload Stage 17's 253.58 MB finding was measured on):
+
+| metric | before (Stage 18 only) | after (+ Stage 19) | Δ |
+|---|---|---|---|
+| cold-eval RSS, 3 samples each | 1097.6–1104.6 MB, avg 1100.5 MB | 1009.7–1017.1 MB, avg 1014.1 MB | **−86.4 MB, −7.85%** (ranges do not overlap) |
+| cold-eval `allocated_bytes` (net) | 1,146,499,594 B | 1,099,488,918 B | **−47,010,676 B, −4.10%** |
+| `record_source_deps/interner` lock share (phases 1-3) | 33.31% (2,081,168 calls, 0.811 s) | 33.23% (2,081,168 calls, 0.806 s) | unchanged — confirms the hit path pays no new cost |
+| `record_source_deps/nodes`, `/source_index` lock shares | 12.40% / 4.70% | 11.48% / 4.26% | within run-to-run spread (see note below) |
+| cold-eval wall time | 4064–4114 ms | 4086–4091 ms | flat |
+| reruns, cold / rerun-heavy | 1,116,093 / 1,444 | 1,116,093 / 1,444 | identical, every run |
+
+**A real, reproducible win, though smaller than Stage 17's rough estimate.**
+Every "after" sample beats every "before" sample on both RSS and the
+deterministic `allocated_bytes` metric. The **−4.10% `allocated_bytes`**
+figure (≈22.6 B saved per interned key) is smaller than Stage 17's own
+back-of-envelope "roughly half of 253.58 MB, ~100-125 MB (9-11%)" estimate
+— that estimate summed the *entire* nested structure's measured capacity
+(both `HashMap`s' own bucket/control-byte/value overhead alongside the key
+bytes), whereas this fix only removes the duplicated *key-byte allocation*
+itself, not the surrounding `HashMap` bookkeeping either map still pays
+independently. The **−7.85% RSS** delta is larger than the
+`allocated_bytes` delta, the same "RSS also captures allocator
+per-allocation overhead" relationship Stage 13/14 both found: eliminating
+one of two ~18-24-byte allocations per key removes that allocation's own
+malloc-quantum overhead entirely, a cost `allocated_bytes`' raw byte-delta
+counter doesn't see. The `record_source_deps/interner` lock share holding
+flat (33.31% -> 33.23%, a difference smaller than this stage's own
+run-to-run noise) directly confirms the design section's claim: the hit
+path — the overwhelming majority of calls once a workload's key set has
+stabilized, and *every* call on `hospital_bench`'s zero-sharing workload is
+a first-sight miss, so this is actually the harder case, not the easier
+one — does no new work under the lock. `record_source_deps/nodes`'s and
+`/source_index`'s small share shifts (12.40%->11.48%, 4.70%->4.26%) are
+consistent with the *interner* site's own total time staying flat while
+the overall critical-path mix shifts slightly run to run at this box's
+current load, not a change in what those two sites themselves do (neither
+touches `SrcKeyInterner` at all).
+
+### Verdict: kept
+
+`hospital_bench` — the workload this stage's evidence was drawn from —
+improves by a real, non-overlapping, reproducible margin on both RSS
+(−7.85%) and the deterministic `allocated_bytes` metric (−4.10%), with the
+hit-path lock-hold share confirmed flat (ruling out a hidden CPU-for-memory
+trade), no wall-time regression, and exact-match reruns. `persist_bench`
+lands within noise on every metric, exactly as its own negligible pre-change
+interner footprint predicted — the same "one workload wins, the other is a
+genuine, explained no-op" shape Stages 14 and 18 both established.
+Persisted format and db size are byte-identical (269.49 MB), and the
+refcounted-reclamation test (`interner::tests::releasing_the_last_reference_shrinks_the_interner`)
+and the engine-level GC reclamation test
+(`driver::tests::liveness_gc_releases_a_collected_nodes_interned_source_keys`)
+both still pass unmodified, confirming reclamation logic is unaffected by
+the storage-sharing change.
+
+### Correctness
+
+`cargo test --workspace --all-features` — **135 passed** (unchanged count:
+no new test needed — every existing `interner`/`driver`/`persist` test
+already exercises `SrcKeyInterner`'s public behavior, which this stage
+leaves entirely unchanged; only the private storage representation moved).
+`cargo test -p computations --features testutil,alloc-stats` — all green
+standalone. `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean.
