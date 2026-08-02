@@ -641,6 +641,82 @@ impl DefTable {
         self.flags[i].set_free(true);
         self.free.push(row);
     }
+
+    /// Below this row count, a column's absolute capacity slack is at most
+    /// a few hundred bytes even at a full 2x doubling overshoot -- not
+    /// worth the branch-and-maybe-realloc cost of checking every def at
+    /// every settle point (most of a typical graph's ~50 defs are small
+    /// "root"/aggregation levels with single-digit-to-low-hundreds row
+    /// counts; see Stage 22 of `docs/persistence-benchmark-notes.md`).
+    const SHRINK_MIN_ROWS: usize = 64;
+
+    /// Trigger ratio for [`Self::shrink_if_slack`]: shrink once a column's
+    /// real capacity exceeds `3/2` of its settled length. Deliberately
+    /// *not* `2` (`Vec`'s own worst-case doubling overshoot): Stage 22's
+    /// measurement found the *average* capacity/length ratio across real
+    /// defs sits around 1.6-1.8x, well under the 2x worst case (a
+    /// doubling def's overshoot is uniformly distributed between 1x and
+    /// 2x, so most settled defs never reach the 2x boundary at all) -- a
+    /// `2` threshold would rarely fire and reclaim almost none of the
+    /// measured slack. `3/2` catches the typical case while still leaving
+    /// real headroom: after a shrink, a column's capacity exactly equals
+    /// its length, so renewed growth needs roughly 50% more rows before
+    /// this threshold (and therefore another realloc) is reached again --
+    /// the same amortized-geometric shape `Vec`'s own doubling relies on,
+    /// just re-centered periodically instead of left to run all the way to
+    /// 2x. This is what keeps repeated calls at every driver settle point
+    /// (see `crate::driver`) safe on a population that keeps slowly
+    /// growing, rather than forcing a realloc on every single insert the
+    /// way an exact-fit-every-time policy would.
+    const SHRINK_RATIO_NUM: usize = 3;
+    const SHRINK_RATIO_DEN: usize = 2;
+
+    /// Same shape as the row-based threshold above, but in raw bytes for
+    /// the byte-addressed `param_arena` (whose growth is driven by
+    /// parameter-byte volume, not row count, so it can't share the same
+    /// counter).
+    const SHRINK_MIN_ARENA_BYTES: usize = 4096;
+
+    /// Shrinks every dense per-row column, plus `param_arena`, to exactly
+    /// its current length whenever real capacity has grown past
+    /// [`Self::SHRINK_RATIO_NUM`]`/`[`Self::SHRINK_RATIO_DEN`] of that
+    /// length -- reclaiming pure `Vec`-growth-doubling slack (capacity
+    /// above the high-water mark every column's `len()` already *is*,
+    /// since rows are freed via `flags`/`free`, never by shrinking a
+    /// column) without touching a freed row's still-reserved slot (that
+    /// slack is reuse headroom for [`Self::insert`], not waste -- see
+    /// [`DefTable`]'s own docs and Stage 22 of
+    /// `docs/persistence-benchmark-notes.md` for the waste-vs-headroom
+    /// distinction this deliberately respects).
+    ///
+    /// Every one of `param_hash`/`result_hash`/`flags`/`param_off`/
+    /// `param_len`/`comp_deps`/`rdeps` is pushed exactly once per fresh
+    /// row in [`Self::insert`] (never independently), so they share one
+    /// `len()`/`capacity()` pair in practice -- checked against
+    /// `param_hash` alone rather than each column separately, cheap
+    /// (`O(1)`, no allocation) in the overwhelmingly common case where
+    /// nothing needs shrinking.
+    fn shrink_if_slack(&mut self) {
+        let len = self.param_hash.len();
+        if len >= Self::SHRINK_MIN_ROWS
+            && self.param_hash.capacity() * Self::SHRINK_RATIO_DEN >= len * Self::SHRINK_RATIO_NUM
+        {
+            self.param_hash.shrink_to_fit();
+            self.result_hash.shrink_to_fit();
+            self.flags.shrink_to_fit();
+            self.param_off.shrink_to_fit();
+            self.param_len.shrink_to_fit();
+            self.comp_deps.shrink_to_fit();
+            self.rdeps.shrink_to_fit();
+        }
+
+        let arena_len = self.param_arena.len();
+        if arena_len >= Self::SHRINK_MIN_ARENA_BYTES
+            && self.param_arena.capacity() * Self::SHRINK_RATIO_DEN >= arena_len * Self::SHRINK_RATIO_NUM
+        {
+            self.param_arena.shrink_to_fit();
+        }
+    }
 }
 
 /// The engine's node table: [`NodeTable::defs`] holds one [`DefTable`] per
@@ -883,6 +959,21 @@ impl NodeTable {
     /// builder-path case).
     pub(crate) fn flow_ids_clone(&self, r: NodeRef) -> Vec<FlowId> {
         self.flow_ids.get(&r).cloned().unwrap_or_default()
+    }
+
+    /// Reclaims pure `Vec`-growth-doubling capacity slack across every
+    /// registered definition's [`DefTable`] (Stage 22 — see
+    /// `docs/persistence-benchmark-notes.md`). Called from the driver's own
+    /// settle points (`crate::driver`'s post-`eval_root` and
+    /// post-`liveness_gc` call sites), never mid-wave, so a shrink never
+    /// races a still-in-progress batch of inserts. Cheap when nothing needs
+    /// shrinking (see [`DefTable::shrink_if_slack`]'s docs) — safe to call
+    /// unconditionally at every settle point rather than needing its own
+    /// caller-side gating.
+    pub(crate) fn shrink_settled(&mut self) {
+        for dt in &mut self.defs {
+            dt.shrink_if_slack();
+        }
     }
 
     /// Every currently-live (non-freed) row, across every definition.
@@ -1172,6 +1263,16 @@ impl EngineInner {
         } else {
             f()
         }
+    }
+
+    /// Reclaims `DefTable` capacity slack across every definition (Stage 22
+    /// — see `docs/persistence-benchmark-notes.md`). Called from
+    /// `crate::driver`'s own settle points; see [`NodeTable::shrink_settled`]
+    /// for the reclamation policy itself.
+    pub(crate) fn shrink_settled_defs(&self) {
+        self.timed(crate::lock_stats::LockSite::ShrinkSettledDefs, || {
+            self.nodes.lock().unwrap().shrink_settled();
+        });
     }
 
     fn get_def<P: CompParam, R: CompResult>(&self, id: &DefId) -> Result<Arc<CompDef<P, R>>, CompError> {
@@ -2500,6 +2601,98 @@ mod tests {
             "Option<u64> ({typed} B) should be no larger than a boxed Arc<dyn Any> handle ({erased} B) alone, \
              which additionally always costs a separate heap allocation this typed column never pays"
         );
+    }
+
+    /// `DefTable::insert`'s doubling growth leaves real slack once enough
+    /// rows have been pushed to exceed [`DefTable::SHRINK_RATIO_NUM`]`/`
+    /// [`DefTable::SHRINK_RATIO_DEN`] of the settled length (Stage 22 — see
+    /// `docs/persistence-benchmark-notes.md`), and [`DefTable::shrink_if_slack`]
+    /// reclaims exactly that: every dense column's capacity equals its
+    /// length afterward, with every row's data intact (param bytes, the
+    /// `param_hash -> row` index, and a still-freeable row all keep
+    /// working) — the shrink must never disturb reuse headroom logic, only
+    /// pure `Vec`-growth-doubling waste above the high-water mark.
+    #[test]
+    fn shrink_if_slack_reclaims_growth_slack_without_disturbing_row_data() {
+        // Below the row-count floor, shrinking never fires even with
+        // plenty of ratio-wise slack -- small defs aren't worth the
+        // capacity-check/maybe-realloc cost at every settle point. Uses its
+        // own throwaway `DefTable` so this sub-check's row numbering never
+        // interferes with the main table's below.
+        let mut small = DefTable::default();
+        for i in 0..8u8 {
+            small.insert(Hash128::from_bytes([i; 16]), b"p");
+        }
+        let small_cap_before = small.param_hash.capacity();
+        small.shrink_if_slack();
+        assert_eq!(
+            small.param_hash.capacity(),
+            small_cap_before,
+            "shrink_if_slack must not touch a DefTable below SHRINK_MIN_ROWS"
+        );
+
+        let mut dt = DefTable::default();
+        // Push past the row-count floor and keep going until `Vec`'s own
+        // doubling growth has left real capacity slack above the shrink
+        // ratio -- looping on the condition itself (rather than a fixed
+        // row count) keeps this test independent of `Vec`'s exact growth
+        // sequence, which is an implementation detail this test must not
+        // assume.
+        let mut hashes = Vec::new();
+        loop {
+            let i = dt.param_hash.len() as u32;
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let hash = Hash128::from_bytes(bytes);
+            dt.insert(hash, b"param");
+            hashes.push(hash);
+            let len = dt.param_hash.len();
+            if len >= DefTable::SHRINK_MIN_ROWS
+                && dt.param_hash.capacity() * DefTable::SHRINK_RATIO_DEN >= len * DefTable::SHRINK_RATIO_NUM
+            {
+                break;
+            }
+            assert!(hashes.len() < 100_000, "never reached the shrink-ratio threshold -- growth policy assumption broke");
+        }
+        let len = dt.param_hash.len();
+
+        // Free every third row, so reuse headroom (below `len`, above the
+        // live count) coexists with growth waste (above `len`) — the
+        // shrink must reclaim only the latter.
+        let mut freed = Vec::new();
+        for (row, _) in hashes.iter().enumerate().step_by(3) {
+            dt.remove(row as u32);
+            freed.push(row as u32);
+        }
+
+        dt.shrink_if_slack();
+
+        assert_eq!(dt.param_hash.capacity(), dt.param_hash.len(), "param_hash should be shrunk to exactly fit");
+        assert_eq!(dt.result_hash.capacity(), dt.result_hash.len());
+        assert_eq!(dt.flags.capacity(), dt.flags.len());
+        assert_eq!(dt.param_off.capacity(), dt.param_off.len());
+        assert_eq!(dt.param_len.capacity(), dt.param_len.len());
+        assert_eq!(dt.comp_deps.capacity(), dt.comp_deps.len());
+        assert_eq!(dt.rdeps.capacity(), dt.rdeps.len());
+        assert_eq!(dt.param_hash.len(), len, "shrinking must never change the high-water length itself");
+
+        // Every surviving row's data and index entry must still be intact
+        // after the shrink -- a `shrink_to_fit` realloc must never corrupt
+        // (or fail to preserve) live content.
+        for (row, &hash) in hashes.iter().enumerate() {
+            if freed.contains(&(row as u32)) {
+                assert!(!dt.contains(row as u32), "a freed row must stay freed across the shrink");
+            } else {
+                assert!(dt.contains(row as u32), "a live row must stay live across the shrink");
+                assert_eq!(dt.row_of(hash), Some(row as u32), "the param_hash index must still resolve after the shrink");
+            }
+        }
+
+        // The free list must still be usable for reuse after the shrink —
+        // proof reuse headroom (row slots below `len`) was left alone, not
+        // folded into the shrink's exact-fit target.
+        let reused_row = dt.insert(Hash128::from_bytes([0xAA; 16]), b"reused");
+        assert!(freed.contains(&reused_row), "insert should have reused one of the freed rows, not grown past len");
     }
 
     /// Regression test for the `rerun`-closure -> `Arc<EngineInner>`

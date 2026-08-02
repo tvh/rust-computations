@@ -81,6 +81,16 @@ impl Engine {
         self.inner.persist_load().await;
 
         self.eval_root(&comp, param).await?;
+        // Reclaim `DefTable` capacity slack (Stage 22 — see
+        // `docs/persistence-benchmark-notes.md`) right at the initial
+        // evaluation's own settle point, before the "initial evaluation
+        // complete" signal below -- deliberately placed here rather than
+        // inside `startup_gc` (which only ever deletes stale sink outputs,
+        // never touches `DefTable`), so every dense column of a freshly
+        // built, otherwise-static graph is shrunk to its settled size
+        // before anything downstream (a benchmark's own RSS sample, a
+        // caller measuring memory right after startup) ever observes it.
+        self.inner.shrink_settled_defs();
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
         self.startup_gc_then_loop().await
@@ -105,6 +115,9 @@ impl Engine {
         self.inner.persist_load().await;
 
         self.eval_root_flows::<P, R>(name, flows, param).await?;
+        // See `Self::run`'s identical call for why this belongs here, not
+        // inside `startup_gc`.
+        self.inner.shrink_settled_defs();
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "initial evaluation complete");
 
         self.startup_gc_then_loop().await
@@ -161,6 +174,20 @@ impl Engine {
             async {
                 let prop_stats = self.inner.propagate(dirtied).await;
                 let gc_stats = self.inner.liveness_gc().await;
+                // Reclaim `DefTable` capacity slack at this round's own
+                // settle point too (Stage 22 — see
+                // `docs/persistence-benchmark-notes.md`), not just once at
+                // startup: a long-running process's node population can
+                // keep growing round to round (new source keys, new flow
+                // arguments), and each such round is exactly the kind of
+                // "settled" point the shrink is safe to run at -- never
+                // mid-wave, only after a round's reruns and GC sweep have
+                // both finished. Cheap when nothing has grown enough to
+                // matter (see `DefTable::shrink_if_slack`'s ratio
+                // threshold), so this is safe to call unconditionally on
+                // every round rather than only when GC actually collected
+                // something.
+                self.inner.shrink_settled_defs();
                 // Persistence is no longer awaited here: every node's
                 // record (and every GC'd node's removal) was already
                 // enqueued synchronously as `propagate`/`liveness_gc` ran

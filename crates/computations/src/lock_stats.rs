@@ -110,10 +110,15 @@ pub(crate) enum LockSite {
     /// `driver::EngineInner::liveness_gc`'s later, separate `source_index`
     /// scan: deciding which now-unreferenced source keys to unregister.
     LivenessGcUnregister,
+    /// `EngineInner::shrink_settled_defs` (Stage 22 — see
+    /// `docs/persistence-benchmark-notes.md`): the per-def `DefTable`
+    /// capacity-slack shrink pass run at each of `crate::driver`'s settle
+    /// points, under `nodes`.
+    ShrinkSettledDefs,
 }
 
 impl LockSite {
-    const ALL: [LockSite; 17] = [
+    const ALL: [LockSite; 18] = [
         LockSite::Prepare,
         LockSite::RunSetInflight,
         LockSite::RunFinishSuccess,
@@ -131,6 +136,7 @@ impl LockSite {
         LockSite::RunWaveRequeue,
         LockSite::LivenessGc,
         LockSite::LivenessGcUnregister,
+        LockSite::ShrinkSettledDefs,
     ];
 
     fn name(self) -> &'static str {
@@ -152,6 +158,7 @@ impl LockSite {
             LockSite::RunWaveRequeue => "run_wave/requeue_rdeps",
             LockSite::LivenessGc => "liveness_gc/mark_sweep",
             LockSite::LivenessGcUnregister => "liveness_gc/unregister_source_keys",
+            LockSite::ShrinkSettledDefs => "shrink_settled_defs",
         }
     }
 

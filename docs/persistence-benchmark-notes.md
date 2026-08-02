@@ -5373,3 +5373,287 @@ testutil,alloc-stats` — all green standalone. `cargo clippy --workspace
 in `--all-targets`). Both harnesses' full phase sequences were re-run and
 their rerun counts/db sizes verified identical to the pre-fix baseline (see
 Measurements above) before any timing number in this section was trusted.
+
+## Stage 22 — DefTable capacity slack
+
+Target: Stage 17's memory accounting found `DefTable`'s dense per-row
+columns costing **215.2 B/row** (`persist_bench`) and **239.1 B/row**
+(`hospital_bench`) of real `.capacity()` against Stage 5's own **135
+B/row** *logical*-length accounting for the same 7 columns
+(`param_hash`/`result_hash`/`flags`/`param_off`/`param_len`/`comp_deps`/
+`rdeps`) — a **~80 B/row (37%)** and **~104 B/row (43%)** gap,
+respectively, attributed to `DefTable::insert` growing every column via
+unreserved `push()` (`Vec`'s own doubling) with no size hint. This stage
+implements, measures, and keeps a fix.
+
+### Waste vs. reuse headroom: this gap is 100% waste, 0% headroom
+
+Before picking a fix, the task's own caution was checked directly: is any
+of this gap actually *reusable* free-list headroom (capacity below a
+column's length, held for a freed row `DefTable::insert` can hand back
+out) rather than genuine waste (capacity above the length/high-water mark,
+which a freed row never touches — see `DefTable`'s own docs, unchanged
+this stage)? Traced the call graph for every phase Stage 17 measured:
+`DefTable::remove` is only ever reached from `NodeTable::remove_by_id`,
+which is called from exactly two places — `driver::liveness_gc`'s
+dead-node sweep, and `persist::restore_nodes`'s decode-failure fallback
+(a record whose value bytes fail to decode gets un-inserted again). Cold
+`eval_root` (both benchmarks' phase 1) never calls `liveness_gc` at all
+(that only runs after the first propagation round, inside
+`startup_gc_then_loop`'s loop, which starts strictly *after* eval_root
+returns); a warm/fingerprint-mismatch restart's `restore_nodes` never hits
+its decode-failure path on a normal successful restart. **Zero rows are
+ever freed before Stage 17's own measurement point, on either benchmark,
+in any of the phases it measured** — confirmed empirically, not just by
+code reading, by this stage's own fix reclaiming the *exact same* byte
+count (to the byte — see below) on `persist_bench` phases 1, 3 (both
+trials), 4 (both trials), 5 (both trials), and 6, which would have
+differed had any phase's free list held anything back. The entire
+measured 80–104 B/row gap was pure `Vec`-growth-doubling waste, not
+reuse headroom, on both of this codebase's benchmarks as they exist
+today — worth stating plainly since the task flagged this as an open
+possibility that would have made most of the gap irreducible; it doesn't
+apply here.
+
+### Approach chosen: shrink-to-fit at quiescence, with a 3/2 hysteresis threshold
+
+Implemented candidate 1 from Stage 17's list: `DefTable::shrink_if_slack`
+(`crates/computations/src/engine.rs`) `shrink_to_fit()`s all 7 dense
+columns plus `param_arena` back to exactly their current length whenever
+real capacity has grown past a threshold, called from two of
+`crate::driver`'s own settle points — right after `eval_root` resolves
+(`Engine::run`/`run_flows`, before the "initial evaluation complete"
+signal) and right after every subsequent round's `liveness_gc`
+(`startup_gc_then_loop`'s loop) — never mid-wave, so a shrink can never
+race an in-progress batch of inserts.
+
+**Threshold: `SHRINK_MIN_ROWS = 64` rows, `SHRINK_RATIO = 3/2`, not `2/1`.**
+The task's own framing ("a def holding N rows can have up to 2N capacity")
+suggested checking against `Vec`'s worst-case 2x doubling overshoot, but
+Stage 17's own measured *average* ratios (215.2/135 ≈ 1.59,
+239.1/135 ≈ 1.77) sit well under 2x — confirmed directly with a throwaway
+`Vec<u128>` growth trace (capacity jumps 256→512 at length 257, then holds
+at 512 through length 511): a settled def's final row count is
+essentially uniformly distributed across its capacity's last doubling
+interval, so most defs never reach the 2x boundary at all and a `2/1`
+threshold would rarely fire. `3/2` catches the typical case. After a
+shrink, a column's capacity exactly equals its length, so renewed growth
+needs roughly 50% more rows before the next shrink (and its one realloc)
+fires again — the same amortized-geometric shape `Vec`'s own doubling
+relies on, re-centered periodically instead of left to run to 2x. This is
+what makes calling the shrink at *every* round's settle point safe rather
+than pathological: a population that keeps slowly growing round to round
+pays one realloc every ~50% of growth, not one realloc per single-row
+insert the way an always-exact-fit policy would (the specific oscillation
+risk the task named). `SHRINK_MIN_ROWS = 64` skips defs too small for the
+absolute savings to matter (a handful of root/aggregation-level defs in
+both benchmarks sit at single-digit-to-low-hundreds row counts).
+
+### Approaches rejected
+
+- **Reserve on growth with a tighter factor (candidate 3)** — rejected in
+  favor of shrinking at quiescence for the reason Stage 17 itself flagged:
+  changing the growth factor changes the amortized-cost shape of *every*
+  `insert` on the hot cold-eval build-up path (999,760 / 1,116,093 pushes
+  per benchmark), trading more frequent, smaller reallocations throughout
+  the entire build for a permanently tighter cap. Shrinking at quiescence
+  instead pays one realloc-and-copy per column per def, exactly once, at
+  an already-idle moment (measured at 25.9 µs total for `persist_bench`'s
+  51 defs, 219 µs total across 7 calls for `hospital_bench`'s 18 defs —
+  see lock-stats below) — strictly cheaper than perturbing every push on
+  the hot path for a workload that (per the waste/headroom finding above)
+  has no reuse pattern to protect against in the first place.
+- **Paged/chunked columns (candidate 2)** — not implemented. Its
+  structural advantage over shrink-at-quiescence is capping worst-case
+  slack *up front* (one partial chunk, regardless of when/whether a
+  settle point is ever reached) rather than reclaiming it after the fact;
+  but shrink-at-quiescence already reclaims 92–98% of the measured slack
+  (below) on both of this codebase's actual benchmarks, leaving little
+  headroom for chunking's specific advantage to be worth its cost: it
+  touches every dense-column access on `engine.rs`'s `prepare`/`run` and
+  `driver.rs`'s GC sweep with an extra indirection, risking exactly the
+  columnar-locality win (Stage 5's measured 9–19%) the task warned not to
+  break casually, for a win this stage's evidence says is now mostly
+  already banked by the cheaper option. Ruled out by the shape of the
+  measured win, not implemented and reverted.
+
+### Measurements
+
+`cargo test --workspace --all-features` — 136 passed (135 + one new:
+`engine::tests::shrink_if_slack_reclaims_growth_slack_without_disturbing_row_data`,
+which checks the row-count floor, the exact-fit postcondition on all 7
+columns after a shrink, index/param-byte integrity for every surviving
+row across the shrink, and that a freed row's reuse-headroom slot below
+`len()` survives the shrink untouched and is still handed back out by a
+later `insert`). `cargo test -p computations --features
+testutil,alloc-stats` — 103 passed standalone. `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean throughout. Same-
+session stash/pop A/B against HEAD (`3181057`), both benchmarks, box load
+(`uptime` 1-minute figures) ranging **~3.8–8.8** across this session —
+shared and loaded throughout, so (per this document's standing practice)
+wall-clock numbers below are for context only; `alloc_stats`'s
+deterministic net-allocated-bytes figures are what this stage's keep
+decision rests on, exactly per this document's own preference and (see
+below) this stage's own evidence for why.
+
+**`persist_bench`, 999,760 achieved instances, 51 `DefTable`s, default
+scale — `alloc_stats` net-allocated bytes (deterministic):**
+
+| phase | before (B) | after (B) | Δ (B) | Δ/instance |
+|---|---|---|---|---|
+| 1. cold eval (persistence configured) | 952,484,877 | 878,911,517 | **-73,573,360** | -73.6 |
+| 3. warm restart, no changes (both trials) | 475,019,431 / 475,019,863 | 401,446,071 / 401,446,071 | **-73,573,360 / -73,573,792** | -73.6 |
+| 4. restart, 1 changed input (trial 1 / 2) | 520,584,471 / 555,188,623 | 447,011,111 / 481,615,263 | **-73,573,360 / -73,573,360** | -73.6 |
+| 5. cold, no persistence (both trials) | 296,306,102 | 222,732,742 | **-73,573,360** | -73.6 |
+| 6. fingerprint mismatch (full revalidation) | 508,154,569 | 434,581,209 | **-73,573,360** | -73.6 |
+| 7. live incremental, no persistence | 5,255 | 5,255 | 0 | 0 |
+| 8. live incremental, with persistence | 48,838,388 | 48,029,223 | -809,165 | ~0 |
+
+The **-73,573,360 B delta is identical to the byte across every phase
+that builds the full 999,760-row graph** (1, 3×2, 4×2, 5×2, 6) — the
+cleanest possible confirmation that this is a fixed, reproducible,
+structural reclaim (73.6 B/instance), not measurement noise, and that it
+reclaims **92%** of Stage 17's measured ~80 B/row gap (215.2 B/row real
+capacity before this stage → **141.6 B/row after**, against the 135 B/row
+logical floor — within 5% of it). Phases 7/8 (no new rows created) show
+zero-to-negligible movement, confirming no per-round cost on workloads
+that never re-trigger the ratio threshold. Reruns and db size (269.49 MB)
+were unaffected on every phase in every configuration, confirming no
+correctness or persistence-format effect.
+
+**`hospital_bench`, 1,116,093 achieved rows, 18 `DefTable`s — `alloc_stats`
+net-allocated bytes:**
+
+| phase | before (B) | after (B) | Δ (B) | Δ/row |
+|---|---|---|---|---|
+| 1. cold eval | 1,099,483,974 | 985,359,890 | **-114,124,084** | -102.3 |
+| 2. live incremental, 1 changed vitals key | 6,328 | 6,392 | +64 | ~0 |
+| 3. rerun-heavy live update (300 keys mutated) | 81,574 | 81,510 | -64 | ~0 |
+
+Reclaims **98%** of Stage 17's measured ~104 B/row gap (239.1 B/row real
+capacity before → **136.8 B/row after**, within 2% of the 135 B/row
+logical floor). Phases 2/3 — the workload's own rerun-heavy, no-new-rows
+phases, the specific case the task asked to watch for oscillation — move
+by ±64 B, noise-level and two orders of magnitude below phase 1's own
+reclaim, confirming the per-round settle-point call finds nothing to do
+once the population stops growing, exactly as the 3/2 hysteresis
+threshold is designed to produce.
+
+**Lock-hold cost of the shrink pass itself** (`COMPUTATIONS_LOCK_STATS=1`):
+`persist_bench` phase 5 (cold, no persistence): `shrink_settled_defs`, 1
+call, 25.9 µs total, **0.00%** of 1.177 s tracked lock time.
+`hospital_bench`'s full main-phase run (cold eval + live incremental +
+rerun-heavy): `shrink_settled_defs`, 7 calls (1 initial + 6 per-round,
+matching `liveness_gc`'s own 6 calls), 219 µs total (31.3 µs mean),
+**0.01%** of 2.060 s tracked lock time. No reproducible wall-clock
+regression on any phase of either benchmark across this session's runs
+(every phase's before/after times overlap within this box's own run-to-
+run noise band).
+
+**RSS — peak and steady-state, reported separately, with an important
+caveat.** "Steady-state" below is each benchmark's own existing
+`ps`-based single-sample measurement (unchanged instrumentation, at the
+existing settle point). "Peak" is a session-local external `ps`-polling
+probe (50 ms interval, summed over every process matching the benchmark's
+binary path, run only for this stage's own measurement and not committed
+to the repo — same "temporary instrument, not kept" precedent as Stage
+17's `debug_memory_breakdown`) tracking the maximum RSS observed across
+each isolated child process's (`persist_bench`) or the whole main-phase
+process's (`hospital_bench`) lifetime.
+
+| benchmark / phase | steady-state before (MB) | steady-state after (MB) | peak before (MB) | peak after (MB) |
+|---|---|---|---|---|
+| `persist_bench` phase 1 (cold eval + `persist_now`, isolated) | 1368.2 | 1369.9 | 1737.0 | 1743.0 |
+| `persist_bench` phase 5-1 (cold, no persistence, isolated) | 290.1 | 257.0 | 291.3 | 256.4 |
+| `hospital_bench` main phase (cold eval → live → rerun-heavy) | 1009.8 / 1079.3 / 1088.1 | 1003.5 / 1070.5 / 1079.2 | 1129.7 (whole process) | 1121.0 (whole process) |
+
+Phase 1's peak is flat (+0.3%, noise) — expected, since a *separate*,
+larger memory event (the subsequent `persist_now` flush, serializing
+999,760 records to redb) happens after this stage's shrink point and
+dominates that process's true peak regardless of what the shrink already
+reclaimed, exactly matching the task's own prediction that a shrink-at-
+quiescence approach "may improve steady state while leaving peak
+untouched." Phase 5-1 is the instructive counter-case: with *no*
+persistence and nothing memory-heavy following the initial build, peak
+and steady-state converge to the same (now lower) number in both the
+before and after run, because the transient pre-shrink high-water instant
+lasts only as long as the shrink call itself (25.9 µs, measured above) —
+far below the resolution of any RSS sample, this session's 50 ms poll
+included. The general rule this stage's own evidence supports: **peak
+stays untouched exactly when a genuinely separate, larger memory event
+follows the shrink point; when nothing does, there is no other peak
+candidate left, and the reclaim shows up in peak too.**
+
+Beyond that structural point, RSS's *magnitude* should not be trusted at
+this effect size on this box: phase 6 (fingerprint mismatch) moved in
+*opposite directions* between this stage's two independently-built
+before/after pairs — the plain build showed 1330.2 → 1552.8 MB (a rise),
+the `alloc-stats` build showed 1551.0 → 1330.0 MB (a fall) — for a change
+whose `alloc_stats` delta was an exactly-reproducible -73,573,360 B in
+both builds. macOS's default system allocator does not necessarily return
+a `shrink_to_fit`-freed page range to the OS promptly (freed blocks
+commonly stay in the process's own free lists for reuse), so a real,
+byte-exact logical reduction does not reliably produce a same-sized,
+immediately-visible RSS drop — precisely the gap this document's own
+preference for `allocated_bytes` over RSS exists to route around, and
+this stage's own numbers are as clean a demonstration of why as any prior
+one. A platform with a more eagerly-page-returning allocator (jemalloc,
+or glibc's `malloc_trim`-style behavior on Linux) would plausibly show a
+cleaner, more visible RSS win for the same change — untested here, flagged
+honestly rather than assumed.
+
+### Verdict: kept
+
+**Kept.** `alloc_stats`'s deterministic net-allocated-bytes figures show a
+large, exactly-reproducible reclaim — 73.6 B/instance (92% of Stage 17's
+measured gap) on `persist_bench`, 102.3 B/row (98% of Stage 17's measured
+gap) on `hospital_bench` — landing `DefTable`'s real per-row capacity
+within 2–5% of Stage 5's own logical floor on both benchmarks. The cost is
+directly measured and negligible: ≤0.01% of tracked lock-hold time on
+either benchmark, no reproducible wall-clock regression across either
+benchmark's full phase sequence, and — the specific risk the task asked
+this stage to watch for — no measurable extra allocation on either
+benchmark's rerun-heavy/live-incremental phases (±64 B, noise-level),
+confirming the 3/2 hysteresis threshold does its job and no grow/shrink
+oscillation occurs on either of this codebase's two representative
+workloads. RSS's noisier signal doesn't contradict this: it's flat-to-
+improving everywhere it isn't swamped by a separate, larger structure
+(the persistence pending-map on `persist_bench` phases 1/3/4/6), converges
+with the deterministic figure exactly where nothing else dominates (phase
+5-1), and even reverses sign between two nominally-identical measurement
+pairs on phase 6 — itself the clearest available evidence for why this
+document weights `alloc_stats` over RSS, not a reason to doubt the win.
+
+The waste-vs-headroom question the task asked this stage to resolve has a
+clean answer for both current benchmarks: **the entire measured 80–104
+B/row gap was pure `Vec`-growth waste, zero reuse headroom** (no row is
+ever freed before either benchmark's first settle point), so this stage
+did not need to compromise between reclaiming waste and disturbing
+headroom — there was no headroom on the table to disturb. That distinction
+remains real for a workload that does GC substantial numbers of rows
+before its own first quiescence point (this design's `shrink_to_fit`,
+gated on capacity above `len()` rather than above the live count, already
+respects it structurally — a freed row's still-reserved slot below `len()`
+is never touched, confirmed by this stage's own correctness test), but
+neither `persist_bench` nor `hospital_bench` exercises that case today,
+so it is flagged for a future stage rather than claimed as verified here.
+
+### Correctness
+
+New test: `engine::tests::shrink_if_slack_reclaims_growth_slack_without_disturbing_row_data`
+(`crates/computations/src/engine.rs`). New production code:
+`DefTable::shrink_if_slack`/`SHRINK_MIN_ROWS`/`SHRINK_RATIO_NUM`/
+`SHRINK_RATIO_DEN`/`SHRINK_MIN_ARENA_BYTES` and `NodeTable::shrink_settled`
+(`engine.rs`), `EngineInner::shrink_settled_defs` (`engine.rs`), a new
+`LockSite::ShrinkSettledDefs` instrumented call site (`lock_stats.rs`),
+and two call sites in `crate::driver` (`Engine::run`/`run_flows`, right
+after `eval_root`; `startup_gc_then_loop`'s loop, right after
+`liveness_gc`). No public API change: `shrink_if_slack`/
+`shrink_settled`/`shrink_settled_defs` are all crate-private, called
+automatically at existing settle points — a caller of this crate never
+needs to know this pass exists. `cargo test --workspace --all-features` —
+136 passed (135 baseline + 1 new). `cargo test -p computations --features
+testutil,alloc-stats` — 103 passed standalone. `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean. The temporary
+external RSS-peak poller used for measurement in this stage was a
+session-local shell script, never added to the repository.
